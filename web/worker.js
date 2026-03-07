@@ -6,29 +6,29 @@
  * Protocol:
  *   Main -> Worker:
  *     { type: 'load' }                          -- initialize WASM + WebGPU, download model
- *     { type: 'audio', samples: Float32Array }   -- feed mic audio chunk
- *     { type: 'stop' }                           -- end of conversation
+ *     { type: 'audio', samples: Float32Array }   -- feed mic audio chunk (prefills incrementally)
+ *     { type: 'stop' }                           -- stop recording, start generation
  *     { type: 'reset' }                          -- clear state for new session
+ *     { type: 'playback-port', port: MessagePort } -- port to stream audio to AudioWorklet
  *
  *   Worker -> Main:
  *     { type: 'status', text: string, ready?: boolean, progress?: { loaded, total } }
- *     { type: 'audio-out', samples: Float32Array }  -- output audio PCM chunk
- *     { type: 'transcript', text: string, final?: boolean }  -- inner monologue text
- *     { type: 'metrics', ... }                      -- performance metrics
+ *     { type: 'audio-chunk', samples: Float32Array, step: number, done: boolean }
+ *     { type: 'transcript', text: string, final?: boolean }
+ *     { type: 'metrics', ... }
  *     { type: 'error', message: string }
  */
 
-// Model base URL — local dev server serves from /hf/ route
-// For production, change to HuggingFace: https://huggingface.co/idle-intelligence/personaplex-7b-v1-q4_k-webgpu/resolve/main
 const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
 
 let engine = null;
 let stsWasm = null;
 let totalSamples = 0;
 let recordingStart = 0;
+let prefillFrames = 0;
 
-let lastMetricsSent = 0;
-const METRICS_INTERVAL_MS = 1000;
+// Port to stream audio directly to AudioWorklet
+let playbackPort = null;
 
 function logState(msg) {
     const t = ((performance.now()) / 1000).toFixed(2);
@@ -57,7 +57,7 @@ async function drainQueue() {
                     await handleAudio(data);
                     break;
                 case 'stop':
-                    logState(`Stop received (${audioChunkCount} chunks)`);
+                    logState(`Stop received (${audioChunkCount} chunks, ${prefillFrames} frames prefilled)`);
                     stopped = true;
                     await handleStop();
                     break;
@@ -65,6 +65,7 @@ async function drainQueue() {
                     logState('Reset -- starting new session');
                     stopped = false;
                     audioChunkCount = 0;
+                    prefillFrames = 0;
                     handleReset();
                     break;
                 default:
@@ -98,6 +99,12 @@ self.onmessage = (e) => {
         return;
     }
 
+    if (type === 'playback-port') {
+        playbackPort = data.port;
+        logState('Playback port received');
+        return;
+    }
+
     msgQueue.push({ type, data });
     drainQueue();
 };
@@ -115,11 +122,6 @@ async function isCached(url) {
     } catch { return false; }
 }
 
-/**
- * Fetch a URL with caching via the Cache API.
- * Returns the Response body as an ArrayBuffer.
- * Reports download progress via postMessage.
- */
 async function cachedFetch(url, label) {
     const cache = await caches.open(CACHE_NAME);
 
@@ -192,45 +194,38 @@ async function handleLoad(config) {
     // 3. Create engine instance.
     engine = new stsWasm.StsEngine();
 
-    // 4. Download and process model shards one at a time (incremental loading).
-    //    This keeps only ~512MB of shard data in WASM memory at once,
-    //    avoiding the 4GB WASM address space limit.
+    // 4. Download and process model shards.
     const shardUrls = config.shardList && config.shardList.length > 0
         ? config.shardList
         : Array.from({ length: 9 }, (_, i) =>
             `${HF_BASE}/personaplex-7b-v1-q4_k.gguf.shard-0${i}`
         );
 
-    // Check if first shard is cached to pick the right verb
     const allCached = await isCached(shardUrls[0]);
     const verb = allCached ? 'Loading' : 'Downloading';
     self.postMessage({ type: 'status', text: `${verb} model...` });
 
-    // Shard 0: parse GGUF header + process shard 0's tensors
     {
         const url = shardUrls[0];
         const label = `${verb} model (1/${shardUrls.length})`;
         const buf = await cachedFetch(url, label);
         self.postMessage({ type: 'status', text: 'Parsing model header...' });
         engine.loadModelBegin(new Uint8Array(buf));
-        // buf can now be GC'd
     }
 
-    // Shards 1..N-1: process each shard's tensors individually
     for (let i = 1; i < shardUrls.length; i++) {
         const url = shardUrls[i];
         const label = `${verb} model (${i + 1}/${shardUrls.length})`;
         const buf = await cachedFetch(url, label);
         self.postMessage({ type: 'status', text: `Loading shard ${i + 1}/${shardUrls.length}...` });
         engine.loadModelShard(new Uint8Array(buf), i);
-        // buf can now be GC'd
     }
 
-    // 5. Assemble final model from processed tensors.
+    // 5. Assemble final model.
     self.postMessage({ type: 'status', text: 'Assembling model...' });
     engine.loadModelFinish();
 
-    // 6. Load Mimi codec weights.
+    // 6. Load Mimi codec.
     const mimiUrl = config.mimiUrl || `${HF_BASE}/tokenizer-e351c8d8-checkpoint125.safetensors`;
     const mimiVerb = await isCached(mimiUrl) ? 'Loading' : 'Downloading';
     const mimiBuf = await cachedFetch(mimiUrl, `${mimiVerb} audio codec`);
@@ -267,12 +262,12 @@ async function handleAudio({ samples }) {
     totalSamples += audioData.length;
     audioChunkCount++;
 
-    // Feed audio to the STS engine — encodes with Mimi, accumulates frames.
-    // No model inference happens here.
-    engine.feedAudio(audioData);
+    // feedAudio now does Mimi encode + incremental prefill (async)
+    const framesProcessed = await engine.feedAudio(audioData);
+    prefillFrames += framesProcessed;
 
     const audioDur = (totalSamples / 24000).toFixed(1);
-    self.postMessage({ type: 'status', text: `Recording... ${audioDur}s` });
+    self.postMessage({ type: 'status', text: `Recording... ${audioDur}s (${prefillFrames} frames prefilled)` });
 }
 
 function sendMetrics(now) {
@@ -302,48 +297,62 @@ async function handleStop() {
     }
 
     const audioDuration = totalSamples / 24000;
-    logState(`Generating response (${totalSamples} samples = ${audioDuration.toFixed(1)}s input)...`);
+    logState(`Starting generation (${audioDuration.toFixed(1)}s input, ${prefillFrames} frames already prefilled)`);
     self.postMessage({ type: 'status', text: 'Generating response...' });
 
-    // flush() runs the full PersonaPlex pipeline:
-    //   1. System prompt prefill (silence → text → silence)
-    //   2. User audio prefill (Mimi tokens through temporal + depformer)
-    //   3. Autoregressive generation until silence or max frames
-    //   4. Mimi decode of response audio tokens
-    logState('Calling engine.flush()...');
-    const result = await engine.flush();
-    logState(`flush() returned: ${result ? JSON.stringify({
-        hasAudio: !!(result.audio && result.audio.length),
-        audioLen: result.audio ? result.audio.length : 0,
-        hasText: !!result.text,
-        textLen: result.text ? result.text.length : 0,
-    }) : 'null/undefined'}`);
+    // Start streaming generation
+    engine.generateStart();
 
-    if (result && result.audio && result.audio.length > 0) {
-        const outDur = (result.audio.length / 24000).toFixed(1);
-        logState(`Sending ${outDur}s of audio (${result.audio.length} samples) to main thread`);
-        self.postMessage({ type: 'audio-out', samples: result.audio });
-    } else {
-        logState('No audio in result');
+    let transcript = '';
+    while (true) {
+        const chunk = await engine.generateStep();
+        if (!chunk) break;
+
+        // Stream audio chunk to playback port (Worker → AudioWorklet)
+        if (chunk.audio && chunk.audio.length > 0) {
+            if (playbackPort) {
+                playbackPort.postMessage({ type: 'audio', samples: chunk.audio }, [chunk.audio.buffer]);
+            }
+            // Also send to main thread for fallback playback
+            self.postMessage({
+                type: 'audio-chunk',
+                samples: playbackPort ? null : chunk.audio,
+                step: chunk.step,
+                done: chunk.done,
+            });
+        }
+
+        // Stream text incrementally
+        if (chunk.text) {
+            transcript += chunk.text;
+            self.postMessage({ type: 'transcript', text: chunk.text, final: false });
+        }
+
+        // Update status with progress
+        self.postMessage({
+            type: 'status',
+            text: `Generating... frame ${chunk.step + 1}`,
+        });
+
+        if (chunk.done) break;
     }
-    if (result && result.text) {
-        logState(`Transcript: "${result.text.substring(0, 100)}${result.text.length > 100 ? '...' : ''}"`);
-        self.postMessage({ type: 'transcript', text: result.text, final: false });
-    }
+
+    logState(`Generation complete: "${transcript.substring(0, 80)}${transcript.length > 80 ? '...' : ''}"`);
 
     // Final metrics
     sendMetrics(performance.now());
 
     self.postMessage({ type: 'transcript', text: '', final: true });
     totalSamples = 0;
+    prefillFrames = 0;
     stopped = false;
-    logState('Generation complete, ready for next input');
+    logState('Ready for next input');
     self.postMessage({ type: 'status', text: 'Ready', ready: true });
 }
 
 function handleReset() {
     totalSamples = 0;
-    lastMetricsSent = 0;
+    prefillFrames = 0;
     audioChunkCount = 0;
     if (!engine) return;
     engine.reset();

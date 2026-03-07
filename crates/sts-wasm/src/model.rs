@@ -935,8 +935,21 @@ pub async fn sample_greedy(logits: Tensor<Wgpu, 3>) -> u32 {
 /// but sufficient for top-k sampling diversity.
 fn pseudo_random() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(12345);
+    static SEED: AtomicU64 = AtomicU64::new(0);
+
+    // Lazy init: seed from time on first call
     let s = SEED.fetch_add(1, Ordering::Relaxed);
+    if s == 0 {
+        #[cfg(target_family = "wasm")]
+        let time_seed = (js_sys::Date::now() * 1000.0) as u64;
+        #[cfg(not(target_family = "wasm"))]
+        let time_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        SEED.store(time_seed, Ordering::Relaxed);
+        return pseudo_random(); // re-enter with seeded value
+    }
     // LCG: (a * s + c) mod m
     let next = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     SEED.store(next, Ordering::Relaxed);

@@ -304,19 +304,22 @@ async function handleStop() {
     engine.generateStart();
 
     let transcript = '';
+    const allAudioChunks = []; // Accumulate all audio for WAV export
     while (true) {
         const chunk = await engine.generateStep();
         if (!chunk) break;
 
         // Stream audio chunk to playback port (Worker → AudioWorklet)
         if (chunk.audio && chunk.audio.length > 0) {
+            // Save a copy for WAV export before transferring
+            allAudioChunks.push(new Float32Array(chunk.audio));
+
             if (playbackPort) {
                 playbackPort.postMessage({ type: 'audio', samples: chunk.audio }, [chunk.audio.buffer]);
             }
             // Also send to main thread for fallback playback
             self.postMessage({
                 type: 'audio-chunk',
-                samples: playbackPort ? null : chunk.audio,
                 step: chunk.step,
                 done: chunk.done,
             });
@@ -341,6 +344,19 @@ async function handleStop() {
 
     // Final metrics
     sendMetrics(performance.now());
+
+    // Send complete audio for WAV download
+    if (allAudioChunks.length > 0) {
+        let totalLen = 0;
+        for (const c of allAudioChunks) totalLen += c.length;
+        const fullAudio = new Float32Array(totalLen);
+        let offset = 0;
+        for (const c of allAudioChunks) {
+            fullAudio.set(c, offset);
+            offset += c.length;
+        }
+        self.postMessage({ type: 'audio-complete', samples: fullAudio }, [fullAudio.buffer]);
+    }
 
     self.postMessage({ type: 'transcript', text: '', final: true });
 

@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sts-web — idle intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #fdfdfd;
+            --text: #1a1a1a;
+            --muted: #555;
+            --faint: #999;
+            --border: #ddd;
+            --green: #2d7d46;
+            --yellow: #b58900;
+            --red: #c0392b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 48px 24px 96px;
+            color: var(--text);
+            background: var(--bg);
+            line-height: 1.5;
+            font-size: 15px;
+        }
+        a { color: var(--text); }
+        a:hover { color: var(--muted); }
+
+        header { margin-bottom: 48px; }
+        .org {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--muted);
+            letter-spacing: 0.02em;
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        h1 {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .tagline {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .tagline a { text-decoration: underline; color: var(--muted); }
+        .tagline a:hover { color: var(--text); }
+        .repo {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        .repo a { color: var(--faint); text-decoration: none; }
+        .repo a:hover { color: var(--muted); }
+
+        section {
+            border-top: 1px solid var(--border);
+            padding: 24px 0;
+        }
+        section h2 {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            color: var(--faint);
+            margin-bottom: 12px;
+        }
+        section h2 .sub {
+            font-weight: 400;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--faint);
+            flex-shrink: 0;
+        }
+        .status-dot.loading { background: var(--yellow); }
+        .status-dot.ready { background: var(--green); }
+        .status-dot.error { background: var(--red); }
+        .status-dot.recording {
+            background: var(--red);
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .progress {
+            height: 2px;
+            background: var(--border);
+            border-radius: 1px;
+            overflow: hidden;
+            margin-top: 12px;
+            display: none;
+        }
+        .progress.visible { display: block; }
+        .progress-bar {
+            height: 100%;
+            background: var(--text);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        #progressInfo {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            color: var(--faint);
+            margin-top: 4px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        button {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 16px;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text);
+            border-radius: 0;
+            transition: border-color 0.15s;
+        }
+        button:hover:not(:disabled) {
+            border-color: var(--text);
+        }
+        button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        button.primary {
+            background: var(--text);
+            color: var(--bg);
+            border-color: var(--text);
+        }
+        button.primary:hover:not(:disabled) {
+            background: var(--muted);
+            border-color: var(--muted);
+        }
+        button.recording {
+            background: var(--red);
+            color: #fff;
+            border-color: var(--red);
+            animation: pulse 1s infinite;
+        }
+        .info {
+            font-size: 13px;
+            color: var(--faint);
+            margin-top: 12px;
+        }
+
+        #transcript {
+            padding: 16px;
+            min-height: 120px;
+            border: 1px solid var(--border);
+            white-space: pre-wrap;
+            line-height: 1.6;
+            font-size: 15px;
+            color: var(--text);
+        }
+        #transcript.empty {
+            color: var(--faint);
+            font-style: italic;
+        }
+
+        #metricsCard { display: none; }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+        .metric { text-align: center; }
+        .metric-value {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .metric-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            color: var(--faint);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-top: 2px;
+        }
+
+        .streaming-cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1em;
+            background: var(--text);
+            margin-left: 2px;
+            vertical-align: text-bottom;
+            animation: blink 0.7s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        .hw-note {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            color: var(--faint);
+            margin-top: 8px;
+        }
+
+        footer {
+            border-top: 1px solid var(--border);
+            padding-top: 24px;
+            margin-top: 24px;
+        }
+        footer a {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--faint);
+            text-decoration: none;
+        }
+        footer a:hover { color: var(--muted); }
+    </style>
+</head>
+<body>
+    <header>
+        <p class="org">idle intelligence</p>
+        <h1>sts-web</h1>
+        <p class="tagline">
+            Quantized to Q4.
+            <a href="https://huggingface.co/nvidia/personaplex-7b-v1">NVIDIA PersonaPlex-7B</a>
+            running client-side via WebGPU using
+            <a href="https://burn.dev">Burn</a>
+        </p>
+        <p class="repo">
+            <a href="https://github.com/idle-intelligence/sts-web">github.com/idle-intelligence/sts-web</a>
+        </p>
+    </header>
+
+    <section>
+        <h2>status</h2>
+        <div class="status">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">Checking browser support...</span>
+        </div>
+        <div class="progress" id="progressBar">
+            <div class="progress-bar" id="progressFill"></div>
+        </div>
+        <p id="progressInfo"></p>
+        <div style="margin-top:12px">
+            <button id="downloadBtn" class="primary" style="display:none">Load Model</button>
+        </div>
+        <p class="hw-note">Desktop only. Requires discrete GPU or Apple Silicon with 16GB+ RAM.</p>
+    </section>
+
+    <section>
+        <h2>input <span class="sub">· audio</span></h2>
+        <div class="actions">
+            <button id="recordBtn" class="primary" disabled>Start Recording</button>
+            <button id="fileBtn" disabled>Load WAV File</button>
+            <button id="exampleBtn" disabled>Load Example WAV</button>
+            <input type="file" id="fileInput" accept=".wav,audio/wav" style="display:none">
+        </div>
+        <p class="info">Audio stays on this device. All inference runs locally in your browser.</p>
+    </section>
+
+    <section>
+        <h2>output <span class="sub">· audio</span></h2>
+        <div class="actions" id="playbackControls" style="display:none">
+            <button id="muteBtn">Mute</button>
+        </div>
+        <p id="audioStatus" class="info">Audio output will play here...</p>
+    </section>
+
+    <section>
+        <h2>output <span class="sub">· inner monologue</span></h2>
+        <div id="transcript" class="empty"><span id="transcriptText">Transcript will appear here...</span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
+    </section>
+
+    <section id="metricsCard">
+        <h2>performance</h2>
+        <div class="metrics-grid">
+            <div class="metric">
+                <div class="metric-value" id="metricFrameMs">--</div>
+                <div class="metric-label">ms/frame</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricFps">--</div>
+                <div class="metric-label">Frames/sec</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricRtf">--</div>
+                <div class="metric-label">RTF</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricTemporalMs">--</div>
+                <div class="metric-label">Temporal (ms)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricDepthMs">--</div>
+                <div class="metric-label">Depth (ms)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricMimiMs">--</div>
+                <div class="metric-label">Mimi (ms)</div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <a href="https://idleintelligence.org">idleintelligence.org</a>
+    </footer>
+
+    <script type="module">
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const progressBar = document.getElementById('progressBar');
+        const progressFill = document.getElementById('progressFill');
+        const progressInfo = document.getElementById('progressInfo');
+        const transcriptEl = document.getElementById('transcript');
+        const transcriptTextEl = document.getElementById('transcriptText');
+        const recordBtn = document.getElementById('recordBtn');
+        const fileBtn = document.getElementById('fileBtn');
+        const fileInput = document.getElementById('fileInput');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const exampleBtn = document.getElementById('exampleBtn');
+        const muteBtn = document.getElementById('muteBtn');
+        const playbackControls = document.getElementById('playbackControls');
+        const audioStatus = document.getElementById('audioStatus');
+        const metricsCard = document.getElementById('metricsCard');
+        const metricFrameMs = document.getElementById('metricFrameMs');
+        const metricFps = document.getElementById('metricFps');
+        const metricRtf = document.getElementById('metricRtf');
+        const metricTemporalMs = document.getElementById('metricTemporalMs');
+        const metricDepthMs = document.getElementById('metricDepthMs');
+        const metricMimiMs = document.getElementById('metricMimiMs');
+
+        let worker = null;
+        let audioCtx = null;
+        let playbackNode = null;
+        let micStream = null;
+        let micWorkletNode = null;
+        let isRecording = false;
+        let isMuted = false;
+        let transcriptText = '';
+
+        function updateStatus(state, text) {
+            statusDot.className = 'status-dot ' + state;
+            statusText.textContent = text;
+        }
+
+        function formatBytes(bytes) {
+            const mb = bytes / (1024 * 1024);
+            return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
+        }
+
+        function updateMetrics(data) {
+            metricsCard.style.display = 'block';
+            if (data.framesPerSec != null) metricFps.textContent = data.framesPerSec.toFixed(1);
+            if (data.avgFrameMs != null) metricFrameMs.textContent = data.avgFrameMs.toFixed(1);
+            if (data.temporalMs != null) metricTemporalMs.textContent = data.temporalMs.toFixed(1);
+            if (data.depthMs != null) metricDepthMs.textContent = data.depthMs.toFixed(1);
+            if (data.mimiMs != null) metricMimiMs.textContent = data.mimiMs.toFixed(1);
+            if (data.avgFrameMs != null) metricRtf.textContent = (data.avgFrameMs / 80).toFixed(2);
+        }
+
+        // --- Audio playback setup ---
+
+        async function initAudioPlayback() {
+            audioCtx = new AudioContext({ sampleRate: 24000 });
+            await audioCtx.audioWorklet.addModule('./audio-playback.js');
+            playbackNode = new AudioWorkletNode(audioCtx, 'audio-playback');
+            playbackNode.connect(audioCtx.destination);
+            return playbackNode;
+        }
+
+        function sendAudioToPlayback(samples) {
+            if (isMuted) return;
+            if (!audioCtx) {
+                audioCtx = new AudioContext({ sampleRate: 24000 });
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+
+            const f32 = samples instanceof Float32Array ? samples : new Float32Array(samples);
+            const buf = audioCtx.createBuffer(1, f32.length, 24000);
+            buf.getChannelData(0).set(f32);
+            const source = audioCtx.createBufferSource();
+            source.buffer = buf;
+            source.connect(audioCtx.destination);
+            source.start();
+            console.log(`[audio] Playing ${(f32.length / 24000).toFixed(1)}s (${f32.length} samples)`);
+        }
+
+        // --- Worker setup ---
+
+        function initWorker() {
+            worker = new Worker('./worker.js', { type: 'module' });
+
+            worker.onmessage = (e) => {
+                const msg = e.data;
+                switch (msg.type) {
+                    case 'status':
+                        if (msg.ready) {
+                            updateStatus('ready', msg.text);
+                            recordBtn.disabled = false;
+                            fileBtn.disabled = false;
+                            exampleBtn.disabled = false;
+                            progressBar.classList.remove('visible');
+                            progressInfo.textContent = '';
+                            downloadBtn.style.display = 'none';
+                        } else {
+                            updateStatus('loading', msg.text);
+                            if (msg.progress) {
+                                progressBar.classList.add('visible');
+                                const pct = msg.progress.total > 0
+                                    ? (msg.progress.loaded / msg.progress.total) * 100 : 0;
+                                progressFill.style.width = pct + '%';
+                                progressInfo.textContent =
+                                    `${formatBytes(msg.progress.loaded)} / ${formatBytes(msg.progress.total)}`;
+                            }
+                        }
+                        break;
+
+                    case 'audio-out':
+                        sendAudioToPlayback(msg.samples);
+                        playbackControls.style.display = '';
+                        audioStatus.textContent = 'Playing audio...';
+                        break;
+
+                    case 'transcript': {
+                        const cursor = document.getElementById('streamingCursor');
+                        if (msg.text) {
+                            transcriptText += msg.text;
+                            transcriptTextEl.textContent = transcriptText;
+                            transcriptEl.classList.remove('empty');
+                        }
+                        if (msg.final) {
+                            if (transcriptText) transcriptText += ' ';
+                            if (cursor) cursor.style.display = 'none';
+                        } else {
+                            if (cursor) cursor.style.display = 'inline-block';
+                        }
+                        break;
+                    }
+
+                    case 'metrics':
+                        updateMetrics(msg);
+                        break;
+
+                    case 'error':
+                        updateStatus('error', 'Error: ' + msg.message);
+                        console.error('[sts]', msg.message);
+                        break;
+                }
+            };
+
+            return worker;
+        }
+
+        // --- Cache check ---
+
+        // For local dev, skip the cache check — model is served from disk
+        async function isModelCached() {
+            return false;
+        }
+
+        // --- Recording ---
+
+        async function startRecording() {
+            if (!audioCtx) await initAudioPlayback();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            await audioCtx.audioWorklet.addModule('./audio-processor.js').catch(() => {});
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                }
+            });
+            const source = audioCtx.createMediaStreamSource(micStream);
+            micWorkletNode = new AudioWorkletNode(audioCtx, 'audio-processor');
+
+            // Direct port from AudioWorklet -> Worker (bypasses main thread)
+            const channel = new MessageChannel();
+            micWorkletNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+            worker.postMessage({ type: 'audio-port', port: channel.port2 }, [channel.port2]);
+
+            source.connect(micWorkletNode);
+            // Don't connect to destination — mic input should not play back
+        }
+
+        function stopRecording() {
+            if (micWorkletNode) {
+                micWorkletNode.port.postMessage({ type: 'stop' });
+                micWorkletNode.disconnect();
+                micWorkletNode = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+            }
+        }
+
+        // --- Init ---
+
+        if (!navigator.gpu) {
+            updateStatus('error', 'WebGPU not supported. Use Chrome or Edge 113+.');
+        } else {
+            initWorker();
+
+            const cached = await isModelCached();
+            if (cached) {
+                updateStatus('loading', 'Loading model from cache (~5 GB)...');
+                worker.postMessage({ type: 'load' });
+            } else {
+                updateStatus('', 'Model not loaded (~5.1 GB download)');
+                downloadBtn.textContent = 'Download Model';
+                downloadBtn.style.display = '';
+                downloadBtn.addEventListener('click', () => {
+                    downloadBtn.disabled = true;
+                    worker.postMessage({ type: 'load' });
+                });
+            }
+        }
+
+        // --- Event handlers ---
+
+        recordBtn.addEventListener('click', async () => {
+            if (!isRecording) {
+                try {
+                    worker.postMessage({ type: 'reset' });
+                    transcriptText = '';
+                    transcriptTextEl.textContent = 'Transcript will appear here...';
+                    transcriptEl.classList.add('empty');
+                    audioStatus.textContent = 'Audio output will play here...';
+                    await startRecording();
+                    isRecording = true;
+                    recordBtn.textContent = 'Stop Recording';
+                    recordBtn.classList.add('recording');
+                    recordBtn.classList.remove('primary');
+                    updateStatus('recording', 'Recording...');
+                } catch (err) {
+                    updateStatus('error', 'Microphone error: ' + err.message);
+                    console.error(err);
+                }
+            } else {
+                stopRecording();
+                worker.postMessage({ type: 'stop' });
+                isRecording = false;
+                recordBtn.textContent = 'Start Recording';
+                recordBtn.classList.remove('recording');
+                recordBtn.classList.add('primary');
+                updateStatus('loading', 'Flushing...');
+                recordBtn.disabled = true;
+            }
+        });
+
+        fileBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            fileInput.value = '';
+            await feedAudioFile(await file.arrayBuffer(), file.name);
+        });
+
+        async function feedAudioFile(arrayBuf, label) {
+            updateStatus('loading', `Decoding ${label}...`);
+            fileBtn.disabled = true;
+            recordBtn.disabled = true;
+            try {
+                const offlineCtx = new OfflineAudioContext(1, 1, 24000);
+                const audioBuf = await offlineCtx.decodeAudioData(arrayBuf);
+                const outLen = Math.ceil(audioBuf.duration * 24000);
+                const resampleCtx = new OfflineAudioContext(1, outLen, 24000);
+                const source = resampleCtx.createBufferSource();
+                source.buffer = audioBuf;
+                source.connect(resampleCtx.destination);
+                source.start(0);
+                const rendered = await resampleCtx.startRendering();
+                const pcm = rendered.getChannelData(0);
+
+                worker.postMessage({ type: 'reset' });
+                transcriptText = '';
+                transcriptTextEl.textContent = '';
+                transcriptEl.classList.remove('empty');
+
+                const CHUNK = 2400;
+                updateStatus('loading', `Processing ${(pcm.length / 24000).toFixed(1)}s of audio...`);
+                for (let i = 0; i < pcm.length; i += CHUNK) {
+                    const chunk = pcm.slice(i, Math.min(i + CHUNK, pcm.length));
+                    worker.postMessage({ type: 'audio', samples: chunk }, [chunk.buffer]);
+                    if (i % (CHUNK * 10) === 0) await new Promise(r => setTimeout(r, 0));
+                }
+                worker.postMessage({ type: 'stop' });
+            } catch (err) {
+                updateStatus('error', 'File error: ' + err.message);
+                console.error(err);
+                fileBtn.disabled = false;
+                recordBtn.disabled = false;
+            }
+        }
+
+        exampleBtn.addEventListener('click', async () => {
+            const resp = await fetch('./joke.wav');
+            if (!resp.ok) { updateStatus('error', 'Failed to fetch example WAV'); return; }
+            await feedAudioFile(await resp.arrayBuffer(), 'joke.wav');
+        });
+
+        muteBtn.addEventListener('click', () => {
+            isMuted = !isMuted;
+            muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
+        });
+    </script>
+</body>
+</html>

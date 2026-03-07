@@ -1,0 +1,70 @@
+[package]
+name = "sts-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "STS 7B speech-to-speech transformer in Burn+wgpu — runs natively and in browser via WASM+WebGPU"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[features]
+default = ["wgpu"]
+wgpu = ["burn/wgpu", "burn/template"]
+wasm = [
+    "wgpu",
+    "dep:wgpu",
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "js-sys",
+    "web-sys",
+    "console_error_panic_hook",
+    "getrandom/wasm_js",
+]
+cli = ["clap", "indicatif"]
+hub = ["hf-hub"]
+
+[dependencies]
+# Burn ML framework
+burn = { workspace = true }
+cubecl = { workspace = true }
+
+# Core
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
+
+# Audio
+hound = { workspace = true }
+
+# Mimi audio codec (Candle-based, runs on CPU)
+mimi-rs = { path = "../../../mimi-rs" }
+candle-core = "0.9"
+candle-nn = "0.9"
+safetensors = "0.4"
+
+# CLI (optional)
+clap = { workspace = true, optional = true }
+indicatif = { workspace = true, optional = true }
+
+# HuggingFace Hub (optional)
+hf-hub = { workspace = true, optional = true }
+
+# WASM support (optional)
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+pollster = "0.4"

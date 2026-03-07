@@ -1,0 +1,10 @@
+target/
+.DS_Store
+*.wav
+*.json
+!web/*.json
+refs/
+__pycache__/
+*.pyc
+CLAUDE.md
+docs/

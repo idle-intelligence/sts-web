@@ -1,0 +1,55 @@
+[workspace]
+members = [
+    "crates/sts-wasm",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/idle-intelligence/sts-web"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+byteorder = "1.5"
+
+# Burn ML framework
+burn = { version = "0.20", default-features = false, features = ["std"] }
+cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
+
+# Audio
+hound = "3.5"
+
+# WASM support
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Response", "Request", "RequestInit", "RequestMode"] }
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", default-features = false }
+wgpu = { version = "26", features = ["fragile-send-sync-non-atomic-wasm"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.18"
+
+# HuggingFace Hub
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
+
+# Patch cubecl-wgpu to cap workgroup size for WebGPU's 256 invocation limit
+[patch.crates-io]
+cubecl-wgpu = { path = "patches/cubecl-wgpu-0.9.0" }

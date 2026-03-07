@@ -289,6 +289,7 @@
         <div class="actions" id="playbackControls" style="display:none">
             <button id="muteBtn">Mute</button>
         </div>
+        <audio id="audioPlayer" controls style="display:none; width:100%; margin-top:12px"></audio>
         <p id="audioStatus" class="info">Audio output will play here...</p>
     </section>
 
@@ -345,6 +346,7 @@
         const downloadBtn = document.getElementById('downloadBtn');
         const exampleBtn = document.getElementById('exampleBtn');
         const muteBtn = document.getElementById('muteBtn');
+        const audioPlayer = document.getElementById('audioPlayer');
         const playbackControls = document.getElementById('playbackControls');
         const audioStatus = document.getElementById('audioStatus');
         const metricsCard = document.getElementById('metricsCard');
@@ -363,6 +365,8 @@
         let isRecording = false;
         let isMuted = false;
         let transcriptText = '';
+        let micModuleLoaded = false;
+        let lastCompleteAudio = null; // Float32Array of full response audio
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -391,24 +395,21 @@
             await audioCtx.audioWorklet.addModule('./audio-playback.js');
             playbackNode = new AudioWorkletNode(audioCtx, 'audio-playback');
             playbackNode.connect(audioCtx.destination);
+
+            // Create a direct channel from Worker -> AudioWorklet for streaming audio
+            const channel = new MessageChannel();
+            playbackNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+            worker.postMessage({ type: 'playback-port', port: channel.port2 }, [channel.port2]);
+
             return playbackNode;
         }
 
         function sendAudioToPlayback(samples) {
-            if (isMuted) return;
-            if (!audioCtx) {
-                audioCtx = new AudioContext({ sampleRate: 24000 });
-            }
+            if (isMuted || !samples) return;
+            if (!playbackNode) return;
             if (audioCtx.state === 'suspended') audioCtx.resume();
-
-            const f32 = samples instanceof Float32Array ? samples : new Float32Array(samples);
-            const buf = audioCtx.createBuffer(1, f32.length, 24000);
-            buf.getChannelData(0).set(f32);
-            const source = audioCtx.createBufferSource();
-            source.buffer = buf;
-            source.connect(audioCtx.destination);
-            source.start();
-            console.log(`[audio] Playing ${(f32.length / 24000).toFixed(1)}s (${f32.length} samples)`);
+            // Fallback: send via main thread if direct port isn't set up
+            playbackNode.port.postMessage({ type: 'audio', samples });
         }
 
         // --- Worker setup ---
@@ -441,11 +442,28 @@
                         }
                         break;
 
-                    case 'audio-out':
-                        sendAudioToPlayback(msg.samples);
+                    case 'audio-chunk':
                         playbackControls.style.display = '';
-                        audioStatus.textContent = 'Playing audio...';
+                        audioStatus.textContent = msg.done
+                            ? 'Generation complete'
+                            : `Generating... frame ${msg.step + 1}`;
+                        if (msg.done && playbackNode) {
+                            // Tell worklet to stop prebuffering and play remaining audio
+                            playbackNode.port.postMessage({ type: 'flush' });
+                        }
                         break;
+
+                    case 'audio-complete': {
+                        lastCompleteAudio = msg.samples;
+                        // Build WAV blob and set as audio player source
+                        const wavBlob = buildWavBlob(msg.samples);
+                        if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
+                        audioPlayer._blobUrl = URL.createObjectURL(wavBlob);
+                        audioPlayer.src = audioPlayer._blobUrl;
+                        audioPlayer.style.display = 'block';
+                        audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
+                        break;
+                    }
 
                     case 'transcript': {
                         const cursor = document.getElementById('streamingCursor');
@@ -479,18 +497,24 @@
 
         // --- Cache check ---
 
-        // For local dev, skip the cache check — model is served from disk
         async function isModelCached() {
-            return false;
+            try {
+                const cache = await caches.open('sts-model-v1');
+                // Check if the first model shard is cached
+                return !!(await cache.match('/hf/personaplex-7b-v1-q4_k-webgpu/personaplex-7b-v1-q4_k.gguf.shard-00'));
+            } catch { return false; }
         }
 
         // --- Recording ---
 
         async function startRecording() {
-            if (!audioCtx) await initAudioPlayback();
+            if (!playbackNode) await initAudioPlayback();
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-            await audioCtx.audioWorklet.addModule('./audio-processor.js').catch(() => {});
+            if (!micModuleLoaded) {
+                await audioCtx.audioWorklet.addModule('./audio-processor.js');
+                micModuleLoaded = true;
+            }
             micStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     channelCount: 1,
@@ -549,6 +573,8 @@
 
         recordBtn.addEventListener('click', async () => {
             if (!isRecording) {
+                // Disable button during async startup to prevent race condition
+                recordBtn.disabled = true;
                 try {
                     worker.postMessage({ type: 'reset' });
                     transcriptText = '';
@@ -557,11 +583,13 @@
                     audioStatus.textContent = 'Audio output will play here...';
                     await startRecording();
                     isRecording = true;
+                    recordBtn.disabled = false;
                     recordBtn.textContent = 'Stop Recording';
                     recordBtn.classList.add('recording');
                     recordBtn.classList.remove('primary');
                     updateStatus('recording', 'Recording...');
                 } catch (err) {
+                    recordBtn.disabled = false;
                     updateStatus('error', 'Microphone error: ' + err.message);
                     console.error(err);
                 }
@@ -572,7 +600,7 @@
                 recordBtn.textContent = 'Start Recording';
                 recordBtn.classList.remove('recording');
                 recordBtn.classList.add('primary');
-                updateStatus('loading', 'Flushing...');
+                updateStatus('loading', 'Generating response...');
                 recordBtn.disabled = true;
             }
         });
@@ -589,7 +617,11 @@
             updateStatus('loading', `Decoding ${label}...`);
             fileBtn.disabled = true;
             recordBtn.disabled = true;
+            exampleBtn.disabled = true;
             try {
+                if (!playbackNode) await initAudioPlayback();
+                if (audioCtx.state === 'suspended') await audioCtx.resume();
+
                 const offlineCtx = new OfflineAudioContext(1, 1, 24000);
                 const audioBuf = await offlineCtx.decodeAudioData(arrayBuf);
                 const outLen = Math.ceil(audioBuf.duration * 24000);
@@ -606,12 +638,13 @@
                 transcriptTextEl.textContent = '';
                 transcriptEl.classList.remove('empty');
 
-                const CHUNK = 2400;
+                const CHUNK = 1920; // Match Mimi frame size
                 updateStatus('loading', `Processing ${(pcm.length / 24000).toFixed(1)}s of audio...`);
                 for (let i = 0; i < pcm.length; i += CHUNK) {
                     const chunk = pcm.slice(i, Math.min(i + CHUNK, pcm.length));
                     worker.postMessage({ type: 'audio', samples: chunk }, [chunk.buffer]);
-                    if (i % (CHUNK * 10) === 0) await new Promise(r => setTimeout(r, 0));
+                    // Yield periodically so worker can process and send status updates
+                    if ((i / CHUNK) % 10 === 0) await new Promise(r => setTimeout(r, 0));
                 }
                 worker.postMessage({ type: 'stop' });
             } catch (err) {
@@ -619,6 +652,7 @@
                 console.error(err);
                 fileBtn.disabled = false;
                 recordBtn.disabled = false;
+                exampleBtn.disabled = false;
             }
         }
 
@@ -632,6 +666,31 @@
             isMuted = !isMuted;
             muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
         });
+
+        function buildWavBlob(samples) {
+            const numSamples = samples.length;
+            const buffer = new ArrayBuffer(44 + numSamples * 2);
+            const view = new DataView(buffer);
+            const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+            writeStr(0, 'RIFF');
+            view.setUint32(4, 36 + numSamples * 2, true);
+            writeStr(8, 'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM
+            view.setUint16(22, 1, true); // mono
+            view.setUint32(24, 24000, true);
+            view.setUint32(28, 48000, true); // byte rate
+            view.setUint16(32, 2, true); // block align
+            view.setUint16(34, 16, true); // bits per sample
+            writeStr(36, 'data');
+            view.setUint32(40, numSamples * 2, true);
+            for (let i = 0; i < numSamples; i++) {
+                const s = Math.max(-1, Math.min(1, samples[i]));
+                view.setInt16(44 + i * 2, s * 32767, true);
+            }
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
     </script>
 </body>
 </html>

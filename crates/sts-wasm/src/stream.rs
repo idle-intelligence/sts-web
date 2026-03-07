@@ -107,7 +107,8 @@ pub struct StsStream {
     prompt_len: usize,
 
     /// Length of the full prefill (prompt_len + user_audio_frames).
-    prefill_len: usize,
+    /// Currently informational only — used for debugging.
+    _prefill_len: usize,
 
     /// Track last model audio tokens for silence detection
     last_model_audio_tokens: Vec<u32>,
@@ -128,6 +129,11 @@ pub struct StsStream {
     // Silence early stopping
     consecutive_silence_frames: usize,
     silence_early_stop_frames: usize,
+
+    // Text-based stopping: stop if text has been padding for N frames after real text
+    consecutive_text_pad_frames: usize,
+    text_pad_stop_frames: usize,
+    has_generated_text: bool,
 }
 
 impl StsStream {
@@ -147,7 +153,7 @@ impl StsStream {
             write_pos: 0,
             step: 0,
             prompt_len: 0,
-            prefill_len: 0,
+            _prefill_len: 0,
             text_temperature: 0.7,
             text_top_k: 25,
             audio_temperature: 0.8,
@@ -157,7 +163,10 @@ impl StsStream {
             repetition_penalty: 1.2,
             penalty_window: 30,
             consecutive_silence_frames: 0,
-            silence_early_stop_frames: 15,
+            silence_early_stop_frames: 8, // ~0.6s of silence triggers stop
+            consecutive_text_pad_frames: 0,
+            text_pad_stop_frames: 6, // ~0.5s of text padding after real text → stop
+            has_generated_text: false,
             config,
             temporal_cache,
             depth_cache,
@@ -414,7 +423,7 @@ impl StsStream {
             self.write_user_audio_tokens(start_pos + i, frame);
         }
         self.write_pos = start_pos + user_audio_frames.len();
-        self.prefill_len = self.write_pos;
+        self._prefill_len = self.write_pos;
 
         // Process each user audio step through temporal + depformer
         let nq = self.config.num_codebooks;
@@ -479,7 +488,6 @@ impl StsStream {
     /// Process one generation step (one 80ms frame at 12.5 Hz).
     pub async fn step(
         &mut self,
-        _user_audio_tokens: &[u32],
         temporal: &TemporalTransformer,
         depth: &DepthTransformer,
     ) -> StepOutput {
@@ -518,6 +526,9 @@ impl StsStream {
             .await
         };
         self.text_token_history.push(text_token);
+        if self.text_token_history.len() > self.penalty_window {
+            self.text_token_history.drain(..self.text_token_history.len() - self.penalty_window);
+        }
 
         // Step 3: Reset depth cache for this time step
         self.depth_cache.reset_keep_buffers();
@@ -563,8 +574,8 @@ impl StsStream {
         }
 
         // Build output
-        let mut model_audio_out = vec![0u32; nq];
-        model_audio_out[..agent_end].copy_from_slice(&agent[..agent_end]);
+        let mut model_audio_out = agent.clone();
+        model_audio_out.resize(nq, 0);
         self.last_model_audio_tokens = model_audio_out.clone();
 
         self.step += 1;
@@ -574,6 +585,16 @@ impl StsStream {
             self.consecutive_silence_frames += 1;
         } else {
             self.consecutive_silence_frames = 0;
+        }
+
+        // Track text padding for early stopping
+        if text_token == self.config.text_padding_id {
+            if self.has_generated_text {
+                self.consecutive_text_pad_frames += 1;
+            }
+        } else {
+            self.has_generated_text = true;
+            self.consecutive_text_pad_frames = 0;
         }
 
         StepOutput {
@@ -594,14 +615,21 @@ impl StsStream {
             .all(|(&got, &expected)| got == expected)
     }
 
-    /// Check if generation should stop due to sustained silence.
+    /// Check if generation should stop due to sustained silence or text completion.
     pub fn should_stop(&self) -> bool {
         self.consecutive_silence_frames >= self.silence_early_stop_frames
+            || (self.has_generated_text
+                && self.consecutive_text_pad_frames >= self.text_pad_stop_frames)
     }
 
     /// Get the number of consecutive silence frames so far.
     pub fn consecutive_silence_frames(&self) -> usize {
         self.consecutive_silence_frames
+    }
+
+    /// Get the number of consecutive text padding frames after real text.
+    pub fn consecutive_text_pad_frames(&self) -> usize {
+        self.consecutive_text_pad_frames
     }
 
     // -----------------------------------------------------------------------
@@ -635,11 +663,13 @@ impl StsStream {
         self.write_pos = 0;
         self.step = 0;
         self.prompt_len = 0;
-        self.prefill_len = 0;
+        self._prefill_len = 0;
         self.last_model_audio_tokens = self.config.silence_tokens.to_vec();
         self.text_token_history.clear();
         for h in &mut self.audio_token_history { h.clear(); }
         self.consecutive_silence_frames = 0;
+        self.consecutive_text_pad_frames = 0;
+        self.has_generated_text = false;
         self.temporal_cache.reset();
         self.depth_cache.reset();
     }
@@ -650,11 +680,13 @@ impl StsStream {
         self.write_pos = 0;
         self.step = 0;
         self.prompt_len = 0;
-        self.prefill_len = 0;
+        self._prefill_len = 0;
         self.last_model_audio_tokens = self.config.silence_tokens.to_vec();
         self.text_token_history.clear();
         for h in &mut self.audio_token_history { h.clear(); }
         self.consecutive_silence_frames = 0;
+        self.consecutive_text_pad_frames = 0;
+        self.has_generated_text = false;
         self.temporal_cache.reset_keep_buffers();
         self.depth_cache.reset_keep_buffers();
     }

@@ -151,13 +151,11 @@ impl Default for StsConfig {
             delays: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
             frame_rate: 12.5,
 
-            // "focused" persona: "<system> You are a helpful assistant. Listen carefully
-            // to what the user says, then respond directly to their question or request.
-            // Stay on topic. Be concise. <system>"
+            // PersonaPlex default: "<system> You are a wise and friendly teacher.
+            // Answer questions or provide advice in a clear and engaging way. <system>"
             system_prompt_tokens: vec![
-                607, 4831, 578, 493, 298, 272, 3850, 5019, 263, 17453, 6716, 269, 419, 262,
-                819, 1182, 261, 409, 4816, 1312, 269, 347, 560, 307, 2498, 263, 17308, 291,
-                3398, 263, 1451, 22876, 263, 607, 4831, 578,
+                607, 4831, 578, 493, 298, 272, 11821, 267, 7514, 3290, 263, 506, 1292, 307,
+                775, 3574, 271, 272, 1195, 267, 12250, 488, 263, 607, 4831, 578,
             ],
         }
     }

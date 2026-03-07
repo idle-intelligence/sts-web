@@ -22,7 +22,9 @@ use burn::tensor::activation::{silu, softmax};
 use burn::tensor::Tensor;
 
 use crate::gguf::{EmbeddingStore, Linear};
-use crate::model::{sample_greedy, sample_top_k, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::model::{sample_greedy, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::model::sample_top_k;
 use crate::StsConfig;
 
 // ---------------------------------------------------------------------------
@@ -411,6 +413,7 @@ impl DepthTransformer {
     /// states and logits for comparison against a BF16 reference.
     ///
     /// Returns (audio_tokens, depth_log).
+    #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn generate_with_logging(
         &self,
@@ -536,7 +539,8 @@ impl DepthTransformer {
     }
 }
 
-/// Log entry for a single depth step.
+/// Log entry for a single depth step (native only).
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DepthStepLog {
     pub step: usize,
@@ -547,7 +551,8 @@ pub struct DepthStepLog {
     pub token: u32,
 }
 
-/// Token ID and its logit value for top-k logging.
+/// Token ID and its logit value for top-k logging (native only).
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TokenLogit {
     pub token: usize,

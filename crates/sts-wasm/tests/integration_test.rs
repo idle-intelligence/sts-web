@@ -76,7 +76,7 @@ fn test_load_full_model() {
 
     let dummy_tokens = vec![0u32; config.num_codebooks];
     println!("Running one inference step...");
-    let out = pollster::block_on(stream.step(&dummy_tokens, &temporal, &depth));
+    let out = pollster::block_on(stream.step(&temporal, &depth));
     println!("  text_token: {}", out.text_token);
     println!("  model_audio_tokens: {:?}", out.model_audio_tokens);
     println!("Inference step completed!");
@@ -140,7 +140,7 @@ fn test_compare_reference() {
         println!("BF16 ref norm: 2.4808");
     }
 
-    let out = pollster::block_on(stream.step(&user_tokens, &temporal, &depth));
+    let out = pollster::block_on(stream.step(&temporal, &depth));
 
     println!("Q4 Text token (greedy): {}", out.text_token);
     println!("Q4 Audio tokens: {:?}", out.model_audio_tokens);
@@ -439,7 +439,7 @@ fn test_end_to_end_audio() {
     let gen_start = std::time::Instant::now();
     for i in 0..max_response_frames {
         let frame_start = std::time::Instant::now();
-        let out = pollster::block_on(stream.step(&sine_tokens, &temporal, &depth));
+        let out = pollster::block_on(stream.step(&temporal, &depth));
         let frame_ms = frame_start.elapsed().as_millis();
 
         // Collect model audio tokens

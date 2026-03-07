@@ -205,7 +205,7 @@ impl StsEngine {
             prefilled: false,
             generating: false,
             gen_step: 0,
-            max_gen_frames: 100,
+            max_gen_frames: 50, // ~4s at 12.5 Hz
             voice_preset_embeddings: None,
             voice_preset_num_frames: 0,
             voice_preset_cache: None,

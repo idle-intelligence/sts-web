@@ -158,7 +158,7 @@ impl StsStream {
             repetition_penalty: 1.2,
             penalty_window: 30,
             consecutive_silence_frames: 0,
-            silence_early_stop_frames: 15,
+            silence_early_stop_frames: 8, // ~0.6s of silence triggers stop
             config,
             temporal_cache,
             depth_cache,

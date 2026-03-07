@@ -129,6 +129,11 @@ pub struct StsStream {
     // Silence early stopping
     consecutive_silence_frames: usize,
     silence_early_stop_frames: usize,
+
+    // Text-based stopping: stop if text has been padding for N frames after real text
+    consecutive_text_pad_frames: usize,
+    text_pad_stop_frames: usize,
+    has_generated_text: bool,
 }
 
 impl StsStream {
@@ -159,6 +164,9 @@ impl StsStream {
             penalty_window: 30,
             consecutive_silence_frames: 0,
             silence_early_stop_frames: 8, // ~0.6s of silence triggers stop
+            consecutive_text_pad_frames: 0,
+            text_pad_stop_frames: 6, // ~0.5s of text padding after real text → stop
+            has_generated_text: false,
             config,
             temporal_cache,
             depth_cache,
@@ -579,6 +587,16 @@ impl StsStream {
             self.consecutive_silence_frames = 0;
         }
 
+        // Track text padding for early stopping
+        if text_token == self.config.text_padding_id {
+            if self.has_generated_text {
+                self.consecutive_text_pad_frames += 1;
+            }
+        } else {
+            self.has_generated_text = true;
+            self.consecutive_text_pad_frames = 0;
+        }
+
         StepOutput {
             model_audio_tokens: model_audio_out,
             text_token,
@@ -597,14 +615,21 @@ impl StsStream {
             .all(|(&got, &expected)| got == expected)
     }
 
-    /// Check if generation should stop due to sustained silence.
+    /// Check if generation should stop due to sustained silence or text completion.
     pub fn should_stop(&self) -> bool {
         self.consecutive_silence_frames >= self.silence_early_stop_frames
+            || (self.has_generated_text
+                && self.consecutive_text_pad_frames >= self.text_pad_stop_frames)
     }
 
     /// Get the number of consecutive silence frames so far.
     pub fn consecutive_silence_frames(&self) -> usize {
         self.consecutive_silence_frames
+    }
+
+    /// Get the number of consecutive text padding frames after real text.
+    pub fn consecutive_text_pad_frames(&self) -> usize {
+        self.consecutive_text_pad_frames
     }
 
     // -----------------------------------------------------------------------
@@ -643,6 +668,8 @@ impl StsStream {
         self.text_token_history.clear();
         for h in &mut self.audio_token_history { h.clear(); }
         self.consecutive_silence_frames = 0;
+        self.consecutive_text_pad_frames = 0;
+        self.has_generated_text = false;
         self.temporal_cache.reset();
         self.depth_cache.reset();
     }
@@ -658,6 +685,8 @@ impl StsStream {
         self.text_token_history.clear();
         for h in &mut self.audio_token_history { h.clear(); }
         self.consecutive_silence_frames = 0;
+        self.consecutive_text_pad_frames = 0;
+        self.has_generated_text = false;
         self.temporal_cache.reset_keep_buffers();
         self.depth_cache.reset_keep_buffers();
     }

@@ -288,9 +288,8 @@
         <h2>output <span class="sub">· audio</span></h2>
         <div class="actions" id="playbackControls" style="display:none">
             <button id="muteBtn">Mute</button>
-            <button id="replayBtn" style="display:none">Replay</button>
-            <button id="downloadBtn2" style="display:none">Download WAV</button>
         </div>
+        <audio id="audioPlayer" controls style="display:none; width:100%; margin-top:12px"></audio>
         <p id="audioStatus" class="info">Audio output will play here...</p>
     </section>
 
@@ -347,8 +346,7 @@
         const downloadBtn = document.getElementById('downloadBtn');
         const exampleBtn = document.getElementById('exampleBtn');
         const muteBtn = document.getElementById('muteBtn');
-        const replayBtn = document.getElementById('replayBtn');
-        const downloadBtn2 = document.getElementById('downloadBtn2');
+        const audioPlayer = document.getElementById('audioPlayer');
         const playbackControls = document.getElementById('playbackControls');
         const audioStatus = document.getElementById('audioStatus');
         const metricsCard = document.getElementById('metricsCard');
@@ -455,12 +453,17 @@
                         }
                         break;
 
-                    case 'audio-complete':
+                    case 'audio-complete': {
                         lastCompleteAudio = msg.samples;
-                        replayBtn.style.display = '';
-                        downloadBtn2.style.display = '';
+                        // Build WAV blob and set as audio player source
+                        const wavBlob = buildWavBlob(msg.samples);
+                        if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
+                        audioPlayer._blobUrl = URL.createObjectURL(wavBlob);
+                        audioPlayer.src = audioPlayer._blobUrl;
+                        audioPlayer.style.display = 'block';
                         audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
                         break;
+                    }
 
                     case 'transcript': {
                         const cursor = document.getElementById('streamingCursor');
@@ -664,28 +667,10 @@
             muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
         });
 
-        replayBtn.addEventListener('click', () => {
-            if (!lastCompleteAudio || !audioCtx) return;
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-            const buf = audioCtx.createBuffer(1, lastCompleteAudio.length, 24000);
-            buf.getChannelData(0).set(lastCompleteAudio);
-            const source = audioCtx.createBufferSource();
-            source.buffer = buf;
-            source.connect(audioCtx.destination);
-            source.start();
-            audioStatus.textContent = 'Replaying...';
-            source.onended = () => {
-                audioStatus.textContent = `Response: ${(lastCompleteAudio.length / 24000).toFixed(1)}s audio`;
-            };
-        });
-
-        downloadBtn2.addEventListener('click', () => {
-            if (!lastCompleteAudio) return;
-            const samples = lastCompleteAudio;
+        function buildWavBlob(samples) {
             const numSamples = samples.length;
             const buffer = new ArrayBuffer(44 + numSamples * 2);
             const view = new DataView(buffer);
-            // WAV header
             const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
             writeStr(0, 'RIFF');
             view.setUint32(4, 36 + numSamples * 2, true);
@@ -704,14 +689,8 @@
                 const s = Math.max(-1, Math.min(1, samples[i]));
                 view.setInt16(44 + i * 2, s * 32767, true);
             }
-            const blob = new Blob([buffer], { type: 'audio/wav' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `sts-output-${Date.now()}.wav`;
-            a.click();
-            URL.revokeObjectURL(url);
-        });
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
     </script>
 </body>
 </html>

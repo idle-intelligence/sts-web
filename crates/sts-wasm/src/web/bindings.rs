@@ -205,7 +205,7 @@ impl StsEngine {
             prefilled: false,
             generating: false,
             gen_step: 0,
-            max_gen_frames: 50, // ~4s at 12.5 Hz
+            max_gen_frames: 75, // ~6s at 12.5 Hz
             voice_preset_embeddings: None,
             voice_preset_num_frames: 0,
             voice_preset_cache: None,
@@ -635,7 +635,11 @@ impl StsEngine {
         let done = stream.should_stop() || self.gen_step >= self.max_gen_frames;
         if done {
             if stream.should_stop() {
-                wasm_log(&format!("[sts] Silence early stop at frame {i}"));
+                wasm_log(&format!(
+                    "[sts] Early stop at frame {i} (silence={}, text_pad={})",
+                    stream.consecutive_silence_frames(),
+                    stream.consecutive_text_pad_frames(),
+                ));
             }
             wasm_log(&format!(
                 "[sts] Generated {} frames in {:.1}s",

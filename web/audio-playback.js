@@ -20,6 +20,14 @@ class AudioPlayback extends AudioWorkletProcessor {
         this.port.onmessage = (e) => {
             if (e.data && e.data.type === 'audio') {
                 this._enqueue(e.data.samples);
+            } else if (e.data && e.data.type === 'port') {
+                // Direct port from Worker for streaming audio (bypasses main thread)
+                const directPort = e.data.port;
+                directPort.onmessage = (ev) => {
+                    if (ev.data && ev.data.type === 'audio') {
+                        this._enqueue(ev.data.samples);
+                    }
+                };
             }
         };
     }

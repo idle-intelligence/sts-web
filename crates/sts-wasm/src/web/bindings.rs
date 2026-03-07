@@ -3,10 +3,10 @@
 //! Provides JavaScript-callable APIs for GPU-accelerated Q4 inference
 //! in browsers with WebGPU support.
 //!
-//! Pipeline:
-//!   1. feedAudio() — encode PCM with Mimi, accumulate user audio frames
-//!   2. flush()     — prefill system prompt → prefill user audio → generate response
-//!   3. Output audio + text tokens returned from flush()
+//! Streaming pipeline:
+//!   1. feedAudio()      — encode PCM with Mimi, prefill each frame through temporal+depth
+//!   2. generateStart()  — prepare for autoregressive generation
+//!   3. generateStep()   — one generation step, returns audio chunk + text (or null when done)
 
 use wasm_bindgen::prelude::*;
 
@@ -145,9 +145,10 @@ pub async fn init_wgpu_device() {
 
 /// Browser-facing STS engine combining Mimi codec + STS transformers.
 ///
-/// Pipeline:
-///   feedAudio(samples) — encode PCM, accumulate user audio frames
-///   flush()            — prefill + generate response, return audio + text
+/// Streaming pipeline:
+///   feedAudio(samples)  — encode PCM with Mimi, prefill each frame incrementally
+///   generateStart()     — prepare for autoregressive generation
+///   generateStep()      — one step → { audio, text } or null when done
 #[cfg_attr(target_family = "wasm", wasm_bindgen)]
 pub struct StsEngine {
     temporal: Option<TemporalTransformer>,
@@ -165,8 +166,12 @@ pub struct StsEngine {
 
     // Audio input buffering
     pcm_buffer: Vec<f32>,
-    user_audio_frames: Vec<Vec<u32>>,
     prefilled: bool,
+
+    // Generation state
+    generating: bool,
+    gen_step: usize,
+    max_gen_frames: usize,
 
     // Voice preset (pre-computed embeddings + token cache snapshot)
     voice_preset_embeddings: Option<Vec<f32>>,
@@ -198,8 +203,10 @@ impl StsEngine {
             metrics: SessionMetrics::new(),
             incremental_loader: None,
             pcm_buffer: Vec::new(),
-            user_audio_frames: Vec::new(),
             prefilled: false,
+            generating: false,
+            gen_step: 0,
+            max_gen_frames: 100,
             voice_preset_embeddings: None,
             voice_preset_num_frames: 0,
             voice_preset_cache: None,
@@ -447,17 +454,21 @@ impl StsEngine {
 
     /// Feed PCM audio samples (f32, 24kHz mono).
     ///
-    /// Encodes audio with Mimi and accumulates user audio frames.
-    /// No model inference happens here — call `flush()` after user stops speaking.
+    /// Encodes audio with Mimi and immediately prefills each frame through
+    /// the temporal+depth transformers. This means prefill happens while the
+    /// user is still speaking, not after they stop.
     ///
-    /// Returns a JS object: `{ audio: null, text: null }` (no output during user speech).
+    /// Returns the number of frames prefilled in this call.
     #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = feedAudio))]
-    pub fn feed_audio(&mut self, samples: &[f32]) -> JsValue {
+    pub async fn feed_audio(&mut self, samples: &[f32]) -> u32 {
+        // Ensure system prompt is prefilled (lazy, first call only)
+        self.ensure_prefilled();
+
         let mimi = match self.mimi.as_mut() {
             Some(m) => m,
             None => {
                 wasm_log("[sts] Warning: feedAudio called before Mimi loaded");
-                return js_sys::Object::new().into();
+                return 0;
             }
         };
 
@@ -467,7 +478,8 @@ impl StsEngine {
         let frame_size = 1920; // 80ms at 24kHz
         let num_codebooks = self.config.num_codebooks; // 8
 
-        // Encode complete frames with Mimi
+        // Encode complete frames with Mimi and collect tokens
+        let mut new_frames: Vec<Vec<u32>> = Vec::new();
         while self.pcm_buffer.len() >= frame_size {
             let frame_pcm: Vec<f32> = self.pcm_buffer.drain(..frame_size).collect();
 
@@ -475,8 +487,6 @@ impl StsEngine {
             let tokens = mimi.encode(&frame_pcm);
             self.metrics.total_mimi_ms += now_ms() - t0;
 
-            // Mimi returns tokens in frame-major order: [tok0..tokN] per frame.
-            // We only need the first 8 codebooks for PersonaPlex.
             let mimi_codebooks = mimi.num_codebooks();
             if tokens.len() >= num_codebooks {
                 let n_frames = tokens.len() / mimi_codebooks;
@@ -484,178 +494,193 @@ impl StsEngine {
                     let offset = f * mimi_codebooks;
                     let frame_tokens: Vec<u32> =
                         tokens[offset..offset + num_codebooks].to_vec();
-                    self.user_audio_frames.push(frame_tokens);
+                    new_frames.push(frame_tokens);
                 }
             }
         }
 
-        // Return empty result during user speech
-        let result = js_sys::Object::new();
-        js_sys::Reflect::set(&result, &"audio".into(), &JsValue::NULL).ok();
-        js_sys::Reflect::set(&result, &"text".into(), &JsValue::NULL).ok();
-        result.into()
-    }
+        // Prefill each new frame incrementally through temporal+depth
+        let num_new = new_frames.len() as u32;
+        if !new_frames.is_empty() {
+            let temporal = match self.temporal.as_ref() {
+                Some(t) => t,
+                None => return 0,
+            };
+            let depth = match self.depth.as_ref() {
+                Some(d) => d,
+                None => return 0,
+            };
+            let stream = match self.stream.as_mut() {
+                Some(s) => s,
+                None => return 0,
+            };
 
-    /// Generate the model's response after user stops speaking.
-    ///
-    /// Runs the full PersonaPlex pipeline:
-    ///   1. System prompt prefill (silence → text → silence)
-    ///   2. User audio prefill (Mimi tokens through temporal + depformer)
-    ///   3. Autoregressive generation until silence or max frames
-    ///   4. Mimi decode of response audio tokens
-    ///
-    /// Returns a JS object: `{ audio: Float32Array, text: string }`
-    #[cfg_attr(target_family = "wasm", wasm_bindgen)]
-    pub async fn flush(&mut self) -> JsValue {
-        let result = js_sys::Object::new();
-
-        let temporal = match self.temporal.as_ref() {
-            Some(t) => t,
-            None => return result.into(),
-        };
-        let depth = match self.depth.as_ref() {
-            Some(d) => d,
-            None => return result.into(),
-        };
-        let stream = match self.stream.as_mut() {
-            Some(s) => s,
-            None => return result.into(),
-        };
-        let mimi = match self.mimi.as_mut() {
-            Some(m) => m,
-            None => return result.into(),
-        };
-
-        let num_codebooks = self.config.num_codebooks; // 8
-        let max_gen_frames = 100; // ~8s at 12.5Hz
-
-        // Phase 1: Voice preset + system prompt prefill (if not done yet)
-        if !self.prefilled {
             let t0 = now_ms();
-
-            // Voice preset (optional)
-            if let (Some(embeddings), Some(cache_snapshot)) = (
-                self.voice_preset_embeddings.as_ref(),
-                self.voice_preset_cache.as_ref(),
-            ) {
-                wasm_log(&format!(
-                    "[sts] Running voice preset ({} frames)...",
-                    self.voice_preset_num_frames
-                ));
-                stream.prefill_voice_preset(
-                    embeddings,
-                    self.voice_preset_num_frames,
-                    cache_snapshot,
-                    temporal,
-                );
-                wasm_log("[sts] Voice preset complete");
-            }
-
-            wasm_log("[sts] Running system prompt prefill...");
-            stream.prefill(temporal);
-            self.metrics.total_temporal_ms += now_ms() - t0;
-            self.prefilled = true;
-
-            // Reset Mimi streaming state after prefill (matches Python:
-            // mimi.reset_streaming() after step_system_prompts, before user audio)
-            mimi.reset();
-            wasm_log("[sts] Prefill complete");
-        }
-
-        // Phase 2: Feed user audio frames through temporal + depformer
-        let user_frames = std::mem::take(&mut self.user_audio_frames);
-        if !user_frames.is_empty() {
-            let t0 = now_ms();
-            wasm_log(&format!(
-                "[sts] Prefilling {} user audio frames...",
-                user_frames.len()
-            ));
-            stream.prefill_user_audio(&user_frames, temporal, depth).await;
+            stream.prefill_user_audio(&new_frames, temporal, depth).await;
             let elapsed = now_ms() - t0;
             self.metrics.total_temporal_ms += elapsed;
             self.metrics.total_depth_ms += elapsed;
-            wasm_log(&format!("[sts] User audio prefill done ({elapsed:.0}ms)"));
         }
 
-        // Phase 3: Generate response
-        wasm_log("[sts] Generating response...");
+        num_new
+    }
+
+    /// Run voice preset + system prompt prefill (lazy, idempotent).
+    fn ensure_prefilled(&mut self) {
+        if self.prefilled {
+            return;
+        }
+
+        let temporal = match self.temporal.as_ref() {
+            Some(t) => t,
+            None => return,
+        };
+        let stream = match self.stream.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let t0 = now_ms();
+
+        // Voice preset (optional)
+        if let (Some(embeddings), Some(cache_snapshot)) = (
+            self.voice_preset_embeddings.as_ref(),
+            self.voice_preset_cache.as_ref(),
+        ) {
+            wasm_log(&format!(
+                "[sts] Running voice preset ({} frames)...",
+                self.voice_preset_num_frames
+            ));
+            stream.prefill_voice_preset(
+                embeddings,
+                self.voice_preset_num_frames,
+                cache_snapshot,
+                temporal,
+            );
+            wasm_log("[sts] Voice preset complete");
+        }
+
+        wasm_log("[sts] Running system prompt prefill...");
+        stream.prefill(temporal);
+        self.metrics.total_temporal_ms += now_ms() - t0;
+        self.prefilled = true;
+
+        // Reset Mimi streaming state after prefill (matches Python)
+        if let Some(mimi) = self.mimi.as_mut() {
+            mimi.reset();
+        }
+        wasm_log("[sts] Prefill complete");
+    }
+
+    /// Prepare for autoregressive generation after user stops speaking.
+    ///
+    /// Call this after the last `feedAudio()`, before the `generateStep()` loop.
+    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = generateStart))]
+    pub fn generate_start(&mut self) {
+        self.ensure_prefilled();
+        self.generating = true;
+        self.gen_step = 0;
         self.metrics.reset();
-        let mut all_audio_tokens: Vec<Vec<u32>> = Vec::new();
-        let mut text_tokens: Vec<u32> = Vec::new();
+        wasm_log("[sts] Generation started");
+    }
+
+    /// Run one generation step. Returns a JS object with audio + text,
+    /// or null if generation is complete (silence stop or max frames).
+    ///
+    /// JS usage:
+    /// ```js
+    /// engine.generateStart();
+    /// while (true) {
+    ///     const chunk = await engine.generateStep();
+    ///     if (!chunk) break;
+    ///     playAudio(chunk.audio);
+    ///     showText(chunk.text);
+    /// }
+    /// ```
+    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = generateStep))]
+    pub async fn generate_step(&mut self) -> JsValue {
+        if !self.generating {
+            return JsValue::NULL;
+        }
+
+        let temporal = match self.temporal.as_ref() {
+            Some(t) => t,
+            None => return JsValue::NULL,
+        };
+        let depth = match self.depth.as_ref() {
+            Some(d) => d,
+            None => return JsValue::NULL,
+        };
+        let stream = match self.stream.as_mut() {
+            Some(s) => s,
+            None => return JsValue::NULL,
+        };
+
         let sine = self.config.sine_tokens.to_vec();
 
-        for i in 0..max_gen_frames {
-            let t0 = now_ms();
-            let output = stream.step(&sine, temporal, depth).await;
-            let elapsed = now_ms() - t0;
-            self.metrics.total_ms += elapsed;
-            self.metrics.total_frames += 1;
-
-            // Log first few frames for debugging
-            if i < 5 || i % 50 == 0 {
-                let toks: Vec<String> = output.model_audio_tokens.iter().map(|t| t.to_string()).collect();
-                wasm_log(&format!(
-                    "[sts] Frame {i}: text={} audio=[{}] ({:.0}ms)",
-                    output.text_token, toks.join(","), elapsed
-                ));
-            }
-
-            all_audio_tokens.push(output.model_audio_tokens);
-            text_tokens.push(output.text_token);
-
-            if stream.should_stop() {
-                wasm_log(&format!("[sts] Silence early stop at frame {i}"));
-                break;
-            }
-        }
-
-        wasm_log(&format!(
-            "[sts] Generated {} gen frames in {:.1}s",
-            self.metrics.total_frames,
-            self.metrics.total_ms / 1000.0
-        ));
-
-        // Phase 4: Decode audio tokens with Mimi
+        // Run one step
         let t0 = now_ms();
-        let mut pcm_out: Vec<f32> = Vec::new();
-        for frame_tokens in &all_audio_tokens {
-            let pcm = mimi.decode_n(frame_tokens, num_codebooks);
-            pcm_out.extend_from_slice(&pcm);
-        }
-        self.metrics.total_mimi_ms += now_ms() - t0;
+        let output = stream.step(&sine, temporal, depth).await;
+        let elapsed = now_ms() - t0;
+        self.metrics.total_ms += elapsed;
+        self.metrics.total_frames += 1;
 
-        // Log PCM stats for debugging
-        if !pcm_out.is_empty() {
-            let max_abs = pcm_out.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-            let rms = (pcm_out.iter().map(|s| s * s).sum::<f32>() / pcm_out.len() as f32).sqrt();
+        let i = self.gen_step;
+        if i < 5 || i.is_multiple_of(50) {
+            let toks: Vec<String> = output.model_audio_tokens.iter().map(|t| t.to_string()).collect();
             wasm_log(&format!(
-                "[sts] PCM: {} samples, max={:.4}, rms={:.4}, decode={:.0}ms",
-                pcm_out.len(), max_abs, rms, self.metrics.total_mimi_ms
+                "[sts] Frame {i}: text={} audio=[{}] ({:.0}ms)",
+                output.text_token, toks.join(","), elapsed
             ));
         }
 
-        // Build audio output
-        if !pcm_out.is_empty() {
-            let audio = js_sys::Float32Array::new_with_length(pcm_out.len() as u32);
-            audio.copy_from(&pcm_out);
-            js_sys::Reflect::set(&result, &"audio".into(), &audio.into()).ok();
+        // Check if we should stop
+        self.gen_step += 1;
+        let done = stream.should_stop() || self.gen_step >= self.max_gen_frames;
+        if done {
+            if stream.should_stop() {
+                wasm_log(&format!("[sts] Silence early stop at frame {i}"));
+            }
+            wasm_log(&format!(
+                "[sts] Generated {} frames in {:.1}s",
+                self.metrics.total_frames,
+                self.metrics.total_ms / 1000.0
+            ));
+            self.generating = false;
         }
 
-        // Build text output
-        let text_str = if let Some(tok) = &self.tokenizer {
-            tok.decode(&text_tokens)
-        } else {
-            // Fallback: comma-separated IDs
-            text_tokens
-                .iter()
-                .filter(|&&t| t != self.config.text_padding_id)
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
+        // Decode audio with Mimi
+        let mimi = match self.mimi.as_mut() {
+            Some(m) => m,
+            None => return JsValue::NULL,
         };
-        if !text_str.is_empty() {
-            js_sys::Reflect::set(&result, &"text".into(), &JsValue::from_str(&text_str)).ok();
+        let num_codebooks = self.config.num_codebooks;
+        let t0 = now_ms();
+        let pcm = mimi.decode_n(&output.model_audio_tokens, num_codebooks);
+        self.metrics.total_mimi_ms += now_ms() - t0;
+
+        // Build result: { audio: Float32Array, text: string|null, done: bool, step: number }
+        let result = js_sys::Object::new();
+
+        let audio = js_sys::Float32Array::new_with_length(pcm.len() as u32);
+        audio.copy_from(&pcm);
+        js_sys::Reflect::set(&result, &"audio".into(), &audio.into()).ok();
+
+        // Decode text token
+        let text_token = output.text_token;
+        if text_token != self.config.text_padding_id {
+            let text_str = if let Some(tok) = &self.tokenizer {
+                tok.decode(&[text_token])
+            } else {
+                text_token.to_string()
+            };
+            if !text_str.is_empty() {
+                js_sys::Reflect::set(&result, &"text".into(), &JsValue::from_str(&text_str)).ok();
+            }
         }
+
+        js_sys::Reflect::set(&result, &"done".into(), &JsValue::from_bool(done)).ok();
+        js_sys::Reflect::set(&result, &"step".into(), &JsValue::from_f64(i as f64)).ok();
 
         result.into()
     }
@@ -725,8 +750,9 @@ impl StsEngine {
             mimi.reset();
         }
         self.pcm_buffer.clear();
-        self.user_audio_frames.clear();
         self.prefilled = false;
+        self.generating = false;
+        self.gen_step = 0;
         self.metrics.reset();
     }
 

@@ -420,15 +420,15 @@ impl Q4Tensor {
 
         let client = WgpuRuntime::client(device);
 
-        let padded = if !raw_bytes.len().is_multiple_of(4) {
+        let handle = if !raw_bytes.len().is_multiple_of(4) {
             let pad = 4 - (raw_bytes.len() % 4);
             let mut buf = raw_bytes.to_vec();
             buf.resize(raw_bytes.len() + pad, 0);
-            buf
+            client.create_from_slice(&buf)
         } else {
-            raw_bytes.to_vec()
+            // Already 4-byte aligned — upload directly without copying
+            client.create_from_slice(raw_bytes)
         };
-        let handle = client.create_from_slice(&padded);
 
         Ok(Self {
             handle,
@@ -499,15 +499,15 @@ impl Q4KTensor {
 
         let client = WgpuRuntime::client(device);
 
-        let padded = if !raw_bytes.len().is_multiple_of(4) {
+        let handle = if !raw_bytes.len().is_multiple_of(4) {
             let pad = 4 - (raw_bytes.len() % 4);
             let mut buf = raw_bytes.to_vec();
             buf.resize(raw_bytes.len() + pad, 0);
-            buf
+            client.create_from_slice(&buf)
         } else {
-            raw_bytes.to_vec()
+            // Already 4-byte aligned — upload directly without copying
+            client.create_from_slice(raw_bytes)
         };
-        let handle = client.create_from_slice(&padded);
 
         Ok(Self {
             handle,
@@ -551,18 +551,18 @@ impl Q4KLinear {
 
 /// A dense (F32) linear layer for precision-sensitive weights.
 pub struct DenseLinear {
-    weight: Tensor<Wgpu, 2>, // [out_features, in_features]
+    weight_t: Tensor<Wgpu, 2>, // [in_features, out_features] (pre-transposed)
 }
 
 impl DenseLinear {
     pub fn new(weight: Tensor<Wgpu, 2>) -> Self {
-        Self { weight }
+        // Pre-transpose at construction to avoid clone+transpose every forward call
+        Self { weight_t: weight.transpose() }
     }
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
-        // x: [B, M, K], weight: [N, K] → output: [B, M, N]
-        let w_t = self.weight.clone().transpose(); // [K, N]
-        burn::tensor::Tensor::matmul(x, w_t.unsqueeze::<3>())
+        // x: [B, M, K], weight_t: [K, N] → output: [B, M, N]
+        burn::tensor::Tensor::matmul(x, self.weight_t.clone().unsqueeze::<3>())
     }
 }
 

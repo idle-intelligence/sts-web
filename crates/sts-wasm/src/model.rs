@@ -714,6 +714,9 @@ impl TemporalTransformer {
     /// Returns (hidden_state, text_logits, log) where `log` is a
     /// `TemporalForwardLog` containing embedding sum, per-layer hidden
     /// states, and post-norm hidden state.
+    ///
+    /// NOT available in WASM: uses sync GPU readback (`.to_data()`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn forward_with_logging(
         &self,
         user_audio_tokens: &[i32],
@@ -797,7 +800,8 @@ impl TemporalTransformer {
     }
 }
 
-/// Per-layer log entry for debugging.
+/// Per-layer log entry for debugging (native only).
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LayerLog {
     pub layer: usize,
@@ -805,7 +809,8 @@ pub struct LayerLog {
     pub first_10: Vec<f32>,
 }
 
-/// Full log of temporal transformer forward pass intermediates.
+/// Full log of temporal transformer forward pass intermediates (native only).
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TemporalForwardLog {
     pub embedding_sum_norm: f32,

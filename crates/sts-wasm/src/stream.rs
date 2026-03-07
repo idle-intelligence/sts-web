@@ -107,7 +107,8 @@ pub struct StsStream {
     prompt_len: usize,
 
     /// Length of the full prefill (prompt_len + user_audio_frames).
-    prefill_len: usize,
+    /// Currently informational only — used for debugging.
+    _prefill_len: usize,
 
     /// Track last model audio tokens for silence detection
     last_model_audio_tokens: Vec<u32>,
@@ -147,7 +148,7 @@ impl StsStream {
             write_pos: 0,
             step: 0,
             prompt_len: 0,
-            prefill_len: 0,
+            _prefill_len: 0,
             text_temperature: 0.7,
             text_top_k: 25,
             audio_temperature: 0.8,
@@ -414,7 +415,7 @@ impl StsStream {
             self.write_user_audio_tokens(start_pos + i, frame);
         }
         self.write_pos = start_pos + user_audio_frames.len();
-        self.prefill_len = self.write_pos;
+        self._prefill_len = self.write_pos;
 
         // Process each user audio step through temporal + depformer
         let nq = self.config.num_codebooks;
@@ -479,7 +480,6 @@ impl StsStream {
     /// Process one generation step (one 80ms frame at 12.5 Hz).
     pub async fn step(
         &mut self,
-        _user_audio_tokens: &[u32],
         temporal: &TemporalTransformer,
         depth: &DepthTransformer,
     ) -> StepOutput {
@@ -518,6 +518,9 @@ impl StsStream {
             .await
         };
         self.text_token_history.push(text_token);
+        if self.text_token_history.len() > self.penalty_window {
+            self.text_token_history.drain(..self.text_token_history.len() - self.penalty_window);
+        }
 
         // Step 3: Reset depth cache for this time step
         self.depth_cache.reset_keep_buffers();
@@ -563,8 +566,8 @@ impl StsStream {
         }
 
         // Build output
-        let mut model_audio_out = vec![0u32; nq];
-        model_audio_out[..agent_end].copy_from_slice(&agent[..agent_end]);
+        let mut model_audio_out = agent.clone();
+        model_audio_out.resize(nq, 0);
         self.last_model_audio_tokens = model_audio_out.clone();
 
         self.step += 1;
@@ -635,7 +638,7 @@ impl StsStream {
         self.write_pos = 0;
         self.step = 0;
         self.prompt_len = 0;
-        self.prefill_len = 0;
+        self._prefill_len = 0;
         self.last_model_audio_tokens = self.config.silence_tokens.to_vec();
         self.text_token_history.clear();
         for h in &mut self.audio_token_history { h.clear(); }
@@ -650,7 +653,7 @@ impl StsStream {
         self.write_pos = 0;
         self.step = 0;
         self.prompt_len = 0;
-        self.prefill_len = 0;
+        self._prefill_len = 0;
         self.last_model_audio_tokens = self.config.silence_tokens.to_vec();
         self.text_token_history.clear();
         for h in &mut self.audio_token_history { h.clear(); }

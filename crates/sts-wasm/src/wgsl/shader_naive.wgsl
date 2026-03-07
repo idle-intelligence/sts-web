@@ -8,10 +8,10 @@
 //
 // Forked from stt-web (originally from voxtral-mini-realtime-rs).
 
-@group(0) @binding(0) var<storage, read_write> weights: array<u32>;
-@group(0) @binding(1) var<storage, read_write> input: array<f32>;
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> info: array<u32>;
+@group(0) @binding(3) var<storage, read> info: array<u32>;
 
 fn read_u32_unaligned(byte_offset: u32) -> u32 {
     let word = byte_offset >> 2u;

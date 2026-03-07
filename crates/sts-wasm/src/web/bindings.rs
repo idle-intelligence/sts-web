@@ -186,7 +186,6 @@ impl StsEngine {
     /// Call `initWgpuDevice()` first, then create this, then load weights.
     #[cfg_attr(target_family = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
-        console_error_panic_hook::set_once();
         let device = WGPU_DEVICE
             .get()
             .cloned()
@@ -518,8 +517,7 @@ impl StsEngine {
             let t0 = now_ms();
             stream.prefill_user_audio(&new_frames, temporal, depth).await;
             let elapsed = now_ms() - t0;
-            self.metrics.total_temporal_ms += elapsed;
-            self.metrics.total_depth_ms += elapsed;
+            self.metrics.total_ms += elapsed;
         }
 
         num_new
@@ -616,11 +614,9 @@ impl StsEngine {
             None => return JsValue::NULL,
         };
 
-        let sine = self.config.sine_tokens.to_vec();
-
         // Run one step
         let t0 = now_ms();
-        let output = stream.step(&sine, temporal, depth).await;
+        let output = stream.step(temporal, depth).await;
         let elapsed = now_ms() - t0;
         self.metrics.total_ms += elapsed;
         self.metrics.total_frames += 1;
@@ -710,9 +706,8 @@ impl StsEngine {
         stream.prefill(temporal);
 
         // Run a few generation steps to warm up depth transformer shaders
-        let sine = self.config.sine_tokens.to_vec();
         for _ in 0..3 {
-            stream.step(&sine, temporal, depth).await;
+            stream.step(temporal, depth).await;
         }
 
         // Reset state but keep GPU KV cache buffers allocated

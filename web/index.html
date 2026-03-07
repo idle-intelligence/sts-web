@@ -363,6 +363,7 @@
         let isRecording = false;
         let isMuted = false;
         let transcriptText = '';
+        let micModuleLoaded = false;
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -478,9 +479,12 @@
 
         // --- Cache check ---
 
-        // For local dev, skip the cache check — model is served from disk
         async function isModelCached() {
-            return false;
+            try {
+                const cache = await caches.open('sts-model-v1');
+                // Check if the first model shard is cached
+                return !!(await cache.match('/hf/personaplex-7b-v1-q4_k-webgpu/personaplex-7b-v1-q4_k.gguf.shard-00'));
+            } catch { return false; }
         }
 
         // --- Recording ---
@@ -489,7 +493,10 @@
             if (!playbackNode) await initAudioPlayback();
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-            await audioCtx.audioWorklet.addModule('./audio-processor.js').catch(() => {});
+            if (!micModuleLoaded) {
+                await audioCtx.audioWorklet.addModule('./audio-processor.js');
+                micModuleLoaded = true;
+            }
             micStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     channelCount: 1,
@@ -548,6 +555,8 @@
 
         recordBtn.addEventListener('click', async () => {
             if (!isRecording) {
+                // Disable button during async startup to prevent race condition
+                recordBtn.disabled = true;
                 try {
                     worker.postMessage({ type: 'reset' });
                     transcriptText = '';
@@ -556,11 +565,13 @@
                     audioStatus.textContent = 'Audio output will play here...';
                     await startRecording();
                     isRecording = true;
+                    recordBtn.disabled = false;
                     recordBtn.textContent = 'Stop Recording';
                     recordBtn.classList.add('recording');
                     recordBtn.classList.remove('primary');
                     updateStatus('recording', 'Recording...');
                 } catch (err) {
+                    recordBtn.disabled = false;
                     updateStatus('error', 'Microphone error: ' + err.message);
                     console.error(err);
                 }
@@ -588,6 +599,7 @@
             updateStatus('loading', `Decoding ${label}...`);
             fileBtn.disabled = true;
             recordBtn.disabled = true;
+            exampleBtn.disabled = true;
             try {
                 if (!playbackNode) await initAudioPlayback();
                 if (audioCtx.state === 'suspended') await audioCtx.resume();
@@ -622,6 +634,7 @@
                 console.error(err);
                 fileBtn.disabled = false;
                 recordBtn.disabled = false;
+                exampleBtn.disabled = false;
             }
         }
 

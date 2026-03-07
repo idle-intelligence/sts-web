@@ -13,10 +13,10 @@
 //   Bytes  4-15:  scales (12 bytes, packed 6-bit scale/min per sub-block)
 //   Bytes 16-143: qs    (128 bytes, packed 4-bit weights)
 
-@group(0) @binding(0) var<storage, read_write> weights: array<u32>;
-@group(0) @binding(1) var<storage, read_write> input: array<f32>;
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> info: array<u32>;
+@group(0) @binding(3) var<storage, read> info: array<u32>;
 
 // Read a u32 from an arbitrary byte offset in the weights buffer.
 // Handles unaligned access by combining two adjacent u32 words.

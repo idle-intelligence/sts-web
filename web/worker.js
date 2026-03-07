@@ -343,6 +343,9 @@ async function handleStop() {
     sendMetrics(performance.now());
 
     self.postMessage({ type: 'transcript', text: '', final: true });
+
+    // Reset engine state for next conversation
+    engine.reset();
     totalSamples = 0;
     prefillFrames = 0;
     stopped = false;

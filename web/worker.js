@@ -3,23 +3,44 @@
  *
  * All inference runs here -- never on the main thread.
  *
- * Protocol:
+ * ## Message Protocol
+ *
  *   Main -> Worker:
- *     { type: 'load' }                          -- initialize WASM + WebGPU, download model
- *     { type: 'new-conversation' }              -- clear all state for a fresh conversation
- *     { type: 'start-listening' }               -- begin accepting audio
- *     { type: 'audio', samples: Float32Array }  -- feed mic audio chunk
- *     { type: 'stop' }                          -- stop recording, generate response
- *     { type: 'playback-port', port: MessagePort } -- port to stream audio to AudioWorklet
+ *     { type: 'load' }                                     -- init WASM + WebGPU, download + load model
+ *     { type: 'new-conversation' }                         -- full reset (clears KV cache, re-prefills)
+ *     { type: 'start-listening' }                          -- begin accepting audio chunks
+ *     { type: 'audio', samples: Float32Array }             -- feed mic audio chunk (24kHz mono)
+ *     { type: 'stop' }                                     -- stop recording, run generation
+ *     { type: 'audio-port', port: MessagePort }            -- direct port from mic AudioWorklet
+ *     { type: 'playback-port', port: MessagePort }         -- port to stream PCM to AudioWorklet (fallback)
+ *     { type: 'mimi-worker-port', port: MessagePort }      -- port to Mimi worker for offloaded decode
  *
  *   Worker -> Main:
- *     { type: 'status', text: string, ready?: boolean, progress?: { loaded, total } }
- *     { type: 'turn-complete' }                 -- generation finished
- *     { type: 'audio-chunk', step: number, done: boolean }
- *     { type: 'transcript', text: string, final?: boolean }
- *     { type: 'audio-complete', samples: Float32Array }
- *     { type: 'metrics', ... }
- *     { type: 'error', message: string }
+ *     { type: 'status', text, ready?, progress? }          -- loading/ready/generating status
+ *     { type: 'turn-complete' }                            -- generation finished, ready for next turn
+ *     { type: 'audio-chunk', step, done }                  -- notifies main of each generated frame
+ *     { type: 'transcript', text, final? }                 -- streaming text tokens (inner monologue)
+ *     { type: 'metrics', framesPerSec, avgFrameMs, ... }   -- performance metrics after generation
+ *     { type: 'error', message }                           -- unrecoverable error
+ *
+ * ## Expected Call Sequence
+ *
+ *   load → [ready] → start-listening → audio* → stop → [turn-complete]
+ *                                              ↑________________________|  (multi-turn)
+ *   At any time: new-conversation → [re-prefills, back to ready]
+ *
+ * ## State Variables
+ *
+ *   engine         -- StsEngine WASM instance (null until loaded)
+ *   listening      -- true between start-listening and stop
+ *   stopped        -- true after stop received (drops late audio messages)
+ *   busy           -- serialization lock for async engine access
+ *   msgQueue       -- FIFO queue for serialized message processing
+ *   totalSamples   -- PCM samples fed in current turn (for duration calc)
+ *   prefillFrames  -- Mimi frames prefilled in current turn
+ *   audioPort      -- direct MessagePort from mic AudioWorklet (bypasses main)
+ *   playbackPort   -- MessagePort to AudioWorklet for PCM playback (fallback)
+ *   mimiWorkerPort -- MessagePort to Mimi worker for offloaded decode
  */
 
 const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
@@ -31,8 +52,11 @@ let recordingStart = 0;
 let prefillFrames = 0;
 let listening = false;
 
-// Port to stream audio directly to AudioWorklet
+// Port to stream audio directly to AudioWorklet (legacy, used when no Mimi worker)
 let playbackPort = null;
+
+// Port to the Mimi worker for offloaded audio decode
+let mimiWorkerPort = null;
 
 function logState(msg) {
     const t = ((performance.now()) / 1000).toFixed(2);
@@ -118,6 +142,12 @@ self.onmessage = (e) => {
     if (type === 'playback-port') {
         playbackPort = data.port;
         logState('Playback port received');
+        return;
+    }
+
+    if (type === 'mimi-worker-port') {
+        mimiWorkerPort = data.port;
+        logState('Mimi worker port received');
         return;
     }
 
@@ -255,15 +285,11 @@ async function handleLoad(config) {
     self.postMessage({ type: 'status', text: 'Loading tokenizer...' });
     engine.loadTokenizer(new Uint8Array(tokBuf));
 
-    // 8. Warm up GPU pipelines.
-    self.postMessage({ type: 'status', text: 'Warming up GPU...' });
+    // 8. Warm up GPU pipelines (includes system prompt prefill).
+    self.postMessage({ type: 'status', text: 'Warming up GPU + prefilling...' });
     await engine.warmup();
 
-    // 9. Prefill system prompt (builds KV cache, ~20s one-time cost).
-    self.postMessage({ type: 'status', text: 'Prefilling system prompt...' });
-    engine.prefill();
-
-    // 10. Signal ready.
+    // 9. Signal ready.
     logState('Model loaded, ready');
     self.postMessage({ type: 'status', text: 'Ready', ready: true });
 }
@@ -290,8 +316,8 @@ async function handleAudio({ samples }) {
     const framesProcessed = await engine.feedAudio(audioData);
     prefillFrames += framesProcessed;
 
-    const audioDur = (totalSamples / 24000).toFixed(1);
-    self.postMessage({ type: 'status', text: `Listening... ${audioDur}s` });
+    // Main thread timer handles "Listening... Xs" display — don't send
+    // redundant/inaccurate status messages from here.
 }
 
 function sendMetrics(now) {
@@ -325,62 +351,71 @@ async function handleStop() {
     logState(`Starting generation (${audioDuration.toFixed(1)}s input, ${prefillFrames} frames prefilled)`);
     self.postMessage({ type: 'status', text: 'Generating response...' });
 
-    // Start streaming generation
+    // Start streaming generation.
+    //
+    // With Mimi worker: generateStepInference() returns audio_tokens which are
+    // sent to the Mimi worker for decode. The inference worker does NOT wait for
+    // decode — it immediately starts the next GPU step. This overlaps Mimi CPU
+    // decode (~35ms) with GPU temporal compute (~115ms).
+    //
+    // Without Mimi worker (fallback): decodeStepAudio() runs locally between
+    // inference steps, same as before.
     engine.generateStart();
 
     let transcript = '';
-    const allAudioChunks = [];
-    while (true) {
-        const chunk = await engine.generateStep();
-        if (!chunk) break;
+    let result = await engine.generateStepInference();
 
-        // Stream audio chunk to playback port (Worker -> AudioWorklet)
-        if (chunk.audio && chunk.audio.length > 0) {
-            allAudioChunks.push(new Float32Array(chunk.audio));
-
-            if (playbackPort) {
-                playbackPort.postMessage({ type: 'audio', samples: chunk.audio }, [chunk.audio.buffer]);
-            }
-            self.postMessage({
-                type: 'audio-chunk',
-                step: chunk.step,
-                done: chunk.done,
+    while (result) {
+        if (mimiWorkerPort) {
+            // Offloaded path: send audio tokens to Mimi worker for decode.
+            // Don't wait — GPU is already computing the next temporal step.
+            mimiWorkerPort.postMessage({
+                type: 'decode',
+                tokens: result.audio_tokens,
+                numCodebooks: result.num_codebooks,
+                step: result.step,
+                done: result.done,
             });
+        } else {
+            // Fallback: decode locally (same thread, blocks next inference step)
+            const audio = engine.decodeStepAudio();
+            if (audio && audio.length > 0 && playbackPort) {
+                playbackPort.postMessage({ type: 'audio', samples: audio }, [audio.buffer]);
+            }
         }
 
-        if (chunk.text) {
-            transcript += chunk.text;
-            self.postMessage({ type: 'transcript', text: chunk.text, final: false });
+        self.postMessage({
+            type: 'audio-chunk',
+            step: result.step,
+            done: result.done,
+        });
+
+        if (result.text) {
+            transcript += result.text;
+            self.postMessage({ type: 'transcript', text: result.text, final: false });
         }
 
         self.postMessage({
             type: 'status',
-            text: `Generating... frame ${chunk.step + 1}`,
+            text: `Generating... frame ${result.step + 1}`,
         });
 
-        if (chunk.done) break;
+        if (result.done) break;
+
+        // Next inference step — if Mimi worker is active, GPU gets full overlap
+        result = await engine.generateStepInference();
     }
 
     logState(`Generation complete: "${transcript.substring(0, 80)}${transcript.length > 80 ? '...' : ''}"`);
     sendMetrics(performance.now());
 
-    // Send complete audio for WAV download
-    if (allAudioChunks.length > 0) {
-        let totalLen = 0;
-        for (const c of allAudioChunks) totalLen += c.length;
-        const fullAudio = new Float32Array(totalLen);
-        let offset = 0;
-        for (const c of allAudioChunks) {
-            fullAudio.set(c, offset);
-            offset += c.length;
-        }
-        self.postMessage({ type: 'audio-complete', samples: fullAudio }, [fullAudio.buffer]);
-    }
-
     self.postMessage({ type: 'transcript', text: '', final: true });
 
     // Prepare for next turn: reset Mimi codec but keep KV cache
     engine.prepareTurn();
+    if (mimiWorkerPort) {
+        mimiWorkerPort.postMessage({ type: 'reset' });
+    }
     totalSamples = 0;
     prefillFrames = 0;
     stopped = false;

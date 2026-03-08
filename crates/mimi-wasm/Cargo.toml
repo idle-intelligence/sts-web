@@ -1,0 +1,26 @@
+[package]
+name = "mimi-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mimi audio codec as a standalone WASM module for Web Worker isolation"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+# Mimi audio codec (Candle-based, runs on CPU)
+mimi-rs = { path = "../../../mimi-rs" }
+candle-core = "0.9"
+candle-nn = "0.9"
+safetensors = "0.4"
+
+# WASM support
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }

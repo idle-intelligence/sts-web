@@ -365,6 +365,7 @@
         const metricMimiMs = document.getElementById('metricMimiMs');
 
         let worker = null;
+        let mimiWorker = null;
         let audioCtx = null;
         let playbackNode = null;
         let micStream = null;
@@ -372,6 +373,11 @@
         let transcriptText = '';
         let micModuleLoaded = false;
         let lastCompleteAudio = null;
+        let listeningStartTime = 0;
+        let listeningTimer = null;
+        const allDecodedChunks = []; // Collect decoded audio from Mimi worker for WAV export
+        let mimiTotalMs = 0;       // Accumulated Mimi decode time from Mimi worker
+        let mimiFrameCount = 0;    // Number of Mimi decode frames
 
         // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
         let uiState = 'idle';
@@ -435,10 +441,17 @@
             playbackNode = new AudioWorkletNode(audioCtx, 'audio-playback');
             playbackNode.connect(audioCtx.destination);
 
-            // Create a direct channel from Worker -> AudioWorklet for streaming audio
-            const channel = new MessageChannel();
-            playbackNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
-            worker.postMessage({ type: 'playback-port', port: channel.port2 }, [channel.port2]);
+            if (mimiWorker) {
+                // Mimi worker path: decoded PCM flows Mimi Worker -> AudioWorklet
+                const channel = new MessageChannel();
+                playbackNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+                mimiWorker.postMessage({ type: 'set-playback-port', port: channel.port2 }, [channel.port2]);
+            } else {
+                // Fallback: inference worker sends PCM directly to AudioWorklet
+                const channel = new MessageChannel();
+                playbackNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+                worker.postMessage({ type: 'playback-port', port: channel.port2 }, [channel.port2]);
+            }
 
             return playbackNode;
         }
@@ -488,6 +501,68 @@
 
         // --- Worker setup ---
 
+        function initMimiWorker() {
+            mimiWorker = new Worker('./mimi-worker.js', { type: 'module' });
+
+            mimiWorker.onmessage = (e) => {
+                const msg = e.data;
+                switch (msg.type) {
+                    case 'status':
+                        console.log('[mimi-worker]', msg.text);
+                        break;
+
+                    case 'ready':
+                        console.log('[mimi-worker] Mimi codec ready');
+                        break;
+
+                    case 'decoded': {
+                        // Accumulate Mimi decode timing
+                        if (msg.decodeMs != null) {
+                            mimiTotalMs += msg.decodeMs;
+                            mimiFrameCount++;
+                        }
+                        // Collect decoded audio for WAV export
+                        if (msg.samples && msg.samples.length > 0) {
+                            allDecodedChunks.push(new Float32Array(msg.samples));
+                        }
+                        // On last frame, assemble full audio for WAV download
+                        if (msg.done && allDecodedChunks.length > 0) {
+                            let totalLen = 0;
+                            for (const c of allDecodedChunks) totalLen += c.length;
+                            const fullAudio = new Float32Array(totalLen);
+                            let offset = 0;
+                            for (const c of allDecodedChunks) {
+                                fullAudio.set(c, offset);
+                                offset += c.length;
+                            }
+                            lastCompleteAudio = fullAudio;
+                            const wavBlob = buildWavBlob(fullAudio);
+                            if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
+                            audioPlayer._blobUrl = URL.createObjectURL(wavBlob);
+                            audioPlayer.src = audioPlayer._blobUrl;
+                            audioPlayer.style.display = 'block';
+                            audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
+                        }
+                        break;
+                    }
+
+                    case 'error':
+                        console.error('[mimi-worker]', msg.message);
+                        updateStatus('error', 'Mimi error: ' + msg.message);
+                        break;
+                }
+            };
+
+            // Create a direct channel: inference worker -> Mimi worker
+            const channel = new MessageChannel();
+            worker.postMessage({ type: 'mimi-worker-port', port: channel.port1 }, [channel.port1]);
+
+            // The Mimi worker receives decode commands on this port
+            mimiWorker.postMessage({ type: 'set-mimi-port', port: channel.port2 }, [channel.port2]);
+
+            return mimiWorker;
+        }
+
         function initWorker() {
             worker = new Worker('./worker.js', { type: 'module' });
 
@@ -505,9 +580,17 @@
                             progressBar.classList.remove('visible');
                             progressInfo.textContent = '';
                             downloadBtn.style.display = 'none';
+
+                            // Start loading Mimi worker now that inference worker is ready
+                            if (mimiWorker) loadMimiWorker();
                         } else if (uiState === 'listening') {
-                            updateStatus('recording', msg.text);
+                            // Main thread timer handles the display; ignore worker status
+                            break;
                         } else if (uiState === 'generating' || uiState === 'speaking') {
+                            // Filter out stale "Listening" messages that arrive after
+                            // the user clicked "Your Turn" (worker audio processing
+                            // is async and messages can arrive late).
+                            if (msg.text && msg.text.startsWith('Listening')) break;
                             updateStatus('active', msg.text);
                         } else {
                             updateStatus('loading', msg.text);
@@ -532,6 +615,7 @@
                         break;
 
                     case 'audio-complete': {
+                        // Fallback path (no Mimi worker): inference worker sends decoded audio
                         lastCompleteAudio = msg.samples;
                         const wavBlob = buildWavBlob(msg.samples);
                         if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
@@ -564,10 +648,15 @@
                         break;
 
                     case 'metrics':
+                        // Override Mimi timing with data from the Mimi worker
+                        if (mimiFrameCount > 0) {
+                            msg.mimiMs = mimiTotalMs / mimiFrameCount;
+                        }
                         updateMetrics(msg);
                         break;
 
                     case 'error':
+                        if (listeningTimer) { clearInterval(listeningTimer); listeningTimer = null; }
                         updateStatus('error', 'Error: ' + msg.message);
                         console.error('[sts]', msg.message);
                         stopMic();
@@ -590,10 +679,46 @@
 
         // --- Init ---
 
+        const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
+        const MIMI_URL = `${HF_BASE}/tokenizer-e351c8d8-checkpoint125.safetensors`;
+        const CACHE_NAME = 'sts-model-v1';
+
+        /** Fetch with Cache API support (mirrors worker.js cachedFetch). */
+        async function cachedFetchMain(url, label) {
+            const cache = await caches.open(CACHE_NAME);
+            const cached = await cache.match(url);
+            if (cached) return await cached.arrayBuffer();
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+            const buf = await resp.arrayBuffer();
+            try {
+                await cache.put(url, new Response(buf.slice(0), {
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                }));
+            } catch (e) { console.warn('Cache put failed:', e); }
+            return buf;
+        }
+
+        /**
+         * Load the Mimi worker: WASM module + model weights.
+         * Called after the inference worker signals ready (model loaded).
+         */
+        async function loadMimiWorker() {
+            try {
+                mimiWorker.postMessage({ type: 'load' });
+                const mimiBuf = await cachedFetchMain(MIMI_URL, 'Mimi codec');
+                mimiWorker.postMessage({ type: 'load-model', data: mimiBuf }, [mimiBuf]);
+            } catch (err) {
+                console.error('[main] Failed to load Mimi worker:', err);
+                // Mimi worker failed — inference worker fallback still works
+            }
+        }
+
         if (!navigator.gpu) {
             updateStatus('error', 'WebGPU not supported. Use Chrome or Edge 113+.');
         } else {
             initWorker();
+            initMimiWorker();
 
             const cached = await isModelCached();
             if (cached) {
@@ -624,7 +749,12 @@
                 await startMic();
                 worker.postMessage({ type: 'start-listening' });
                 setUIState('listening');
-                updateStatus('recording', 'Listening...');
+                listeningStartTime = performance.now();
+                updateStatus('recording', 'Listening... 0s');
+                listeningTimer = setInterval(() => {
+                    const elapsed = ((performance.now() - listeningStartTime) / 1000).toFixed(1);
+                    updateStatus('recording', `Listening... ${elapsed}s`);
+                }, 200);
             } catch (err) {
                 myTurnBtn.disabled = false;
                 updateStatus('error', 'Microphone error: ' + err.message);
@@ -634,10 +764,16 @@
 
         // "Your Turn" — stop recording, trigger generation
         yourTurnBtn.addEventListener('click', () => {
+            if (listeningTimer) { clearInterval(listeningTimer); listeningTimer = null; }
             stopMic();
             worker.postMessage({ type: 'stop' });
             setUIState('generating');
             updateStatus('active', 'Generating response...');
+
+            // Clear decoded audio chunks and Mimi timing for new generation
+            allDecodedChunks.length = 0;
+            mimiTotalMs = 0;
+            mimiFrameCount = 0;
 
             // Reset playback buffer for fresh output
             if (playbackNode) {
@@ -648,6 +784,7 @@
 
         // "New Conversation" — reset everything
         newConvoBtn.addEventListener('click', () => {
+            if (listeningTimer) { clearInterval(listeningTimer); listeningTimer = null; }
             stopMic();
 
             // Reset playback buffer
@@ -661,8 +798,12 @@
             transcriptEl.classList.add('empty');
             audioStatus.textContent = 'Audio output will play here...';
 
-            // Tell worker to reset engine completely
+            // Tell workers to reset
             worker.postMessage({ type: 'new-conversation' });
+            if (mimiWorker) mimiWorker.postMessage({ type: 'reset' });
+            allDecodedChunks.length = 0;
+            mimiTotalMs = 0;
+            mimiFrameCount = 0;
             setUIState('idle');
             updateStatus('ready', 'Ready');
         });
@@ -684,8 +825,11 @@
                 if (!playbackNode) await initAudioPlayback();
                 if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-                // Reset playback buffer
+                // Reset playback buffer and decoded chunks
                 playbackNode.port.postMessage({ type: 'reset' });
+                allDecodedChunks.length = 0;
+                mimiTotalMs = 0;
+                mimiFrameCount = 0;
 
                 const offlineCtx = new OfflineAudioContext(1, 1, 24000);
                 const audioBuf = await offlineCtx.decodeAudioData(arrayBuf);

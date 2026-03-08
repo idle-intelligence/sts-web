@@ -218,6 +218,23 @@ impl KVCache {
         self.len = 0;
         self.write_pos = 0;
     }
+
+    /// Roll back the cache by `n` steps (undo the last `n` updates).
+    ///
+    /// The stale KV data at the rolled-back positions remains in the buffer
+    /// but will be overwritten by subsequent updates and is excluded from
+    /// the valid region via `len`.
+    pub fn rollback(&mut self, n: usize) {
+        let n = n.min(self.len);
+        self.offset -= n;
+        self.len -= n;
+        if self.write_pos >= n {
+            self.write_pos -= n;
+        } else {
+            // wrap around ring buffer
+            self.write_pos = self.max_len - (n - self.write_pos);
+        }
+    }
 }
 
 /// Collection of KV caches for all layers.
@@ -257,6 +274,13 @@ impl LayerCaches {
     pub fn reset_keep_buffers(&mut self) {
         for cache in &mut self.caches {
             cache.reset_keep_buffers();
+        }
+    }
+
+    /// Roll back all layer caches by `n` steps.
+    pub fn rollback(&mut self, n: usize) {
+        for cache in &mut self.caches {
+            cache.rollback(n);
         }
     }
 }

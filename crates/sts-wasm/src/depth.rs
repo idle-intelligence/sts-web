@@ -21,10 +21,10 @@ use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::Tensor;
 
-use crate::gguf::{EmbeddingStore, Linear};
-use crate::model::{sample_greedy, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::gguf::{gpu_argmax, EmbeddingStore, Linear};
+use crate::model::{sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::model::sample_top_k;
+use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
 
 // ---------------------------------------------------------------------------
@@ -357,7 +357,9 @@ impl DepthTransformer {
             let logits = self.output_linears[step].forward(h);
 
             let token = if audio_temp <= 0.0 {
-                sample_greedy(logits).await
+                // GPU argmax: reads back 4 bytes (one u32) instead of
+                // the full logits tensor (e.g. 8KB for V=2048).
+                gpu_argmax(logits).await
             } else {
                 let history = penalty_history
                     .and_then(|h| h.get(step))

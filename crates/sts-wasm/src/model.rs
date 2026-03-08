@@ -13,9 +13,16 @@
 //!
 //! All linear projections use Q4Linear from the gguf module.
 
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
+use burn::backend::wgpu::{
+    into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
+    Wgpu, WgpuDevice, WgpuRuntime,
+};
 use burn::tensor::activation::{silu, softmax};
-use burn::tensor::Tensor;
+use burn::tensor::{DType, Tensor, TensorPrimitive};
+use cubecl::prelude::KernelId;
+use cubecl::server::{Bindings, CubeCount, Handle};
+use cubecl::{CubeTask, Runtime};
+use std::cell::RefCell;
 
 use crate::gguf::{EmbeddingStore, Linear};
 use crate::StsConfig;
@@ -286,35 +293,119 @@ impl LayerCaches {
 }
 
 // ---------------------------------------------------------------------------
-// RmsNorm
+// Fused RMSNorm kernel — 1 dispatch instead of 6-8
 // ---------------------------------------------------------------------------
 
-/// RMSNorm with learnable scale weights.
+struct RmsNormKernelSource;
+
+impl KernelSource for RmsNormKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_rmsnorm.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused RMSNorm on GPU: output = (x / rms(x)) * alpha, single dispatch.
 ///
-/// The Moshi GGUF stores norm weights as `norm.alpha` with shape [1, 1, dim],
-/// which we squeeze to [dim].
-///
-/// `alpha_broadcast` is pre-computed as [1, 1, dim] at construction time to
-/// avoid repeated clone+unsqueeze in the hot path (256 calls per generation step).
+/// `x`: [B, S, D], `alpha_handle`: GPU buffer of [D] f32 weights.
+/// Returns [B, S, D] normalized tensor.
+fn fused_rms_norm(
+    x: Tensor<Wgpu, 3>,
+    alpha_handle: &Handle,
+    _eps: f32,
+    info_handle: &Handle,
+) -> Tensor<Wgpu, 3> {
+    let cube_input: CubeTensor<WgpuRuntime> = x.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let b = cube_input.shape.dims[0];
+    let s = cube_input.shape.dims[1];
+    let d = cube_input.shape.dims[2];
+    let total_rows = b * s;
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    let output_handle = client.empty(total_rows * d * 4);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(alpha_handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.clone().binding());
+
+    let kernel = SourceKernel::new(RmsNormKernelSource, CubeDim::new_1d(256));
+
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(total_rows as u32),
+            bindings,
+        )
+        .expect("RMSNorm kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, s, d]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
 pub struct RmsNormLayer {
-    alpha_broadcast: Tensor<Wgpu, 3>,
-    eps: f64,
+    alpha_handle: Handle,
+    eps: f32,
+    dim: usize,
+    /// Cached info buffer (D, eps_bits, total_rows). Keyed by total_rows.
+    info_cache: RefCell<Option<(usize, Handle)>>,
+    device: WgpuDevice,
 }
 
 impl RmsNormLayer {
     pub fn new(alpha: Tensor<Wgpu, 1>, eps: f64) -> Self {
-        let alpha_broadcast = alpha.unsqueeze::<2>().unsqueeze_dim::<3>(0);
-        Self { alpha_broadcast, eps }
+        let dim = alpha.dims()[0];
+        let device = alpha.device();
+        // Extract the GPU handle from the alpha tensor
+        let alpha_handle = alpha.into_primitive().tensor().handle;
+        Self {
+            alpha_handle,
+            eps: eps as f32,
+            dim,
+            info_cache: RefCell::new(None),
+            device,
+        }
+    }
+
+    /// Get or create a cached info buffer for the given total_rows.
+    fn get_or_create_info(&self, total_rows: usize) -> Handle {
+        let mut cache = self.info_cache.borrow_mut();
+        if let Some((cached_rows, ref handle)) = *cache {
+            if cached_rows == total_rows {
+                return handle.clone();
+            }
+        }
+        let client = WgpuRuntime::client(&self.device);
+        let info: [u32; 3] = [
+            self.dim as u32,
+            self.eps.to_bits(),
+            total_rows as u32,
+        ];
+        let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let handle = client.create_from_slice(&info_bytes);
+        *cache = Some((total_rows, handle.clone()));
+        handle
     }
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
-        let [_b, _s, d] = x.dims();
-        // RMS norm: x * rsqrt(mean(x^2) + eps) * alpha
-        let x_sq = x.clone().powf_scalar(2.0);
-        let mean_sq = x_sq.sum_dim(2) / (d as f64);
-        let rms = (mean_sq + self.eps).sqrt();
-        let x_norm = x / rms;
-        x_norm * self.alpha_broadcast.clone()
+        let [b, s, _d] = x.dims();
+        let total_rows = b * s;
+        let info_handle = self.get_or_create_info(total_rows);
+        fused_rms_norm(x, &self.alpha_handle, self.eps, &info_handle)
     }
 }
 

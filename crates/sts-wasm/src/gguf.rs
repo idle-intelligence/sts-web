@@ -780,6 +780,88 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
 }
 
 // ---------------------------------------------------------------------------
+// GPU argmax kernel dispatch
+// ---------------------------------------------------------------------------
+
+struct ArgmaxKernel;
+
+impl KernelSource for ArgmaxKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_argmax.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// GPU-side argmax: returns the index of the maximum value in a logits tensor.
+///
+/// Launches a single-workgroup (256 threads) compute shader that performs a
+/// parallel reduction, then reads back just 4 bytes (one u32) instead of the
+/// entire logits tensor (e.g. 2048 x 4 = 8KB for audio vocab).
+///
+/// `logits`: [1, 1, V] tensor (e.g. V=2048 for audio, V=32000 for text)
+/// Returns the argmax index as u32.
+pub async fn gpu_argmax(logits: Tensor<Wgpu, 3>) -> u32 {
+    let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let v = cube_input.shape.dims[cube_input.shape.num_dims() - 1];
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    // Output: single u32
+    let result_handle = client.empty(4);
+
+    // Info: just the vocab size
+    let info_bytes: Vec<u8> = (v as u32).to_le_bytes().to_vec();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(result_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(
+        ArgmaxKernel,
+        CubeDim::new_1d(256),
+    );
+
+    // Single workgroup — all reduction happens in shared memory
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(1),
+            bindings,
+        )
+        .expect("Argmax kernel launch failed");
+
+    // Read back just 4 bytes (one u32 index).
+    // We wrap the handle as an f32 tensor (same 4 bytes) and reinterpret
+    // the bits as u32 after readback, since Burn's Wgpu backend works with
+    // float primitives.
+    let result_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![1]),
+        result_handle,
+        DType::F32,
+    );
+    let result: Tensor<Wgpu, 1> =
+        Tensor::from_primitive(TensorPrimitive::Float(result_tensor));
+    let data: Vec<f32> = result
+        .into_data_async()
+        .await
+        .expect("GPU readback failed")
+        .to_vec()
+        .expect("argmax result to_vec failed");
+    // Reinterpret f32 bits as u32 (the shader wrote a u32 index)
+    data[0].to_bits()
+}
+
+// ---------------------------------------------------------------------------
 // EmbeddingStore — Q4 embeddings for token lookups
 // ---------------------------------------------------------------------------
 

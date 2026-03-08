@@ -60,7 +60,8 @@ use burn::tensor::Tensor;
 use cubecl::Runtime;
 
 use crate::depth::DepthTransformer;
-use crate::model::{sample_greedy, sample_top_k_with_penalty, LayerCaches, TemporalTransformer};
+use crate::gguf::gpu_argmax;
+use crate::model::{sample_top_k_with_penalty, LayerCaches, TemporalTransformer};
 use crate::StsConfig;
 
 /// Cross-platform millisecond timer.
@@ -600,7 +601,7 @@ impl StsStream {
 
         // Step 2: Sample text token with repetition penalty
         let text_token = if self.text_temperature <= 0.0 {
-            sample_greedy(text_logits).await
+            gpu_argmax(text_logits).await
         } else {
             let text_history: Vec<u32> = self
                 .text_token_history

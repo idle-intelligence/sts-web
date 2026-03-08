@@ -28,13 +28,92 @@ use crate::gguf::{EmbeddingStore, Linear};
 use crate::StsConfig;
 
 // ---------------------------------------------------------------------------
-// RoPE -- Rotary Position Embeddings
+// RoPE -- Rotary Position Embeddings (fused GPU kernel)
 // ---------------------------------------------------------------------------
 
-/// Rotary Position Embeddings with precomputed cos/sin tables.
+struct RopeKernelSource;
+
+impl KernelSource for RopeKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_rope.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Apply fused RoPE in-place on a [B, S, H, D] tensor.
+///
+/// Launches a single GPU dispatch instead of ~6-8 Burn operations.
+/// The tensor is modified in-place (safe since Q/K are fresh projections).
+fn fused_rope_inplace(
+    x: Tensor<Wgpu, 4>,
+    cos_handle: &Handle,
+    sin_handle: &Handle,
+    offset: usize,
+    half_dim: usize,
+) -> Tensor<Wgpu, 4> {
+    let cube_x: CubeTensor<WgpuRuntime> = x.into_primitive().tensor();
+    let cube_x = into_contiguous(cube_x);
+
+    let b = cube_x.shape.dims[0];
+    let s = cube_x.shape.dims[1];
+    let h = cube_x.shape.dims[2];
+    // d = cube_x.shape.dims[3], but we use half_dim from the RoPE tables
+
+    let total_elements = b * s * h * half_dim;
+
+    let client = cube_x.client.clone();
+    let device = cube_x.device.clone();
+
+    // Info buffer: [pos_offset, B, S, H, half_D]
+    let info: [u32; 5] = [
+        offset as u32,
+        b as u32,
+        s as u32,
+        h as u32,
+        half_dim as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_x.handle.clone().binding())
+        .with_buffer(cos_handle.clone().binding())
+        .with_buffer(sin_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(RopeKernelSource, CubeDim::new_1d(256));
+
+    let num_workgroups = (total_elements as u32).div_ceil(256);
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("RoPE kernel launch failed");
+
+    // Return the same buffer as a tensor (modified in-place)
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, s, h, half_dim * 2]),
+        cube_x.handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
+/// Rotary Position Embeddings with precomputed cos/sin tables on GPU.
+///
+/// Uses a fused WGSL compute shader: 1 dispatch per tensor instead of ~6-8
+/// Burn operations (reshape, slice, broadcast, mul, sub, add, cat, reshape).
 pub struct RoPE {
-    cos: Tensor<Wgpu, 2>,
-    sin: Tensor<Wgpu, 2>,
+    cos_handle: Handle,
+    sin_handle: Handle,
+    half_dim: usize,
 }
 
 impl RoPE {
@@ -61,62 +140,42 @@ impl RoPE {
         let cos = freqs.clone().cos();
         let sin = freqs.sin();
 
-        RoPE { cos, sin }
+        // Extract GPU handles for the fused kernel
+        let cos_handle = cos.into_primitive().tensor().handle;
+        let sin_handle = sin.into_primitive().tensor().handle;
+
+        RoPE {
+            cos_handle,
+            sin_handle,
+            half_dim,
+        }
     }
 
-    /// Apply rotary embeddings to Q and K tensors.
+    /// Apply rotary embeddings to Q and K tensors using fused GPU kernel.
     ///
     /// q, k shape: [batch, seq, heads, head_dim]
+    /// 2 GPU dispatches total (1 for Q, 1 for K) instead of ~12-16 Burn ops.
     pub fn apply(
         &self,
         q: Tensor<Wgpu, 4>,
         k: Tensor<Wgpu, 4>,
         offset: usize,
     ) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
-        let seq_len = q.dims()[1];
-        let [_max_len, half_dim] = self.cos.dims();
-        let cos = self
-            .cos
-            .clone()
-            .slice([offset..offset + seq_len, 0..half_dim]);
-        let sin = self
-            .sin
-            .clone()
-            .slice([offset..offset + seq_len, 0..half_dim]);
-
-        let q_rot = Self::apply_rotation(q, cos.clone(), sin.clone());
-        let k_rot = Self::apply_rotation(k, cos, sin);
+        let q_rot = fused_rope_inplace(
+            q,
+            &self.cos_handle,
+            &self.sin_handle,
+            offset,
+            self.half_dim,
+        );
+        let k_rot = fused_rope_inplace(
+            k,
+            &self.cos_handle,
+            &self.sin_handle,
+            offset,
+            self.half_dim,
+        );
         (q_rot, k_rot)
-    }
-
-    fn apply_rotation(
-        x: Tensor<Wgpu, 4>,
-        cos: Tensor<Wgpu, 2>,
-        sin: Tensor<Wgpu, 2>,
-    ) -> Tensor<Wgpu, 4> {
-        let [batch, seq, heads, head_dim] = x.dims();
-        let half_dim = head_dim / 2;
-
-        let x_pairs = x.reshape([batch, seq, heads, half_dim, 2]);
-
-        let x_r: Tensor<Wgpu, 4> = x_pairs
-            .clone()
-            .slice([0..batch, 0..seq, 0..heads, 0..half_dim, 0..1])
-            .reshape([batch, seq, heads, half_dim]);
-        let x_i: Tensor<Wgpu, 4> = x_pairs
-            .slice([0..batch, 0..seq, 0..heads, 0..half_dim, 1..2])
-            .reshape([batch, seq, heads, half_dim]);
-
-        let cos: Tensor<Wgpu, 4> = cos.unsqueeze_dim::<3>(0).unsqueeze_dim(2);
-        let sin: Tensor<Wgpu, 4> = sin.unsqueeze_dim::<3>(0).unsqueeze_dim(2);
-
-        let out_r = x_r.clone() * cos.clone() - x_i.clone() * sin.clone();
-        let out_i = x_r * sin + x_i * cos;
-
-        let out_r: Tensor<Wgpu, 5> = out_r.unsqueeze_dim(4);
-        let out_i: Tensor<Wgpu, 5> = out_i.unsqueeze_dim(4);
-        let out = Tensor::cat(vec![out_r, out_i], 4);
-        out.reshape([batch, seq, heads, head_dim])
     }
 }
 

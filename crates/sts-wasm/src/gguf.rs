@@ -21,6 +21,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount, Handle};
 use cubecl::{CubeTask, Runtime};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -400,6 +401,9 @@ pub struct Q4Tensor {
     pub(crate) handle: Handle,
     shape: [usize; 2],
     num_blocks: usize,
+    /// Cached info buffer for matmul dispatch, keyed by (B, M).
+    /// During generation B=1, M=1 so this is a stable cache hit.
+    info_cache: RefCell<Option<([usize; 2], Handle)>>,
 }
 
 impl Q4Tensor {
@@ -434,6 +438,7 @@ impl Q4Tensor {
             handle,
             shape,
             num_blocks,
+            info_cache: RefCell::new(None),
         })
     }
 
@@ -443,6 +448,23 @@ impl Q4Tensor {
 
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
+    }
+
+    /// Get or create a cached info buffer for the given (B, M) dimensions.
+    fn get_or_create_info(&self, b: usize, m: usize, k: usize, n: usize, blocks_per_row: usize, device: &WgpuDevice) -> Handle {
+        let key = [b, m];
+        let mut cache = self.info_cache.borrow_mut();
+        if let Some((cached_key, ref handle)) = *cache {
+            if cached_key == key {
+                return handle.clone();
+            }
+        }
+        let client = WgpuRuntime::client(device);
+        let info: [u32; 5] = [b as u32, m as u32, k as u32, n as u32, blocks_per_row as u32];
+        let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let handle = client.create_from_slice(&info_bytes);
+        *cache = Some((key, handle.clone()));
+        handle
     }
 }
 
@@ -479,6 +501,8 @@ pub struct Q4KTensor {
     pub(crate) handle: Handle,
     shape: [usize; 2],
     num_blocks: usize,
+    /// Cached info buffer for matmul dispatch, keyed by (B, M).
+    info_cache: RefCell<Option<([usize; 2], Handle)>>,
 }
 
 impl Q4KTensor {
@@ -513,6 +537,7 @@ impl Q4KTensor {
             handle,
             shape,
             num_blocks,
+            info_cache: RefCell::new(None),
         })
     }
 
@@ -522,6 +547,23 @@ impl Q4KTensor {
 
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
+    }
+
+    /// Get or create a cached info buffer for the given (B, M) dimensions.
+    fn get_or_create_info(&self, b: usize, m: usize, k: usize, n: usize, blocks_per_row: usize, device: &WgpuDevice) -> Handle {
+        let key = [b, m];
+        let mut cache = self.info_cache.borrow_mut();
+        if let Some((cached_key, ref handle)) = *cache {
+            if cached_key == key {
+                return handle.clone();
+            }
+        }
+        let client = WgpuRuntime::client(device);
+        let info: [u32; 5] = [b as u32, m as u32, k as u32, n as u32, blocks_per_row as u32];
+        let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let handle = client.create_from_slice(&info_bytes);
+        *cache = Some((key, handle.clone()));
+        handle
     }
 }
 
@@ -625,15 +667,7 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 
     let output_handle = client.empty(b * m * n * 4);
 
-    let info: [u32; 5] = [
-        b as u32,
-        m as u32,
-        k as u32,
-        n as u32,
-        blocks_per_row as u32,
-    ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let info_handle = client.create_from_slice(&info_bytes);
+    let info_handle = weights.get_or_create_info(b, m, k, n, blocks_per_row, &device);
 
     let bindings = Bindings::new()
         .with_buffer(weights.handle.clone().binding())
@@ -710,15 +744,7 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
 
     let output_handle = client.empty(b * m * n * 4);
 
-    let info: [u32; 5] = [
-        b as u32,
-        m as u32,
-        k as u32,
-        n as u32,
-        blocks_per_row as u32,
-    ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let info_handle = client.create_from_slice(&info_bytes);
+    let info_handle = weights.get_or_create_info(b, m, k, n, blocks_per_row, &device);
 
     let bindings = Bindings::new()
         .with_buffer(weights.handle.clone().binding())

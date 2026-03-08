@@ -402,6 +402,13 @@ async function handleStop() {
 
         if (result.done) break;
 
+        // Yield to the event loop so MessagePort messages (to Mimi worker)
+        // actually flush cross-thread. Without this, the WASM Promise from
+        // generateStepInference() resolves as a microtask, and the loop
+        // resumes immediately — MessagePort postMessage calls queue up but
+        // never get dispatched until the entire loop finishes.
+        await new Promise(r => setTimeout(r, 0));
+
         // Next inference step — if Mimi worker is active, GPU gets full overlap
         result = await engine.generateStepInference();
     }

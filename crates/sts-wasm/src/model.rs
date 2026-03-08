@@ -293,14 +293,18 @@ impl LayerCaches {
 ///
 /// The Moshi GGUF stores norm weights as `norm.alpha` with shape [1, 1, dim],
 /// which we squeeze to [dim].
+///
+/// `alpha_broadcast` is pre-computed as [1, 1, dim] at construction time to
+/// avoid repeated clone+unsqueeze in the hot path (256 calls per generation step).
 pub struct RmsNormLayer {
-    alpha: Tensor<Wgpu, 1>,
+    alpha_broadcast: Tensor<Wgpu, 3>,
     eps: f64,
 }
 
 impl RmsNormLayer {
     pub fn new(alpha: Tensor<Wgpu, 1>, eps: f64) -> Self {
-        Self { alpha, eps }
+        let alpha_broadcast = alpha.unsqueeze::<2>().unsqueeze_dim::<3>(0);
+        Self { alpha_broadcast, eps }
     }
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
@@ -310,7 +314,7 @@ impl RmsNormLayer {
         let mean_sq = x_sq.sum_dim(2) / (d as f64);
         let rms = (mean_sq + self.eps).sqrt();
         let x_norm = x / rms;
-        x_norm * self.alpha.clone().unsqueeze::<2>().unsqueeze_dim::<3>(0)
+        x_norm * self.alpha_broadcast.clone()
     }
 }
 
@@ -914,10 +918,15 @@ pub async fn sample_top_k_with_penalty(
         }
     }
 
-    // Find top-k indices
+    // Find top-k indices using partial sort (O(n) partition + O(k log k) sort)
     let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+    if indexed.len() > top_k {
+        indexed.select_nth_unstable_by(top_k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        indexed.truncate(top_k);
+    }
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.truncate(top_k);
 
     // Softmax over top-k
     let max_val = indexed[0].1;

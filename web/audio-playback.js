@@ -4,7 +4,7 @@
  * Receives audio via MessagePort from the worker, buffers it in a ring buffer,
  * and outputs 128-sample render quantums to the audio context.
  *
- * Buffers ~1s before starting playback to smooth out generation jitter.
+ * Prebuffers ~0.25s (1 frame) before starting playback for low-latency duplex.
  * This is the output counterpart to audio-processor.js (input).
  */
 
@@ -17,8 +17,8 @@ class AudioPlayback extends AudioWorkletProcessor {
         this._readPos = 0;
         this._writePos = 0;
         this._available = 0;
-        // Buffer ~1s before starting playback to absorb generation jitter
-        this._prebufferThreshold = 24000;
+        // Buffer ~0.25s before starting playback (1 generation frame)
+        this._prebufferThreshold = 6000;
         this._prebuffering = true;
 
         this.port.onmessage = (e) => {
@@ -35,6 +35,12 @@ class AudioPlayback extends AudioWorkletProcessor {
             } else if (e.data && e.data.type === 'flush') {
                 // Stop prebuffering — play whatever we have (generation done)
                 this._prebuffering = false;
+            } else if (e.data && e.data.type === 'reset') {
+                // Clear ring buffer for new conversation
+                this._readPos = 0;
+                this._writePos = 0;
+                this._available = 0;
+                this._prebuffering = true;
             }
         };
     }

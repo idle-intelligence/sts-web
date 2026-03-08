@@ -96,6 +96,10 @@
         .status-dot.loading { background: var(--yellow); }
         .status-dot.ready { background: var(--green); }
         .status-dot.error { background: var(--red); }
+        .status-dot.active {
+            background: var(--green);
+            animation: pulse 1.5s infinite;
+        }
         .status-dot.recording {
             background: var(--red);
             animation: pulse 1s infinite;
@@ -160,11 +164,13 @@
             background: var(--muted);
             border-color: var(--muted);
         }
-        button.recording {
+        button.danger {
             background: var(--red);
             color: #fff;
             border-color: var(--red);
-            animation: pulse 1s infinite;
+        }
+        button.danger:hover:not(:disabled) {
+            opacity: 0.85;
         }
         .info {
             font-size: 13px;
@@ -180,10 +186,6 @@
             line-height: 1.6;
             font-size: 15px;
             color: var(--text);
-        }
-        #transcript.empty {
-            color: var(--faint);
-            font-style: italic;
         }
 
         #metricsCard { display: none; }
@@ -274,28 +276,33 @@
     </section>
 
     <section>
-        <h2>input <span class="sub">· audio</span></h2>
+        <h2>conversation</h2>
         <div class="actions">
-            <button id="recordBtn" class="primary" disabled>Start Recording</button>
-            <button id="fileBtn" disabled>Load WAV File</button>
-            <button id="exampleBtn" disabled>Load Example WAV</button>
-            <input type="file" id="fileInput" accept=".wav,audio/wav" style="display:none">
+            <button id="talkBtn" class="primary" disabled>Talk</button>
+            <button id="newConvoBtn" style="display:none">New conversation</button>
+            <button id="muteBtn" style="display:none">Mute</button>
         </div>
         <p class="info">Audio stays on this device. All inference runs locally in your browser.</p>
     </section>
 
     <section>
-        <h2>output <span class="sub">· audio</span></h2>
-        <div class="actions" id="playbackControls" style="display:none">
-            <button id="muteBtn">Mute</button>
-        </div>
-        <audio id="audioPlayer" controls style="display:none; width:100%; margin-top:12px"></audio>
-        <p id="audioStatus" class="info">Audio output will play here...</p>
+        <h2>output <span class="sub">· inner monologue</span></h2>
+        <div id="transcript"><span id="transcriptText"></span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
     </section>
 
     <section>
-        <h2>output <span class="sub">· inner monologue</span></h2>
-        <div id="transcript" class="empty"><span id="transcriptText">Transcript will appear here...</span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
+        <h2>output <span class="sub">· audio</span></h2>
+        <audio id="audioPlayer" controls style="display:none; width:100%; margin-top:12px"></audio>
+        <p id="audioStatus" class="info"></p>
+    </section>
+
+    <section>
+        <h2>files <span class="sub">· walkie-talkie mode</span></h2>
+        <div class="actions">
+            <button id="fileBtn" disabled>Load WAV File</button>
+            <button id="exampleBtn" disabled>Load Example WAV</button>
+            <input type="file" id="fileInput" accept=".wav,audio/wav" style="display:none">
+        </div>
     </section>
 
     <section id="metricsCard">
@@ -340,14 +347,14 @@
         const progressInfo = document.getElementById('progressInfo');
         const transcriptEl = document.getElementById('transcript');
         const transcriptTextEl = document.getElementById('transcriptText');
-        const recordBtn = document.getElementById('recordBtn');
+        const talkBtn = document.getElementById('talkBtn');
+        const newConvoBtn = document.getElementById('newConvoBtn');
         const fileBtn = document.getElementById('fileBtn');
         const fileInput = document.getElementById('fileInput');
         const downloadBtn = document.getElementById('downloadBtn');
         const exampleBtn = document.getElementById('exampleBtn');
         const muteBtn = document.getElementById('muteBtn');
         const audioPlayer = document.getElementById('audioPlayer');
-        const playbackControls = document.getElementById('playbackControls');
         const audioStatus = document.getElementById('audioStatus');
         const metricsCard = document.getElementById('metricsCard');
         const metricFrameMs = document.getElementById('metricFrameMs');
@@ -362,11 +369,11 @@
         let playbackNode = null;
         let micStream = null;
         let micWorkletNode = null;
-        let isRecording = false;
+        let isDuplexRunning = false;
         let isMuted = false;
         let transcriptText = '';
         let micModuleLoaded = false;
-        let lastCompleteAudio = null; // Float32Array of full response audio
+        let lastCompleteAudio = null;
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -408,7 +415,6 @@
             if (isMuted || !samples) return;
             if (!playbackNode) return;
             if (audioCtx.state === 'suspended') audioCtx.resume();
-            // Fallback: send via main thread if direct port isn't set up
             playbackNode.port.postMessage({ type: 'audio', samples });
         }
 
@@ -423,12 +429,17 @@
                     case 'status':
                         if (msg.ready) {
                             updateStatus('ready', msg.text);
-                            recordBtn.disabled = false;
-                            fileBtn.disabled = false;
-                            exampleBtn.disabled = false;
+                            if (!isDuplexRunning) {
+                                talkBtn.disabled = false;
+                                fileBtn.disabled = false;
+                                exampleBtn.disabled = false;
+                            }
                             progressBar.classList.remove('visible');
                             progressInfo.textContent = '';
                             downloadBtn.style.display = 'none';
+                        } else if (isDuplexRunning) {
+                            // During duplex, show worker status updates
+                            updateStatus('recording', msg.text);
                         } else {
                             updateStatus('loading', msg.text);
                             if (msg.progress) {
@@ -443,19 +454,16 @@
                         break;
 
                     case 'audio-chunk':
-                        playbackControls.style.display = '';
                         audioStatus.textContent = msg.done
                             ? 'Generation complete'
                             : `Generating... frame ${msg.step + 1}`;
                         if (msg.done && playbackNode) {
-                            // Tell worklet to stop prebuffering and play remaining audio
                             playbackNode.port.postMessage({ type: 'flush' });
                         }
                         break;
 
                     case 'audio-complete': {
                         lastCompleteAudio = msg.samples;
-                        // Build WAV blob and set as audio player source
                         const wavBlob = buildWavBlob(msg.samples);
                         if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
                         audioPlayer._blobUrl = URL.createObjectURL(wavBlob);
@@ -481,6 +489,17 @@
                         break;
                     }
 
+                    case 'turn-complete':
+                        // In duplex mode, do NOT change button state — duplex runs continuously.
+                        // Only re-enable buttons for file-based walkie-talkie mode.
+                        if (!isDuplexRunning) {
+                            updateStatus('ready', 'Ready');
+                            talkBtn.disabled = false;
+                            fileBtn.disabled = false;
+                            exampleBtn.disabled = false;
+                        }
+                        break;
+
                     case 'metrics':
                         updateMetrics(msg);
                         break;
@@ -488,6 +507,16 @@
                     case 'error':
                         updateStatus('error', 'Error: ' + msg.message);
                         console.error('[sts]', msg.message);
+                        if (isDuplexRunning) {
+                            isDuplexRunning = false;
+                            stopMic();
+                            talkBtn.textContent = 'Talk';
+                            talkBtn.classList.remove('recording');
+                            talkBtn.classList.add('primary');
+                            talkBtn.disabled = false;
+                            fileBtn.disabled = false;
+                            exampleBtn.disabled = false;
+                        }
                         break;
                 }
             };
@@ -500,17 +529,17 @@
         async function isModelCached() {
             try {
                 const cache = await caches.open('sts-model-v1');
-                // Check if the first model shard is cached
                 return !!(await cache.match('/hf/personaplex-7b-v1-q4_k-webgpu/personaplex-7b-v1-q4_k.gguf.shard-00'));
             } catch { return false; }
         }
 
-        // --- Recording ---
+        // --- Duplex ---
 
-        async function startRecording() {
+        async function startDuplex() {
             if (!playbackNode) await initAudioPlayback();
             if (audioCtx.state === 'suspended') await audioCtx.resume();
 
+            // Set up mic
             if (!micModuleLoaded) {
                 await audioCtx.audioWorklet.addModule('./audio-processor.js');
                 micModuleLoaded = true;
@@ -533,9 +562,17 @@
 
             source.connect(micWorkletNode);
             // Don't connect to destination — mic input should not play back
+
+            // Tell worker to start duplex loop
+            worker.postMessage({ type: 'duplex-start' });
         }
 
-        function stopRecording() {
+        function stopDuplex() {
+            worker.postMessage({ type: 'duplex-stop' });
+            stopMic();
+        }
+
+        function stopMic() {
             if (micWorkletNode) {
                 micWorkletNode.port.postMessage({ type: 'stop' });
                 micWorkletNode.disconnect();
@@ -571,39 +608,73 @@
 
         // --- Event handlers ---
 
-        recordBtn.addEventListener('click', async () => {
-            if (!isRecording) {
-                // Disable button during async startup to prevent race condition
-                recordBtn.disabled = true;
+        talkBtn.addEventListener('click', async () => {
+            if (!isDuplexRunning) {
+                talkBtn.disabled = true;
                 try {
-                    worker.postMessage({ type: 'reset' });
                     transcriptText = '';
                     transcriptTextEl.textContent = 'Transcript will appear here...';
                     transcriptEl.classList.add('empty');
                     audioStatus.textContent = 'Audio output will play here...';
-                    await startRecording();
-                    isRecording = true;
-                    recordBtn.disabled = false;
-                    recordBtn.textContent = 'Stop Recording';
-                    recordBtn.classList.add('recording');
-                    recordBtn.classList.remove('primary');
-                    updateStatus('recording', 'Recording...');
+                    await startDuplex();
+                    isDuplexRunning = true;
+                    talkBtn.disabled = false;
+                    talkBtn.textContent = 'End';
+                    talkBtn.classList.add('recording');
+                    talkBtn.classList.remove('primary');
+                    newConvoBtn.style.display = '';
+                    muteBtn.style.display = '';
+                    fileBtn.disabled = true;
+                    exampleBtn.disabled = true;
+                    updateStatus('recording', 'Duplex active');
                 } catch (err) {
-                    recordBtn.disabled = false;
+                    talkBtn.disabled = false;
                     updateStatus('error', 'Microphone error: ' + err.message);
                     console.error(err);
                 }
             } else {
-                stopRecording();
-                worker.postMessage({ type: 'stop' });
-                isRecording = false;
-                recordBtn.textContent = 'Start Recording';
-                recordBtn.classList.remove('recording');
-                recordBtn.classList.add('primary');
-                updateStatus('loading', 'Generating response...');
-                recordBtn.disabled = true;
+                stopDuplex();
+                isDuplexRunning = false;
+                talkBtn.textContent = 'Talk';
+                talkBtn.classList.remove('recording');
+                talkBtn.classList.add('primary');
+                muteBtn.style.display = 'none';
+                fileBtn.disabled = false;
+                exampleBtn.disabled = false;
+                updateStatus('ready', 'Ready');
             }
         });
+
+        newConvoBtn.addEventListener('click', () => {
+            // If duplex is running, stop it first
+            if (isDuplexRunning) {
+                stopDuplex();
+                isDuplexRunning = false;
+                talkBtn.textContent = 'Talk';
+                talkBtn.classList.remove('recording');
+                talkBtn.classList.add('primary');
+                muteBtn.style.display = 'none';
+                fileBtn.disabled = false;
+                exampleBtn.disabled = false;
+            }
+
+            // Reset playback buffer
+            if (playbackNode) {
+                playbackNode.port.postMessage({ type: 'reset' });
+            }
+
+            // Clear transcript
+            transcriptText = '';
+            transcriptTextEl.textContent = 'Transcript will appear here...';
+            transcriptEl.classList.add('empty');
+            audioStatus.textContent = 'Audio output will play here...';
+
+            // Tell worker to reset engine completely
+            worker.postMessage({ type: 'new-conversation' });
+            updateStatus('ready', 'Ready');
+        });
+
+        // --- File handlers (walkie-talkie testing) ---
 
         fileBtn.addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', async (e) => {
@@ -616,11 +687,14 @@
         async function feedAudioFile(arrayBuf, label) {
             updateStatus('loading', `Decoding ${label}...`);
             fileBtn.disabled = true;
-            recordBtn.disabled = true;
+            talkBtn.disabled = true;
             exampleBtn.disabled = true;
             try {
                 if (!playbackNode) await initAudioPlayback();
                 if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+                // Reset playback buffer
+                playbackNode.port.postMessage({ type: 'reset' });
 
                 const offlineCtx = new OfflineAudioContext(1, 1, 24000);
                 const audioBuf = await offlineCtx.decodeAudioData(arrayBuf);
@@ -633,17 +707,19 @@
                 const rendered = await resampleCtx.startRendering();
                 const pcm = rendered.getChannelData(0);
 
-                worker.postMessage({ type: 'reset' });
+                worker.postMessage({ type: 'new-conversation' });
                 transcriptText = '';
                 transcriptTextEl.textContent = '';
                 transcriptEl.classList.remove('empty');
+
+                // Use walkie-talkie path: start-listening, feed audio, stop
+                worker.postMessage({ type: 'start-listening' });
 
                 const CHUNK = 1920; // Match Mimi frame size
                 updateStatus('loading', `Processing ${(pcm.length / 24000).toFixed(1)}s of audio...`);
                 for (let i = 0; i < pcm.length; i += CHUNK) {
                     const chunk = pcm.slice(i, Math.min(i + CHUNK, pcm.length));
                     worker.postMessage({ type: 'audio', samples: chunk }, [chunk.buffer]);
-                    // Yield periodically so worker can process and send status updates
                     if ((i / CHUNK) % 10 === 0) await new Promise(r => setTimeout(r, 0));
                 }
                 worker.postMessage({ type: 'stop' });
@@ -651,7 +727,7 @@
                 updateStatus('error', 'File error: ' + err.message);
                 console.error(err);
                 fileBtn.disabled = false;
-                recordBtn.disabled = false;
+                talkBtn.disabled = false;
                 exampleBtn.disabled = false;
             }
         }
@@ -665,6 +741,13 @@
         muteBtn.addEventListener('click', () => {
             isMuted = !isMuted;
             muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
+            if (playbackNode) {
+                if (isMuted) {
+                    playbackNode.disconnect();
+                } else {
+                    playbackNode.connect(audioCtx.destination);
+                }
+            }
         });
 
         function buildWavBlob(samples) {

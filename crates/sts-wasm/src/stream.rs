@@ -19,6 +19,10 @@
 //!   Stream 9:  user audio codebook 0 (delay=0)
 //!   Streams 10-16: user audio codebooks 1-7 (delay=1)
 
+use burn::backend::wgpu::{Wgpu, WgpuRuntime};
+use burn::tensor::Tensor;
+use cubecl::Runtime;
+
 use crate::depth::DepthTransformer;
 use crate::model::{sample_greedy, sample_top_k_with_penalty, LayerCaches, TemporalTransformer};
 use crate::StsConfig;
@@ -134,6 +138,15 @@ pub struct StsStream {
     consecutive_text_pad_frames: usize,
     text_pad_stop_frames: usize,
     has_generated_text: bool,
+
+    /// Pre-submitted temporal result for pipelining.
+    /// After depformer finishes, we enqueue the NEXT frame's temporal forward
+    /// so the GPU works while the caller does Mimi decode on CPU (~40ms overlap).
+    pending_temporal: Option<(Tensor<Wgpu, 3>, Tensor<Wgpu, 3>)>,
+
+    /// Full-duplex mode: when true, silence is expected (model listening)
+    /// and should_stop() is not checked by duplex_step().
+    duplex_mode: bool,
 }
 
 impl StsStream {
@@ -167,11 +180,22 @@ impl StsStream {
             consecutive_text_pad_frames: 0,
             text_pad_stop_frames: 6, // ~0.5s of text padding after real text → stop
             has_generated_text: false,
+            pending_temporal: None,
+            duplex_mode: false,
             config,
             temporal_cache,
             depth_cache,
             token_cache,
         }
+    }
+
+    /// Enable or disable full-duplex mode.
+    ///
+    /// In duplex mode, `duplex_step()` does not check `should_stop()` —
+    /// silence is normal when the model is listening. The caller manages
+    /// when to stop generation.
+    pub fn set_duplex_mode(&mut self, enabled: bool) {
+        self.duplex_mode = enabled;
     }
 
     /// Set sampling parameters.
@@ -486,6 +510,11 @@ impl StsStream {
     // -----------------------------------------------------------------------
 
     /// Process one generation step (one 80ms frame at 12.5 Hz).
+    ///
+    /// Uses pipelining: after depformer finishes, enqueues the NEXT frame's
+    /// temporal forward pass on the GPU and flushes commands. The caller can
+    /// then do Mimi decode (CPU, ~40ms) while the GPU computes temporal (~113ms),
+    /// saving ~35ms per frame.
     pub async fn step(
         &mut self,
         temporal: &TemporalTransformer,
@@ -494,16 +523,14 @@ impl StsStream {
         let nq = self.config.num_codebooks;
         let step = self.step;
 
-        // Read input tokens from cache (reads position step - 1)
-        let (text, model, user) = self.read_input_tokens(step);
-
-        // Step 1: Temporal transformer forward pass
-        let (hidden, text_logits) = temporal.forward(
-            &user,
-            &model,
-            text,
-            &mut self.temporal_cache,
-        );
+        // Step 1: Get temporal result — either from pre-submitted pipeline
+        // (GPU already computed while caller was doing Mimi decode) or compute now.
+        let (hidden, text_logits) = if let Some(pending) = self.pending_temporal.take() {
+            pending
+        } else {
+            let (text, model, user) = self.read_input_tokens(step);
+            temporal.forward(&user, &model, text, &mut self.temporal_cache)
+        };
 
         // Step 2: Sample text token with repetition penalty
         let text_token = if self.text_temperature <= 0.0 {
@@ -559,7 +586,6 @@ impl StsStream {
         };
 
         // Write depformer output to cache at position `step` (no delay).
-        // Both agent and user predictions are written during generation.
         self.write_depformer_output(step, text_token, &agent, user_pred);
 
         // Update per-codebook audio token history for repetition penalty
@@ -595,6 +621,231 @@ impl StsStream {
         } else {
             self.has_generated_text = true;
             self.consecutive_text_pad_frames = 0;
+        }
+
+        // Step 5: Pipeline — pre-submit NEXT frame's temporal forward pass.
+        // The GPU starts computing while the caller does Mimi decode on CPU.
+        // We enqueue the work and flush to ensure the GPU command is submitted.
+        {
+            let next_step = self.step;
+            let (text, model, user) = self.read_input_tokens(next_step);
+            let result = temporal.forward(&user, &model, text, &mut self.temporal_cache);
+            self.pending_temporal = Some(result);
+
+            // Flush GPU command buffer so the temporal work starts immediately.
+            // Without this, the commands sit in the encoder until the next readback,
+            // which would be too late for pipelining.
+            let client = WgpuRuntime::client(temporal.device());
+            client.flush();
+        }
+
+        StepOutput {
+            model_audio_tokens: model_audio_out,
+            text_token,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-duplex generation
+    // -----------------------------------------------------------------------
+
+    /// Fast-forward through queued user audio frames with temporal-only processing.
+    ///
+    /// For each frame:
+    /// 1. Write user audio tokens + silence model audio + text padding into cache
+    /// 2. Run temporal forward (builds KV cache state)
+    /// 3. Write silence tokens as agent output (no depformer)
+    /// 4. Advance step counter
+    ///
+    /// No depformer, no sampling — just builds the KV cache state for the user's
+    /// speech so the model is caught up when the next full duplex_step() runs.
+    ///
+    /// Returns the number of frames processed.
+    pub fn duplex_catchup(
+        &mut self,
+        user_audio_frames: &[Vec<u32>],
+        temporal: &TemporalTransformer,
+    ) -> usize {
+        // Write all user audio tokens into cache first
+        for (i, frame) in user_audio_frames.iter().enumerate() {
+            let pos = self.write_pos + i;
+            self.write_user_audio_tokens(pos, frame);
+        }
+        self.write_pos += user_audio_frames.len();
+
+        // Run temporal forward for each frame (no depformer)
+        for _i in 0..user_audio_frames.len() {
+            let step = self.step;
+            let (text, model, user) = self.read_input_tokens(step);
+            let (_hidden, _text_logits) = temporal.forward(
+                &user, &model, text, &mut self.temporal_cache,
+            );
+
+            // Write silence/padding output to cache at this step position
+            // (no depformer output, so use silence tokens for model audio)
+            let silence = self.config.silence_tokens;
+            let text_pad = self.config.text_padding_id;
+            self.write_depformer_output(
+                step,
+                text_pad,
+                &silence,
+                None, // No user predictions — real user audio stays in cache
+            );
+
+            self.step += 1;
+        }
+
+        user_audio_frames.len()
+    }
+
+    /// Process one full-duplex generation step.
+    ///
+    /// Unlike `step()`, this accepts optional user audio tokens and writes them
+    /// into the token cache BEFORE running the temporal transformer, making the
+    /// model truly full-duplex: it can process user audio and generate model
+    /// audio in the same step.
+    ///
+    /// No pipelining (no pending_temporal) — kept simple.
+    pub async fn duplex_step(
+        &mut self,
+        user_audio_tokens: Option<&[u32]>,
+        temporal: &TemporalTransformer,
+        depth: &DepthTransformer,
+    ) -> StepOutput {
+        let nq = self.config.num_codebooks;
+        let step = self.step;
+
+        // Step 1: Write tokens into cache at write_pos before temporal step.
+        let pos = self.write_pos;
+        if let Some(user_tokens) = user_audio_tokens {
+            // Real user audio: write user audio to streams 9-16, silence to
+            // streams 1-8, text_padding to stream 0.
+            self.write_user_audio_tokens(pos, user_tokens);
+        } else {
+            // No user audio: write silence for agent, sine for user,
+            // text_padding for text — same pattern as write_prompt_tokens.
+            self.write_prompt_tokens(pos, self.config.text_padding_id as i32);
+        }
+        self.write_pos = pos + 1;
+
+        // Step 2: Read input tokens and run temporal forward.
+        let (text, model, user) = self.read_input_tokens(step);
+        let (hidden, text_logits) = temporal.forward(
+            &user, &model, text, &mut self.temporal_cache,
+        );
+
+        // Step 3: Sample text token with repetition penalty.
+        let text_token = if self.text_temperature <= 0.0 {
+            sample_greedy(text_logits).await
+        } else {
+            let text_history: Vec<u32> = self
+                .text_token_history
+                .iter()
+                .rev()
+                .take(self.penalty_window)
+                .copied()
+                .collect();
+            sample_top_k_with_penalty(
+                text_logits,
+                self.text_top_k,
+                self.text_temperature,
+                &text_history,
+                self.repetition_penalty,
+            )
+            .await
+        };
+        self.text_token_history.push(text_token);
+        if self.text_token_history.len() > self.penalty_window {
+            self.text_token_history.drain(..self.text_token_history.len() - self.penalty_window);
+        }
+
+        // Step 4: Reset depth cache and run depformer.
+        self.depth_cache.reset_keep_buffers();
+
+        let provided = if user_audio_tokens.is_some() {
+            // Provide real user audio tokens at depformer positions 8..15
+            // (same pattern as prefill_user_audio).
+            let mut prov = vec![-1i32; self.config.depth_num_steps];
+            for cb in 0..nq {
+                let stream = 1 + nq + cb;
+                let tok = self.token_cache.read(stream, step);
+                if tok >= 0 {
+                    prov[nq + cb] = tok;
+                }
+            }
+            Some(prov)
+        } else {
+            None
+        };
+
+        let penalty_hist = &self.audio_token_history;
+        let all_audio_tokens = depth.generate(
+            hidden,
+            text_token,
+            &mut self.depth_cache,
+            self.audio_temperature,
+            self.audio_top_k,
+            provided.as_deref(),
+            Some(penalty_hist),
+            self.repetition_penalty,
+        )
+        .await;
+
+        // Step 5: Write depformer output to cache.
+        let agent_end = nq.min(all_audio_tokens.len());
+        let agent = &all_audio_tokens[..agent_end];
+
+        if user_audio_tokens.is_some() {
+            // Real user audio in cache — don't overwrite with predictions.
+            self.write_depformer_output(step, text_token, agent, None);
+        } else {
+            // No real user audio — write user predictions too.
+            let user_start = nq;
+            let user_end = (2 * nq).min(all_audio_tokens.len());
+            let user_pred = if user_end > user_start {
+                Some(&all_audio_tokens[user_start..user_end])
+            } else {
+                None
+            };
+            self.write_depformer_output(step, text_token, agent, user_pred);
+        }
+
+        // Step 6: Update audio token history for repetition penalty.
+        for (s, &token) in all_audio_tokens.iter().enumerate() {
+            if s < self.audio_token_history.len() {
+                let hist = &mut self.audio_token_history[s];
+                hist.push(token);
+                if hist.len() > self.penalty_window {
+                    hist.drain(..hist.len() - self.penalty_window);
+                }
+            }
+        }
+
+        // Step 7: Build output and advance step.
+        let mut model_audio_out = agent.to_vec();
+        model_audio_out.resize(nq, 0);
+        self.last_model_audio_tokens = model_audio_out.clone();
+
+        self.step += 1;
+
+        // Step 8: Silence/stop tracking — only if NOT in duplex mode.
+        // In duplex mode, silence is normal (model listening) and the caller
+        // manages when to stop.
+        if !self.duplex_mode {
+            if self.is_silence() {
+                self.consecutive_silence_frames += 1;
+            } else {
+                self.consecutive_silence_frames = 0;
+            }
+
+            if text_token == self.config.text_padding_id {
+                if self.has_generated_text {
+                    self.consecutive_text_pad_frames += 1;
+                }
+            } else {
+                self.has_generated_text = true;
+                self.consecutive_text_pad_frames = 0;
+            }
         }
 
         StepOutput {
@@ -670,6 +921,8 @@ impl StsStream {
         self.consecutive_silence_frames = 0;
         self.consecutive_text_pad_frames = 0;
         self.has_generated_text = false;
+        self.pending_temporal = None;
+        self.duplex_mode = false;
         self.temporal_cache.reset();
         self.depth_cache.reset();
     }
@@ -687,6 +940,8 @@ impl StsStream {
         self.consecutive_silence_frames = 0;
         self.consecutive_text_pad_frames = 0;
         self.has_generated_text = false;
+        self.pending_temporal = None;
+        self.duplex_mode = false;
         self.temporal_cache.reset_keep_buffers();
         self.depth_cache.reset_keep_buffers();
     }

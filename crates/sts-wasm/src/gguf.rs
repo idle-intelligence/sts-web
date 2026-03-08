@@ -723,7 +723,24 @@ impl KernelSource for Q4KMatmulNaiveKernel {
     }
 }
 
+/// Cooperative Q4_K matvec kernel for M=1 (single-token generation).
+/// Uses 256 threads per workgroup, one workgroup per output element.
+/// Threads cooperatively tile along K with shared memory reduction.
+struct Q4KMatvecKernel;
+
+impl KernelSource for Q4KMatvecKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4k_matvec.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
 /// Fused Q4_K dequant+matmul on GPU.
+/// For M=1 (single-token generation), dispatches the cooperative matvec kernel.
+/// For M>1 (prefill), uses the naive one-thread-per-output kernel.
 pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
@@ -752,22 +769,38 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
-    let kernel = SourceKernel::new(
-        Q4KMatmulNaiveKernel {
-            workgroup_size_x: NAIVE_WG_X,
-            workgroup_size_y: NAIVE_WG_Y,
-        },
-        CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
-    );
-    let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
-    let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
-    client
-        .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
-            CubeCount::new_2d(wg_x, wg_y),
-            bindings,
-        )
-        .expect("Q4_K naive matmul kernel launch failed");
+    if m == 1 {
+        // Matvec with shared-memory input caching: 256 threads per workgroup,
+        // each thread computes one output element, input vector cached in shared mem.
+        let kernel = SourceKernel::new(Q4KMatvecKernel, CubeDim::new_1d(256));
+        let wg_x = n.div_ceil(256) as u32;
+        let wg_y = b as u32;
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_2d(wg_x, wg_y),
+                bindings,
+            )
+            .expect("Q4_K matvec kernel launch failed");
+    } else {
+        // Naive kernel: one thread per output element
+        let kernel = SourceKernel::new(
+            Q4KMatmulNaiveKernel {
+                workgroup_size_x: NAIVE_WG_X,
+                workgroup_size_y: NAIVE_WG_Y,
+            },
+            CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
+        );
+        let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
+        let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_2d(wg_x, wg_y),
+                bindings,
+            )
+            .expect("Q4_K naive matmul kernel launch failed");
+    }
 
     let output_tensor = CubeTensor::new_contiguous(
         client,

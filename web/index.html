@@ -278,9 +278,9 @@
     <section>
         <h2>conversation</h2>
         <div class="actions">
-            <button id="talkBtn" class="primary" disabled>Talk</button>
-            <button id="newConvoBtn" style="display:none">New conversation</button>
-            <button id="muteBtn" style="display:none">Mute</button>
+            <button id="myTurnBtn" class="primary" disabled>My Turn</button>
+            <button id="yourTurnBtn" class="danger" disabled style="display:none">Your Turn</button>
+            <button id="newConvoBtn" style="display:none">New Conversation</button>
         </div>
         <p class="info">Audio stays on this device. All inference runs locally in your browser.</p>
     </section>
@@ -297,7 +297,7 @@
     </section>
 
     <section>
-        <h2>files <span class="sub">· walkie-talkie mode</span></h2>
+        <h2>files <span class="sub">· test mode</span></h2>
         <div class="actions">
             <button id="fileBtn" disabled>Load WAV File</button>
             <button id="exampleBtn" disabled>Load Example WAV</button>
@@ -347,13 +347,13 @@
         const progressInfo = document.getElementById('progressInfo');
         const transcriptEl = document.getElementById('transcript');
         const transcriptTextEl = document.getElementById('transcriptText');
-        const talkBtn = document.getElementById('talkBtn');
+        const myTurnBtn = document.getElementById('myTurnBtn');
+        const yourTurnBtn = document.getElementById('yourTurnBtn');
         const newConvoBtn = document.getElementById('newConvoBtn');
         const fileBtn = document.getElementById('fileBtn');
         const fileInput = document.getElementById('fileInput');
         const downloadBtn = document.getElementById('downloadBtn');
         const exampleBtn = document.getElementById('exampleBtn');
-        const muteBtn = document.getElementById('muteBtn');
         const audioPlayer = document.getElementById('audioPlayer');
         const audioStatus = document.getElementById('audioStatus');
         const metricsCard = document.getElementById('metricsCard');
@@ -369,11 +369,43 @@
         let playbackNode = null;
         let micStream = null;
         let micWorkletNode = null;
-        let isDuplexRunning = false;
-        let isMuted = false;
         let transcriptText = '';
         let micModuleLoaded = false;
         let lastCompleteAudio = null;
+
+        // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
+        let uiState = 'idle';
+
+        function setUIState(state) {
+            uiState = state;
+            switch (state) {
+                case 'idle':
+                    myTurnBtn.textContent = 'My Turn';
+                    myTurnBtn.disabled = false;
+                    myTurnBtn.style.display = '';
+                    myTurnBtn.classList.add('primary');
+                    yourTurnBtn.style.display = 'none';
+                    yourTurnBtn.disabled = true;
+                    fileBtn.disabled = false;
+                    exampleBtn.disabled = false;
+                    break;
+                case 'listening':
+                    myTurnBtn.style.display = 'none';
+                    yourTurnBtn.style.display = '';
+                    yourTurnBtn.disabled = false;
+                    newConvoBtn.style.display = '';
+                    fileBtn.disabled = true;
+                    exampleBtn.disabled = true;
+                    break;
+                case 'generating':
+                case 'speaking':
+                    myTurnBtn.style.display = 'none';
+                    yourTurnBtn.style.display = 'none';
+                    fileBtn.disabled = true;
+                    exampleBtn.disabled = true;
+                    break;
+            }
+        }
 
         function updateStatus(state, text) {
             statusDot.className = 'status-dot ' + state;
@@ -411,11 +443,47 @@
             return playbackNode;
         }
 
-        function sendAudioToPlayback(samples) {
-            if (isMuted || !samples) return;
-            if (!playbackNode) return;
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-            playbackNode.port.postMessage({ type: 'audio', samples });
+        // --- Mic setup ---
+
+        async function startMic() {
+            if (!audioCtx) await initAudioPlayback();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            if (!micModuleLoaded) {
+                await audioCtx.audioWorklet.addModule('./audio-processor.js');
+                micModuleLoaded = true;
+            }
+
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                }
+            });
+            const source = audioCtx.createMediaStreamSource(micStream);
+            micWorkletNode = new AudioWorkletNode(audioCtx, 'audio-processor');
+
+            // Direct port from AudioWorklet -> Worker (bypasses main thread)
+            const channel = new MessageChannel();
+            micWorkletNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+            worker.postMessage({ type: 'audio-port', port: channel.port2 }, [channel.port2]);
+
+            source.connect(micWorkletNode);
+            // Don't connect to destination — mic input should not play back
+        }
+
+        function stopMic() {
+            if (micWorkletNode) {
+                micWorkletNode.port.postMessage({ type: 'stop' });
+                micWorkletNode.disconnect();
+                micWorkletNode = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+            }
         }
 
         // --- Worker setup ---
@@ -429,17 +497,18 @@
                     case 'status':
                         if (msg.ready) {
                             updateStatus('ready', msg.text);
-                            if (!isDuplexRunning) {
-                                talkBtn.disabled = false;
+                            if (uiState === 'idle') {
+                                myTurnBtn.disabled = false;
                                 fileBtn.disabled = false;
                                 exampleBtn.disabled = false;
                             }
                             progressBar.classList.remove('visible');
                             progressInfo.textContent = '';
                             downloadBtn.style.display = 'none';
-                        } else if (isDuplexRunning) {
-                            // During duplex, show worker status updates
+                        } else if (uiState === 'listening') {
                             updateStatus('recording', msg.text);
+                        } else if (uiState === 'generating' || uiState === 'speaking') {
+                            updateStatus('active', msg.text);
                         } else {
                             updateStatus('loading', msg.text);
                             if (msg.progress) {
@@ -490,14 +559,8 @@
                     }
 
                     case 'turn-complete':
-                        // In duplex mode, do NOT change button state — duplex runs continuously.
-                        // Only re-enable buttons for file-based walkie-talkie mode.
-                        if (!isDuplexRunning) {
-                            updateStatus('ready', 'Ready');
-                            talkBtn.disabled = false;
-                            fileBtn.disabled = false;
-                            exampleBtn.disabled = false;
-                        }
+                        updateStatus('ready', 'Ready');
+                        setUIState('idle');
                         break;
 
                     case 'metrics':
@@ -507,16 +570,8 @@
                     case 'error':
                         updateStatus('error', 'Error: ' + msg.message);
                         console.error('[sts]', msg.message);
-                        if (isDuplexRunning) {
-                            isDuplexRunning = false;
-                            stopMic();
-                            talkBtn.textContent = 'Talk';
-                            talkBtn.classList.remove('recording');
-                            talkBtn.classList.add('primary');
-                            talkBtn.disabled = false;
-                            fileBtn.disabled = false;
-                            exampleBtn.disabled = false;
-                        }
+                        stopMic();
+                        setUIState('idle');
                         break;
                 }
             };
@@ -531,57 +586,6 @@
                 const cache = await caches.open('sts-model-v1');
                 return !!(await cache.match('/hf/personaplex-7b-v1-q4_k-webgpu/personaplex-7b-v1-q4_k.gguf.shard-00'));
             } catch { return false; }
-        }
-
-        // --- Duplex ---
-
-        async function startDuplex() {
-            if (!playbackNode) await initAudioPlayback();
-            if (audioCtx.state === 'suspended') await audioCtx.resume();
-
-            // Set up mic
-            if (!micModuleLoaded) {
-                await audioCtx.audioWorklet.addModule('./audio-processor.js');
-                micModuleLoaded = true;
-            }
-            micStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    channelCount: 1,
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false,
-                }
-            });
-            const source = audioCtx.createMediaStreamSource(micStream);
-            micWorkletNode = new AudioWorkletNode(audioCtx, 'audio-processor');
-
-            // Direct port from AudioWorklet -> Worker (bypasses main thread)
-            const channel = new MessageChannel();
-            micWorkletNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
-            worker.postMessage({ type: 'audio-port', port: channel.port2 }, [channel.port2]);
-
-            source.connect(micWorkletNode);
-            // Don't connect to destination — mic input should not play back
-
-            // Tell worker to start duplex loop
-            worker.postMessage({ type: 'duplex-start' });
-        }
-
-        function stopDuplex() {
-            worker.postMessage({ type: 'duplex-stop' });
-            stopMic();
-        }
-
-        function stopMic() {
-            if (micWorkletNode) {
-                micWorkletNode.port.postMessage({ type: 'stop' });
-                micWorkletNode.disconnect();
-                micWorkletNode = null;
-            }
-            if (micStream) {
-                micStream.getTracks().forEach(t => t.stop());
-                micStream = null;
-            }
         }
 
         // --- Init ---
@@ -608,55 +612,43 @@
 
         // --- Event handlers ---
 
-        talkBtn.addEventListener('click', async () => {
-            if (!isDuplexRunning) {
-                talkBtn.disabled = true;
-                try {
-                    transcriptText = '';
-                    transcriptTextEl.textContent = 'Transcript will appear here...';
-                    transcriptEl.classList.add('empty');
-                    audioStatus.textContent = 'Audio output will play here...';
-                    await startDuplex();
-                    isDuplexRunning = true;
-                    talkBtn.disabled = false;
-                    talkBtn.textContent = 'End';
-                    talkBtn.classList.add('recording');
-                    talkBtn.classList.remove('primary');
-                    newConvoBtn.style.display = '';
-                    muteBtn.style.display = '';
-                    fileBtn.disabled = true;
-                    exampleBtn.disabled = true;
-                    updateStatus('recording', 'Duplex active');
-                } catch (err) {
-                    talkBtn.disabled = false;
-                    updateStatus('error', 'Microphone error: ' + err.message);
-                    console.error(err);
-                }
-            } else {
-                stopDuplex();
-                isDuplexRunning = false;
-                talkBtn.textContent = 'Talk';
-                talkBtn.classList.remove('recording');
-                talkBtn.classList.add('primary');
-                muteBtn.style.display = 'none';
-                fileBtn.disabled = false;
-                exampleBtn.disabled = false;
-                updateStatus('ready', 'Ready');
+        // "My Turn" — start recording
+        myTurnBtn.addEventListener('click', async () => {
+            myTurnBtn.disabled = true;
+            try {
+                transcriptText = '';
+                transcriptTextEl.textContent = 'Transcript will appear here...';
+                transcriptEl.classList.add('empty');
+                audioStatus.textContent = 'Audio output will play here...';
+
+                await startMic();
+                worker.postMessage({ type: 'start-listening' });
+                setUIState('listening');
+                updateStatus('recording', 'Listening...');
+            } catch (err) {
+                myTurnBtn.disabled = false;
+                updateStatus('error', 'Microphone error: ' + err.message);
+                console.error(err);
             }
         });
 
-        newConvoBtn.addEventListener('click', () => {
-            // If duplex is running, stop it first
-            if (isDuplexRunning) {
-                stopDuplex();
-                isDuplexRunning = false;
-                talkBtn.textContent = 'Talk';
-                talkBtn.classList.remove('recording');
-                talkBtn.classList.add('primary');
-                muteBtn.style.display = 'none';
-                fileBtn.disabled = false;
-                exampleBtn.disabled = false;
+        // "Your Turn" — stop recording, trigger generation
+        yourTurnBtn.addEventListener('click', () => {
+            stopMic();
+            worker.postMessage({ type: 'stop' });
+            setUIState('generating');
+            updateStatus('active', 'Generating response...');
+
+            // Reset playback buffer for fresh output
+            if (playbackNode) {
+                playbackNode.port.postMessage({ type: 'reset' });
             }
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        });
+
+        // "New Conversation" — reset everything
+        newConvoBtn.addEventListener('click', () => {
+            stopMic();
 
             // Reset playback buffer
             if (playbackNode) {
@@ -671,10 +663,11 @@
 
             // Tell worker to reset engine completely
             worker.postMessage({ type: 'new-conversation' });
+            setUIState('idle');
             updateStatus('ready', 'Ready');
         });
 
-        // --- File handlers (walkie-talkie testing) ---
+        // --- File handlers (test mode) ---
 
         fileBtn.addEventListener('click', () => fileInput.click());
         fileInput.addEventListener('change', async (e) => {
@@ -686,9 +679,7 @@
 
         async function feedAudioFile(arrayBuf, label) {
             updateStatus('loading', `Decoding ${label}...`);
-            fileBtn.disabled = true;
-            talkBtn.disabled = true;
-            exampleBtn.disabled = true;
+            setUIState('generating');
             try {
                 if (!playbackNode) await initAudioPlayback();
                 if (audioCtx.state === 'suspended') await audioCtx.resume();
@@ -726,9 +717,7 @@
             } catch (err) {
                 updateStatus('error', 'File error: ' + err.message);
                 console.error(err);
-                fileBtn.disabled = false;
-                talkBtn.disabled = false;
-                exampleBtn.disabled = false;
+                setUIState('idle');
             }
         }
 
@@ -736,18 +725,6 @@
             const resp = await fetch('./joke.wav');
             if (!resp.ok) { updateStatus('error', 'Failed to fetch example WAV'); return; }
             await feedAudioFile(await resp.arrayBuffer(), 'joke.wav');
-        });
-
-        muteBtn.addEventListener('click', () => {
-            isMuted = !isMuted;
-            muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
-            if (playbackNode) {
-                if (isMuted) {
-                    playbackNode.disconnect();
-                } else {
-                    playbackNode.connect(audioCtx.destination);
-                }
-            }
         });
 
         function buildWavBlob(samples) {

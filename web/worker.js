@@ -6,17 +6,15 @@
  * Protocol:
  *   Main -> Worker:
  *     { type: 'load' }                          -- initialize WASM + WebGPU, download model
- *     { type: 'duplex-start' }                  -- start full-duplex loop
- *     { type: 'duplex-stop' }                   -- stop full-duplex loop
  *     { type: 'new-conversation' }              -- clear all state for a fresh conversation
- *     { type: 'start-listening' }               -- (walkie-talkie) begin accepting audio
+ *     { type: 'start-listening' }               -- begin accepting audio
  *     { type: 'audio', samples: Float32Array }  -- feed mic audio chunk
- *     { type: 'stop' }                          -- (walkie-talkie) stop recording, generate
+ *     { type: 'stop' }                          -- stop recording, generate response
  *     { type: 'playback-port', port: MessagePort } -- port to stream audio to AudioWorklet
  *
  *   Worker -> Main:
  *     { type: 'status', text: string, ready?: boolean, progress?: { loaded, total } }
- *     { type: 'turn-complete' }                 -- generation finished (walkie-talkie)
+ *     { type: 'turn-complete' }                 -- generation finished
  *     { type: 'audio-chunk', step: number, done: boolean }
  *     { type: 'transcript', text: string, final?: boolean }
  *     { type: 'audio-complete', samples: Float32Array }
@@ -31,14 +29,10 @@ let stsWasm = null;
 let totalSamples = 0;
 let recordingStart = 0;
 let prefillFrames = 0;
-let listening = false; // Only process audio when explicitly listening (walkie-talkie)
+let listening = false;
 
 // Port to stream audio directly to AudioWorklet
 let playbackPort = null;
-
-// Duplex state
-let duplexRunning = false;
-const duplexAudioBuffer = [];
 
 function logState(msg) {
     const t = ((performance.now()) / 1000).toFixed(2);
@@ -57,7 +51,7 @@ async function drainQueue() {
     while (msgQueue.length > 0) {
         const { type, data } = msgQueue.shift();
         try {
-            // Drop audio messages when not listening or after stop (walkie-talkie only)
+            // Drop audio messages when not listening or after stop
             if (type === 'audio' && (!listening || stopped)) continue;
             switch (type) {
                 case 'load':
@@ -81,12 +75,6 @@ async function drainQueue() {
                     listening = false;
                     await handleStop();
                     break;
-                case 'duplex-start':
-                    await handleDuplexStart();
-                    break;
-                case 'duplex-stop':
-                    handleDuplexStop();
-                    break;
                 case 'new-conversation':
                     logState('New conversation');
                     stopped = false;
@@ -94,7 +82,6 @@ async function drainQueue() {
                     audioChunkCount = 0;
                     prefillFrames = 0;
                     totalSamples = 0;
-                    duplexAudioBuffer.length = 0;
                     handleNewConversation();
                     break;
                 default:
@@ -121,13 +108,8 @@ self.onmessage = (e) => {
         audioPort = data.port;
         audioPort.onmessage = (ev) => {
             if (ev.data.type === 'audio') {
-                if (duplexRunning) {
-                    // In duplex mode, buffer audio directly (bypass queue serialization)
-                    duplexAudioBuffer.push(ev.data.samples);
-                } else {
-                    msgQueue.push({ type: 'audio', data: { samples: ev.data.samples } });
-                    drainQueue();
-                }
+                msgQueue.push({ type: 'audio', data: { samples: ev.data.samples } });
+                drainQueue();
             }
         };
         return;
@@ -136,18 +118,6 @@ self.onmessage = (e) => {
     if (type === 'playback-port') {
         playbackPort = data.port;
         logState('Playback port received');
-        return;
-    }
-
-    // Handle duplex stop/reset directly (don't queue — drainQueue is blocked)
-    if (type === 'duplex-stop' && duplexRunning) {
-        handleDuplexStop();
-        return;
-    }
-    if (type === 'new-conversation' && duplexRunning) {
-        handleDuplexStop();
-        // Queue the reset for after the loop exits
-        msgQueue.push({ type, data });
         return;
     }
 
@@ -299,7 +269,7 @@ async function handleLoad(config) {
 }
 
 // ---------------------------------------------------------------------------
-// Walkie-talkie handlers (kept for file/example WAV fallback)
+// Audio handlers
 // ---------------------------------------------------------------------------
 
 async function handleAudio({ samples }) {
@@ -419,81 +389,6 @@ async function handleStop() {
 }
 
 // ---------------------------------------------------------------------------
-// Duplex handlers
-// ---------------------------------------------------------------------------
-
-async function handleDuplexStart() {
-    if (!engine) {
-        self.postMessage({ type: 'error', message: 'Engine not loaded' });
-        return;
-    }
-    if (duplexRunning) {
-        logState('Duplex already running');
-        return;
-    }
-    logState('Starting duplex loop');
-    // Run the loop but don't await it here -- let drainQueue finish so the
-    // worker can keep processing other messages (like duplex-stop).
-    runDuplexLoop().catch(err => {
-        self.postMessage({ type: 'error', message: err.message || String(err) });
-    });
-}
-
-function handleDuplexStop() {
-    logState('Stopping duplex loop');
-    duplexRunning = false;
-}
-
-async function runDuplexLoop() {
-    engine.duplexStart();
-    duplexRunning = true;
-    busy = true; // Prevent drainQueue from touching engine while duplex runs
-    let step = 0;
-
-    while (duplexRunning) {
-        // Drain audio buffer into engine (Mimi encode only, fast)
-        // Take a snapshot to avoid re-entrancy issues
-        const pending = duplexAudioBuffer.splice(0, duplexAudioBuffer.length);
-        for (const samples of pending) {
-            engine.feedAudioDuplex(samples);
-        }
-
-        // Run one duplex step (~250ms)
-        const result = await engine.duplexStep();
-        if (!result) break;
-
-        // Stream audio to playback
-        if (result.audio && result.audio.length > 0 && playbackPort) {
-            playbackPort.postMessage({ type: 'audio', samples: result.audio }, [result.audio.buffer]);
-        }
-
-        // Forward text
-        if (result.text) {
-            self.postMessage({ type: 'transcript', text: result.text, final: false });
-        }
-
-        // Status
-        self.postMessage({
-            type: 'status',
-            text: result.userQueueDepth > 0
-                ? `Listening... (${result.userQueueDepth} frames buffered)`
-                : `Active (step ${step})`,
-        });
-
-        step++;
-    }
-
-    engine.duplexStop();
-    duplexRunning = false;
-    busy = false; // Allow drainQueue to process messages again
-    duplexAudioBuffer.length = 0;
-    logState('Duplex loop ended');
-    self.postMessage({ type: 'status', text: 'Ready', ready: true });
-    // Process any queued messages (e.g. new-conversation) that arrived during loop
-    drainQueue();
-}
-
-// ---------------------------------------------------------------------------
 // Conversation reset
 // ---------------------------------------------------------------------------
 
@@ -501,7 +396,6 @@ function handleNewConversation() {
     totalSamples = 0;
     prefillFrames = 0;
     audioChunkCount = 0;
-    duplexAudioBuffer.length = 0;
     if (!engine) return;
     engine.reset();
 }

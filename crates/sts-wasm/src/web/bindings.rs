@@ -178,8 +178,6 @@ pub struct StsEngine {
     voice_preset_num_frames: usize,
     voice_preset_cache: Option<Vec<Vec<i32>>>,
 
-    // Duplex mode: queue of Mimi-encoded user audio frames (each is 8 u32 tokens)
-    user_frame_queue: Vec<Vec<u32>>,
 }
 
 #[cfg_attr(target_family = "wasm", wasm_bindgen)]
@@ -212,7 +210,6 @@ impl StsEngine {
             voice_preset_embeddings: None,
             voice_preset_num_frames: 0,
             voice_preset_cache: None,
-            user_frame_queue: Vec::new(),
         }
     }
 
@@ -774,7 +771,6 @@ impl StsEngine {
             mimi.reset();
         }
         self.pcm_buffer.clear();
-        self.user_frame_queue.clear();
         self.prefilled = false;
         self.generating = false;
         self.gen_step = 0;
@@ -787,216 +783,6 @@ impl StsEngine {
         self.temporal.is_some() && self.depth.is_some() && self.mimi.is_some()
     }
 
-    // ------------------------------------------------------------------
-    // Duplex API
-    // ------------------------------------------------------------------
-
-    /// Feed PCM audio for duplex mode (encode only, no prefill).
-    ///
-    /// Encodes complete 80ms frames (1920 samples at 24kHz) with Mimi and
-    /// pushes each frame's tokens to `user_frame_queue`. The duplex step
-    /// loop will pop frames from the queue as needed.
-    ///
-    /// Returns the number of frames encoded in this call.
-    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = feedAudioDuplex))]
-    pub fn feed_audio_duplex(&mut self, samples: &[f32]) -> u32 {
-        let mimi = match self.mimi.as_mut() {
-            Some(m) => m,
-            None => {
-                wasm_log("[sts] Warning: feedAudioDuplex called before Mimi loaded");
-                return 0;
-            }
-        };
-
-        // Append incoming PCM
-        self.pcm_buffer.extend_from_slice(samples);
-
-        let frame_size = 1920; // 80ms at 24kHz
-        let num_codebooks = self.config.num_codebooks; // 8
-        let mut frames_encoded: u32 = 0;
-
-        // Encode complete frames with Mimi and queue tokens
-        while self.pcm_buffer.len() >= frame_size {
-            let frame_pcm: Vec<f32> = self.pcm_buffer.drain(..frame_size).collect();
-
-            let t0 = now_ms();
-            let tokens = mimi.encode(&frame_pcm);
-            self.metrics.total_mimi_ms += now_ms() - t0;
-
-            let mimi_codebooks = mimi.num_codebooks();
-            if tokens.len() >= num_codebooks {
-                let n_frames = tokens.len() / mimi_codebooks;
-                for f in 0..n_frames {
-                    let offset = f * mimi_codebooks;
-                    let frame_tokens: Vec<u32> =
-                        tokens[offset..offset + num_codebooks].to_vec();
-                    self.user_frame_queue.push(frame_tokens);
-                    frames_encoded += 1;
-                }
-            }
-        }
-
-        // Log sparingly
-        if frames_encoded > 0 {
-            let queue_depth = self.user_frame_queue.len();
-            if queue_depth <= 1 || queue_depth % 50 == 0 {
-                wasm_log(&format!(
-                    "[sts] feedAudioDuplex: encoded {} frames, queue depth={}",
-                    frames_encoded, queue_depth
-                ));
-            }
-        }
-
-        frames_encoded
-    }
-
-    /// Start duplex mode.
-    ///
-    /// Ensures system prompt is prefilled (lazy, one-time), enables duplex
-    /// mode on the stream, and resets generation step counter and metrics.
-    /// Does NOT reset KV cache.
-    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = duplexStart))]
-    pub fn duplex_start(&mut self) {
-        self.ensure_prefilled();
-
-        if let Some(stream) = self.stream.as_mut() {
-            stream.set_duplex_mode(true);
-        }
-
-        self.generating = true;
-        self.gen_step = 0;
-        self.metrics.reset();
-        wasm_log("[sts] Duplex mode started");
-    }
-
-    /// Run one duplex step.
-    ///
-    /// Pops a user audio frame from the queue (if available) and runs one
-    /// temporal+depth step. Returns a JS object with:
-    ///   - `audio`: Float32Array of decoded PCM samples
-    ///   - `text`: decoded text token (string, if not padding)
-    ///   - `step`: current step number
-    ///   - `userQueueDepth`: remaining frames in user_frame_queue
-    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = duplexStep))]
-    pub async fn duplex_step(&mut self) -> JsValue {
-        // Drop excess frames — keep only the latest one.
-        // At >1x RTF the model can't process every frame in realtime.
-        // Better to generate audio every step than waste time catching up.
-        let dropped = if self.user_frame_queue.len() > 1 {
-            let n = self.user_frame_queue.len() - 1;
-            self.user_frame_queue.drain(..n);
-            n
-        } else {
-            0
-        };
-
-        // Pop the last frame (if any) for full duplex step
-        let user_tokens: Option<Vec<u32>> = if !self.user_frame_queue.is_empty() {
-            Some(self.user_frame_queue.remove(0))
-        } else {
-            None
-        };
-
-        let temporal = match self.temporal.as_ref() {
-            Some(t) => t,
-            None => return JsValue::NULL,
-        };
-        let depth = match self.depth.as_ref() {
-            Some(d) => d,
-            None => return JsValue::NULL,
-        };
-        let stream = match self.stream.as_mut() {
-            Some(s) => s,
-            None => return JsValue::NULL,
-        };
-
-        // Run one full duplex step (temporal + depformer + returns audio)
-        let t0 = now_ms();
-        let output = stream
-            .duplex_step(user_tokens.as_deref(), temporal, depth)
-            .await;
-        let elapsed = now_ms() - t0;
-        self.metrics.total_ms += elapsed;
-        self.metrics.total_frames += 1;
-
-        let i = self.gen_step;
-        if i < 5 || i % 10 == 0 || dropped > 0 {
-            let toks: Vec<String> = output
-                .model_audio_tokens
-                .iter()
-                .map(|t| t.to_string())
-                .collect();
-            let has_user = user_tokens.is_some();
-            wasm_log(&format!(
-                "[sts] Duplex frame {i}: text={} audio=[{}] user={} dropped={} ({:.0}ms)",
-                output.text_token,
-                toks.join(","),
-                has_user,
-                dropped,
-                elapsed
-            ));
-        }
-
-        self.gen_step += 1;
-
-        // Decode audio with Mimi
-        let mimi = match self.mimi.as_mut() {
-            Some(m) => m,
-            None => return JsValue::NULL,
-        };
-        let num_codebooks = self.config.num_codebooks;
-        let t0 = now_ms();
-        let pcm = mimi.decode_n(&output.model_audio_tokens, num_codebooks);
-        self.metrics.total_mimi_ms += now_ms() - t0;
-
-        // Build result: { audio, text, step, userQueueDepth }
-        let result = js_sys::Object::new();
-
-        let audio = js_sys::Float32Array::new_with_length(pcm.len() as u32);
-        audio.copy_from(&pcm);
-        js_sys::Reflect::set(&result, &"audio".into(), &audio.into()).ok();
-
-        // Decode text token
-        let text_token = output.text_token;
-        if text_token != self.config.text_padding_id {
-            let text_str = if let Some(tok) = &self.tokenizer {
-                tok.decode(&[text_token])
-            } else {
-                text_token.to_string()
-            };
-            if !text_str.is_empty() {
-                js_sys::Reflect::set(&result, &"text".into(), &JsValue::from_str(&text_str))
-                    .ok();
-            }
-        }
-
-        js_sys::Reflect::set(&result, &"step".into(), &JsValue::from_f64(i as f64)).ok();
-        js_sys::Reflect::set(
-            &result,
-            &"userQueueDepth".into(),
-            &JsValue::from_f64(self.user_frame_queue.len() as f64),
-        )
-        .ok();
-
-        result.into()
-    }
-
-    /// Stop duplex mode.
-    ///
-    /// Disables duplex mode on the stream, clears the user frame queue,
-    /// and sets generating to false. Does NOT reset model state.
-    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = duplexStop))]
-    pub fn duplex_stop(&mut self) {
-        if let Some(stream) = self.stream.as_mut() {
-            stream.set_duplex_mode(false);
-        }
-        self.user_frame_queue.clear();
-        self.generating = false;
-        wasm_log(&format!(
-            "[sts] Duplex mode stopped after {} frames",
-            self.gen_step
-        ));
-    }
 }
 
 impl Default for StsEngine {

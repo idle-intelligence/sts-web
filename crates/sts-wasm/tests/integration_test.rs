@@ -288,6 +288,98 @@ fn test_q4k_matmul_nonzero() {
 }
 
 #[test]
+fn test_q4k_cooperative_vs_naive() {
+    // Compare cooperative matvec (M=1) vs naive (M=2, first row) output.
+    // If cooperative shader has a bug, results will differ.
+    let model_dir = Path::new("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_k-webgpu");
+    if !model_dir.exists() {
+        eprintln!("Skipping: quantized model not found");
+        return;
+    }
+
+    use burn::backend::wgpu::WgpuDevice;
+    use burn::tensor::Tensor;
+    use sts_wasm::gguf::Q4ModelLoader;
+
+    let shards = load_shards();
+    let device = WgpuDevice::default();
+    let mut loader = Q4ModelLoader::from_shards(shards).unwrap();
+
+    // Load a Q4_K tensor
+    let linear = loader
+        .load_linear_auto("transformer.layers.0.self_attn.in_proj_weight", &device)
+        .unwrap();
+
+    let k = 4096usize;
+    let n = 12288usize;
+
+    // Create input vector
+    let input_data: Vec<f32> = (0..k).map(|i| (i as f32 * 0.001) - 2.0).collect();
+
+    // M=1 path → cooperative shader
+    let input_m1 = Tensor::<burn::backend::Wgpu, 3>::from_data(
+        burn::tensor::TensorData::new(input_data.clone(), [1, 1, k]),
+        &device,
+    );
+    let out_m1 = linear.forward(input_m1);
+    let out_m1_flat: Tensor<burn::backend::Wgpu, 1> = out_m1.reshape([n]);
+    let vals_m1: Vec<f32> = pollster::block_on(out_m1_flat.into_data_async())
+        .expect("readback")
+        .to_vec()
+        .expect("to_vec");
+
+    // M=2 path → naive shader (duplicate the row)
+    let mut input_data_m2 = input_data.clone();
+    input_data_m2.extend_from_slice(&input_data);
+    let input_m2 = Tensor::<burn::backend::Wgpu, 3>::from_data(
+        burn::tensor::TensorData::new(input_data_m2, [1, 2, k]),
+        &device,
+    );
+    let out_m2 = linear.forward(input_m2);
+    // Take first row only
+    let out_m2_row0 = out_m2.slice([0..1, 0..1, 0..n]);
+    let out_m2_flat: Tensor<burn::backend::Wgpu, 1> = out_m2_row0.reshape([n]);
+    let vals_m2: Vec<f32> = pollster::block_on(out_m2_flat.into_data_async())
+        .expect("readback")
+        .to_vec()
+        .expect("to_vec");
+
+    // Compare
+    let mut max_diff: f32 = 0.0;
+    let mut sum_diff: f32 = 0.0;
+    let mut num_mismatches = 0;
+    for i in 0..n {
+        let diff = (vals_m1[i] - vals_m2[i]).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        sum_diff += diff;
+        if diff > 0.01 {
+            num_mismatches += 1;
+            if num_mismatches <= 10 {
+                println!("Mismatch at [{i}]: cooperative={:.6}, naive={:.6}, diff={:.6}",
+                    vals_m1[i], vals_m2[i], diff);
+            }
+        }
+    }
+
+    let norm_m1: f32 = vals_m1.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let norm_m2: f32 = vals_m2.iter().map(|v| v * v).sum::<f32>().sqrt();
+    println!("Cooperative norm: {norm_m1:.4}, Naive norm: {norm_m2:.4}");
+    println!("Max diff: {max_diff:.6}, Avg diff: {:.6}", sum_diff / n as f32);
+    println!("Mismatches (>0.01): {num_mismatches} / {n}");
+
+    assert!(
+        max_diff < 0.1,
+        "Cooperative vs naive max difference too large: {max_diff}"
+    );
+    assert!(
+        num_mismatches == 0,
+        "Cooperative vs naive have {num_mismatches} mismatches"
+    );
+}
+
+#[test]
 fn test_end_to_end_audio() {
     let model_dir = Path::new("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_k-webgpu");
     let wav_path = Path::new("/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke.wav");

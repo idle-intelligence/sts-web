@@ -44,6 +44,8 @@ const server = createServer((req, res) => {
         filePath = join(ROOT, "web/index.html");
     } else if (pathname.startsWith("/pkg/")) {
         filePath = join(ROOT, "crates/sts-wasm", pathname);
+    } else if (pathname.startsWith("/mimi-pkg/")) {
+        filePath = join(ROOT, "crates/mimi-wasm/pkg", pathname.replace("/mimi-pkg/", ""));
     } else if (pathname.startsWith("/hf/")) {
         filePath = join(ROOT, "..", pathname);
     } else {

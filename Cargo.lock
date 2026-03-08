@@ -2795,6 +2795,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimi-wasm"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "console_error_panic_hook",
+ "getrandom 0.3.4",
+ "js-sys",
+ "mimi-rs",
+ "safetensors 0.4.5",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

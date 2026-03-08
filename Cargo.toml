@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sts-wasm",
+    "crates/mimi-wasm",
 ]
 resolver = "2"
 
@@ -20,7 +21,7 @@ byteorder = "1.5"
 
 # Burn ML framework
 burn = { version = "0.20", default-features = false, features = ["std"] }
-cubecl = { version = "0.9", default-features = false, features = ["wgpu"] }
+cubecl = { version = "0.9", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 
 # Audio
 hound = "3.5"

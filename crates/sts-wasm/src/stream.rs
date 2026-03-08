@@ -7,21 +7,78 @@
 //! 4. Run depth transformer to generate model audio tokens
 //! 5. Return model audio tokens for Mimi decoder + text token
 //!
-//! Uses a flat token cache with delay offsets (matching Swift reference):
-//! - Tokens are written at `pos + delays[stream]`
+//! # Token Cache Layout
+//!
+//! A flat `TokenCache` with 17 streams and delay offsets (matching Swift reference):
+//! - Tokens are written at `write_pos + delays[stream]`
 //! - Tokens are read at `step - 1` for all streams
 //! - Unwritten positions contain -1 (zero embedding contribution)
 //!
-//! Stream layout (17 sub-sequences at each time step):
-//!   Stream 0:  text (delay=0)
-//!   Stream 1:  model audio codebook 0 (delay=0)
-//!   Streams 2-8: model audio codebooks 1-7 (delay=1)
-//!   Stream 9:  user audio codebook 0 (delay=0)
-//!   Streams 10-16: user audio codebooks 1-7 (delay=1)
+//! ```text
+//! Stream  | Content                    | Delay | Vocab offset
+//! --------|----------------------------|-------|-------------
+//!  0      | text                       |   0   | raw text tokens
+//!  1      | model audio codebook 0     |   0   | + audio_offset (2048)
+//!  2-8    | model audio codebooks 1-7  |   1   | + audio_offset
+//!  9      | user audio codebook 0      |   0   | + audio_offset
+//! 10-16   | user audio codebooks 1-7   |   1   | + audio_offset
+//! ```
+//!
+//! # Counters: `write_pos` vs `step`
+//!
+//! - `write_pos`: where the next token will be written in the cache. Advances
+//!   during both prefill and generation.
+//! - `step`: the temporal transformer's step index. At each step, tokens at
+//!   position `step - 1` are read from the cache, embedded, and fed to the
+//!   transformer. Equals `write_pos` in normal operation.
+//! - `prompt_len`: number of steps consumed by system prompt prefill
+//!   (silence1 + text + silence2). User audio frames start at this offset.
+//!
+//! # Reset Methods
+//!
+//! - `reset_keep_buffers()`: full reset for a new conversation. Clears token
+//!   cache, all counters, stop-detection state, and resets KV caches (keeps
+//!   GPU buffers allocated). After this, `prefill()` must be called again.
+//! - `reset_generation_state(pipelined_steps)`: partial reset between turns
+//!   in the same conversation. Clears stop-detection counters, token histories,
+//!   and rolls back any pre-submitted pipelined temporal cache entries. Does
+//!   NOT touch the token cache, `write_pos`, `step`, or `prompt_len` — the KV
+//!   cache retains the full conversation history.
+//! - `undo_warmup_generation(gen_steps, pipelined_steps)`: rolls back warmup
+//!   generation steps while preserving the prefill KV cache. Used by
+//!   `StsEngine::warmup()` to compile shaders without polluting the cache.
+//!
+//! # Pipelining
+//!
+//! After each generation step's depformer finishes, the NEXT frame's temporal
+//! forward pass is pre-submitted to the GPU (`pending_temporal`). This lets the
+//! GPU compute while the caller runs Mimi decode on the CPU (~35ms overlap).
+//! The pipelined result is consumed at the start of the next `step()` call.
+
+use burn::backend::wgpu::{Wgpu, WgpuRuntime};
+use burn::tensor::Tensor;
+use cubecl::Runtime;
 
 use crate::depth::DepthTransformer;
 use crate::model::{sample_greedy, sample_top_k_with_penalty, LayerCaches, TemporalTransformer};
 use crate::StsConfig;
+
+/// Cross-platform millisecond timer.
+fn now_ms() -> f64 {
+    #[cfg(target_family = "wasm")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0
+    }
+}
 
 /// Output of a single STS inference step.
 pub struct StepOutput {
@@ -30,6 +87,10 @@ pub struct StepOutput {
     pub model_audio_tokens: Vec<u32>,
     /// Text token from inner monologue (always produced).
     pub text_token: u32,
+    /// Time spent in temporal transformer forward pass (ms).
+    pub temporal_ms: f64,
+    /// Time spent in depth transformer forward pass (ms).
+    pub depth_ms: f64,
 }
 
 /// Flat token cache with delay offsets.
@@ -134,6 +195,20 @@ pub struct StsStream {
     consecutive_text_pad_frames: usize,
     text_pad_stop_frames: usize,
     has_generated_text: bool,
+
+    /// Pre-submitted temporal result for pipelining.
+    /// After depformer finishes, we enqueue the NEXT frame's temporal forward
+    /// so the GPU works while the caller does Mimi decode on CPU (~40ms overlap).
+    pending_temporal: Option<(Tensor<Wgpu, 3>, Tensor<Wgpu, 3>)>,
+
+    /// Wall-clock time for the pre-submitted temporal forward (ms).
+    /// Saved when the work is enqueued, reported on the next step.
+    pending_temporal_ms: f64,
+
+    /// Accumulated temporal_ms during prefill_user_audio.
+    pub prefill_temporal_ms: f64,
+    /// Accumulated depth_ms during prefill_user_audio.
+    pub prefill_depth_ms: f64,
 }
 
 impl StsStream {
@@ -167,6 +242,10 @@ impl StsStream {
             consecutive_text_pad_frames: 0,
             text_pad_stop_frames: 6, // ~0.5s of text padding after real text → stop
             has_generated_text: false,
+            pending_temporal: None,
+            pending_temporal_ms: 0.0,
+            prefill_temporal_ms: 0.0,
+            prefill_depth_ms: 0.0,
             config,
             temporal_cache,
             depth_cache,
@@ -427,17 +506,21 @@ impl StsStream {
 
         // Process each user audio step through temporal + depformer
         let nq = self.config.num_codebooks;
+        self.prefill_temporal_ms = 0.0;
+        self.prefill_depth_ms = 0.0;
         for _i in 0..user_audio_frames.len() {
             let step = self.step;
             let (text, model, user) = self.read_input_tokens(step);
 
             // Temporal forward
+            let t_temporal = now_ms();
             let (hidden, _text_logits) = temporal.forward(
                 &user,
                 &model,
                 text,
                 &mut self.temporal_cache,
             );
+            self.prefill_temporal_ms += now_ms() - t_temporal;
 
             // Force text=PAD during user audio prefill (matches Python)
             let text_token = self.config.text_padding_id;
@@ -454,6 +537,7 @@ impl StsStream {
             }
 
             // Run depformer
+            let t_depth = now_ms();
             self.depth_cache.reset_keep_buffers();
             let all_audio_tokens = depth.generate(
                 hidden,
@@ -466,6 +550,7 @@ impl StsStream {
                 1.0,
             )
             .await;
+            self.prefill_depth_ms += now_ms() - t_depth;
 
             // Write depformer output to cache at position `step` (no delay).
             // Agent audio tokens are written; user audio predictions are NOT written
@@ -486,6 +571,11 @@ impl StsStream {
     // -----------------------------------------------------------------------
 
     /// Process one generation step (one 80ms frame at 12.5 Hz).
+    ///
+    /// Uses pipelining: after depformer finishes, enqueues the NEXT frame's
+    /// temporal forward pass on the GPU and flushes commands. The caller can
+    /// then do Mimi decode (CPU, ~40ms) while the GPU computes temporal (~113ms),
+    /// saving ~35ms per frame.
     pub async fn step(
         &mut self,
         temporal: &TemporalTransformer,
@@ -494,16 +584,19 @@ impl StsStream {
         let nq = self.config.num_codebooks;
         let step = self.step;
 
-        // Read input tokens from cache (reads position step - 1)
-        let (text, model, user) = self.read_input_tokens(step);
-
-        // Step 1: Temporal transformer forward pass
-        let (hidden, text_logits) = temporal.forward(
-            &user,
-            &model,
-            text,
-            &mut self.temporal_cache,
-        );
+        // Step 1: Get temporal result — either from pre-submitted pipeline
+        // (GPU already computed while caller was doing Mimi decode) or compute now.
+        let (hidden, text_logits, temporal_ms) = if let Some(pending) = self.pending_temporal.take() {
+            let ms = self.pending_temporal_ms;
+            self.pending_temporal_ms = 0.0;
+            let (h, l) = pending;
+            (h, l, ms)
+        } else {
+            let t0 = now_ms();
+            let (text, model, user) = self.read_input_tokens(step);
+            let result = temporal.forward(&user, &model, text, &mut self.temporal_cache);
+            (result.0, result.1, now_ms() - t0)
+        };
 
         // Step 2: Sample text token with repetition penalty
         let text_token = if self.text_temperature <= 0.0 {
@@ -534,6 +627,7 @@ impl StsStream {
         self.depth_cache.reset_keep_buffers();
 
         // Step 4: Depth transformer generates 16 audio tokens
+        let t_depth = now_ms();
         let penalty_hist = &self.audio_token_history;
         let all_audio_tokens = depth.generate(
             hidden,
@@ -546,6 +640,7 @@ impl StsStream {
             self.repetition_penalty,
         )
         .await;
+        let depth_ms = now_ms() - t_depth;
 
         // Split depformer output into agent (0-7) and user (8-15)
         let agent_end = nq.min(all_audio_tokens.len());
@@ -559,7 +654,6 @@ impl StsStream {
         };
 
         // Write depformer output to cache at position `step` (no delay).
-        // Both agent and user predictions are written during generation.
         self.write_depformer_output(step, text_token, &agent, user_pred);
 
         // Update per-codebook audio token history for repetition penalty
@@ -597,9 +691,29 @@ impl StsStream {
             self.consecutive_text_pad_frames = 0;
         }
 
+        // Step 5: Pipeline — pre-submit NEXT frame's temporal forward pass.
+        // The GPU starts computing while the caller does Mimi decode on CPU.
+        // We enqueue the work and flush to ensure the GPU command is submitted.
+        {
+            let next_step = self.step;
+            let (text, model, user) = self.read_input_tokens(next_step);
+            let t_pipe = now_ms();
+            let result = temporal.forward(&user, &model, text, &mut self.temporal_cache);
+            self.pending_temporal_ms = now_ms() - t_pipe;
+            self.pending_temporal = Some(result);
+
+            // Flush GPU command buffer so the temporal work starts immediately.
+            // Without this, the commands sit in the encoder until the next readback,
+            // which would be too late for pipelining.
+            let client = WgpuRuntime::client(temporal.device());
+            client.flush();
+        }
+
         StepOutput {
             model_audio_tokens: model_audio_out,
             text_token,
+            temporal_ms,
+            depth_ms,
         }
     }
 
@@ -670,8 +784,84 @@ impl StsStream {
         self.consecutive_silence_frames = 0;
         self.consecutive_text_pad_frames = 0;
         self.has_generated_text = false;
+        self.pending_temporal = None;
+        self.pending_temporal_ms = 0.0;
+        self.prefill_temporal_ms = 0.0;
+        self.prefill_depth_ms = 0.0;
         self.temporal_cache.reset();
         self.depth_cache.reset();
+    }
+
+    /// Undo warmup generation steps, keeping the prefill KV cache intact.
+    ///
+    /// After warmup runs prefill + N generation steps (to compile depth shaders),
+    /// this rolls back the generation state so the next `feedAudio()` or
+    /// `generateStart()` continues from where prefill ended.
+    ///
+    /// `gen_steps` is the number of generation steps to undo (e.g. 3).
+    /// `pipelined_steps` is the number of extra temporal forward passes that
+    /// were pre-submitted by the pipelining logic (typically 1).
+    pub fn undo_warmup_generation(&mut self, gen_steps: usize, pipelined_steps: usize) {
+        // Roll back the temporal KV cache: generation steps + pipelined step
+        let total_temporal_rollback = gen_steps + pipelined_steps;
+        self.temporal_cache.rollback(total_temporal_rollback);
+
+        // Clear token cache entries written during generation
+        // (depformer writes at positions step-gen_steps..step without delay)
+        let gen_start = self.step - gen_steps;
+        for pos in gen_start..self.step {
+            for stream in 0..self.token_cache.num_streams {
+                self.token_cache.write(stream, pos, -1);
+            }
+        }
+
+        // Roll back step and write_pos to where prefill ended
+        self.step = gen_start;
+        self.write_pos = gen_start;
+
+        // Clear generation-related state
+        self.last_model_audio_tokens = self.config.silence_tokens.to_vec();
+        self.text_token_history.clear();
+        for h in &mut self.audio_token_history { h.clear(); }
+        self.consecutive_silence_frames = 0;
+        self.consecutive_text_pad_frames = 0;
+        self.has_generated_text = false;
+        self.pending_temporal = None;
+        self.pending_temporal_ms = 0.0;
+        self.prefill_temporal_ms = 0.0;
+        self.prefill_depth_ms = 0.0;
+
+        // Depth cache is reset every step anyway, just clear it
+        self.depth_cache.reset_keep_buffers();
+    }
+
+    /// Reset generation-related state for a new turn, keeping the KV cache
+    /// and token cache intact so the conversation continues.
+    ///
+    /// Clears: silence/text-pad counters, token histories, pending pipelined
+    /// temporal result. Also rolls back the temporal cache by `pipelined_steps`
+    /// entries to undo the pre-submitted temporal forward from pipelining.
+    pub fn reset_generation_state(&mut self, pipelined_steps: usize) {
+        self.consecutive_silence_frames = 0;
+        self.consecutive_text_pad_frames = 0;
+        self.has_generated_text = false;
+        self.text_token_history.clear();
+        for h in &mut self.audio_token_history { h.clear(); }
+        self.last_model_audio_tokens = self.config.silence_tokens.to_vec();
+
+        // Drop stale pipelined temporal result and roll back its cache entry
+        if self.pending_temporal.take().is_some() && pipelined_steps > 0 {
+            self.temporal_cache.rollback(pipelined_steps);
+        }
+        self.pending_temporal_ms = 0.0;
+        self.prefill_temporal_ms = 0.0;
+        self.prefill_depth_ms = 0.0;
+
+        // Sync write_pos to step so the next prefill_user_audio writes tokens
+        // at the correct position (after generated frames, not after turn 1's
+        // user audio). Without this, turn 2's user audio overwrites turn 1's
+        // generated tokens and temporal reads from the wrong positions.
+        self.write_pos = self.step;
     }
 
     /// Reset state but keep GPU KV cache buffers allocated.
@@ -687,6 +877,10 @@ impl StsStream {
         self.consecutive_silence_frames = 0;
         self.consecutive_text_pad_frames = 0;
         self.has_generated_text = false;
+        self.pending_temporal = None;
+        self.pending_temporal_ms = 0.0;
+        self.prefill_temporal_ms = 0.0;
+        self.prefill_depth_ms = 0.0;
         self.temporal_cache.reset_keep_buffers();
         self.depth_cache.reset_keep_buffers();
     }
@@ -938,6 +1132,8 @@ mod tests {
         let output = StepOutput {
             model_audio_tokens: vec![1, 2, 3, 4, 5, 6, 7, 8],
             text_token: 42,
+            temporal_ms: 0.0,
+            depth_ms: 0.0,
         };
         assert_eq!(output.model_audio_tokens.len(), 8);
         assert_eq!(output.text_token, 42);

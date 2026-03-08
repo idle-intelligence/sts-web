@@ -3,10 +3,48 @@
 //! Provides JavaScript-callable APIs for GPU-accelerated Q4 inference
 //! in browsers with WebGPU support.
 //!
-//! Streaming pipeline:
-//!   1. feedAudio()      — encode PCM with Mimi, prefill each frame through temporal+depth
-//!   2. generateStart()  — prepare for autoregressive generation
-//!   3. generateStep()   — one generation step, returns audio chunk + text (or null when done)
+//! # Engine Lifecycle
+//!
+//! ```text
+//! initWgpuDevice()
+//!   → new StsEngine()
+//!     → loadModelBegin/loadModelShard/loadModelFinish (or loadModel)
+//!       → loadMimi()
+//!         → loadTokenizer()
+//!           → warmup()            -- prefills system prompt + compiles shaders
+//!             → [conversation loop]:
+//!                 feedAudio()      -- user speaks (Mimi encode + incremental prefill)
+//!                 generateStart()  -- user stops speaking
+//!                 generateStepInference() / decodeStepAudio()  -- generation loop
+//!                 prepareTurn()    -- ready for next turn (keeps KV cache)
+//!             → reset()            -- new conversation (clears KV cache, re-prefills)
+//! ```
+//!
+//! # State Flags
+//!
+//! - `prefilled`: system prompt (+ optional voice preset) has been fed through
+//!   temporal transformer. Set by `warmup()` or lazily by first `feedAudio()`.
+//!   Cleared by `reset()`.
+//! - `generating`: true between `generateStart()` and generation completion
+//!   (either `should_stop()` or `max_gen_frames` reached). Cleared by
+//!   `prepareTurn()` and `reset()`.
+//! - `gen_step`: frame counter within current generation (0-based). Reset by
+//!   `generateStart()`, `prepareTurn()`, and `reset()`.
+//!
+//! # Multi-Turn Conversations
+//!
+//! - `prepareTurn()`: keeps KV cache and system prompt intact. Resets Mimi
+//!   codec, PCM buffer, generation counters, and stream stop-detection state.
+//!   The next `feedAudio()` appends new user audio to the existing KV cache.
+//! - `reset()`: clears everything (KV cache, token cache, Mimi state) and
+//!   immediately re-runs system prompt prefill for a fresh conversation.
+//!
+//! # Streaming Pipeline (per generation step)
+//!
+//!   1. `feedAudio(samples)` — encode PCM with Mimi, prefill each frame through temporal+depth
+//!   2. `generateStart()`   — prepare for autoregressive generation
+//!   3. `generateStepInference()` — one inference step (GPU), returns audio tokens + text
+//!   4. `decodeStepAudio()`       — decode audio tokens via Mimi (CPU), overlaps with next GPU step
 
 use wasm_bindgen::prelude::*;
 
@@ -177,13 +215,19 @@ pub struct StsEngine {
     voice_preset_embeddings: Option<Vec<f32>>,
     voice_preset_num_frames: usize,
     voice_preset_cache: Option<Vec<Vec<i32>>>,
+
+    /// Pending audio tokens from the last generateStepInference() call,
+    /// awaiting Mimi decode via decodeStepAudio().
+    pending_audio_tokens: Option<Vec<u32>>,
 }
 
 #[cfg_attr(target_family = "wasm", wasm_bindgen)]
 impl StsEngine {
     /// Create a new StsEngine instance.
     ///
-    /// Call `initWgpuDevice()` first, then create this, then load weights.
+    /// **Precondition:** `initWgpuDevice()` must have been called and awaited.
+    /// **State after:** all fields at defaults; `prefilled = false`, `generating = false`.
+    /// **Next step:** load model weights, then Mimi, then tokenizer, then `warmup()`.
     #[cfg_attr(target_family = "wasm", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         let device = WGPU_DEVICE
@@ -209,6 +253,7 @@ impl StsEngine {
             voice_preset_embeddings: None,
             voice_preset_num_frames: 0,
             voice_preset_cache: None,
+            pending_audio_tokens: None,
         }
     }
 
@@ -457,6 +502,11 @@ impl StsEngine {
     /// the temporal+depth transformers. This means prefill happens while the
     /// user is still speaking, not after they stop.
     ///
+    /// **Precondition:** model, Mimi, and tokenizer loaded. Called after `warmup()`.
+    /// **State:** lazily calls `ensure_prefilled()` on first invocation. Buffers
+    /// partial PCM internally (1920 samples = 80ms = 1 Mimi frame).
+    /// **Next step:** more `feedAudio()` calls, then `generateStart()`.
+    ///
     /// Returns the number of frames prefilled in this call.
     #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = feedAudio))]
     pub async fn feed_audio(&mut self, samples: &[f32]) -> u32 {
@@ -518,12 +568,42 @@ impl StsEngine {
             stream.prefill_user_audio(&new_frames, temporal, depth).await;
             let elapsed = now_ms() - t0;
             self.metrics.total_ms += elapsed;
+            self.metrics.total_temporal_ms += stream.prefill_temporal_ms;
+            self.metrics.total_depth_ms += stream.prefill_depth_ms;
         }
 
         num_new
     }
 
+    /// Run system prompt prefill eagerly.
+    ///
+    /// After `warmup()`, prefill is already done — this is a no-op.
+    /// Kept for backward compatibility. Idempotent.
+    #[cfg_attr(target_family = "wasm", wasm_bindgen)]
+    pub async fn prefill(&mut self) {
+        self.ensure_prefilled();
+
+        // Force GPU to complete all enqueued prefill work before returning.
+        // Without this, the 39 temporal forward passes are just enqueued and
+        // their compute time shows up on the first feedAudio() call instead.
+        if let Some(temporal) = self.temporal.as_ref() {
+            use burn::backend::wgpu::WgpuRuntime;
+            use cubecl::Runtime;
+            let client = WgpuRuntime::client(temporal.device());
+            client.flush();
+            // Perform a tiny GPU readback to block until all prior work completes.
+            let sync_tensor = burn::tensor::Tensor::<burn::backend::wgpu::Wgpu, 1>::zeros(
+                [1],
+                temporal.device(),
+            );
+            let _ = sync_tensor.into_data_async().await;
+        }
+    }
+
     /// Run voice preset + system prompt prefill (lazy, idempotent).
+    ///
+    /// Enqueues GPU work but does NOT wait for completion.
+    /// Callers that need completion should flush + sync the GPU afterward.
     fn ensure_prefilled(&mut self) {
         if self.prefilled {
             return;
@@ -572,7 +652,9 @@ impl StsEngine {
 
     /// Prepare for autoregressive generation after user stops speaking.
     ///
-    /// Call this after the last `feedAudio()`, before the `generateStep()` loop.
+    /// **Precondition:** at least one `feedAudio()` call completed.
+    /// **State:** sets `generating = true`, `gen_step = 0`, resets metrics.
+    /// **Next step:** call `generateStepInference()` in a loop.
     #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = generateStart))]
     pub fn generate_start(&mut self) {
         self.ensure_prefilled();
@@ -582,21 +664,31 @@ impl StsEngine {
         wasm_log("[sts] Generation started");
     }
 
-    /// Run one generation step. Returns a JS object with audio + text,
-    /// or null if generation is complete (silence stop or max frames).
+    /// Run one generation step (inference only, no Mimi decode).
+    ///
+    /// **Precondition:** `generateStart()` called, `generating == true`.
+    /// **State:** increments `gen_step`, sets `generating = false` when done
+    /// (silence detected or `max_gen_frames` reached). Stores audio tokens
+    /// internally for `decodeStepAudio()`.
+    /// **Returns:** JS object `{ done, text, step, audio_tokens, num_codebooks }`
+    /// or `null` if not generating.
+    ///
+    /// This split allows the GPU to get a head start on the next temporal
+    /// computation while Mimi decode (CPU, ~35ms) runs between calls.
     ///
     /// JS usage:
     /// ```js
     /// engine.generateStart();
-    /// while (true) {
-    ///     const chunk = await engine.generateStep();
-    ///     if (!chunk) break;
-    ///     playAudio(chunk.audio);
-    ///     showText(chunk.text);
+    /// let result = await engine.generateStepInference();
+    /// while (result && !result.done) {
+    ///     let audio = engine.decodeStepAudio(); // CPU, ~35ms — GPU runs next temporal
+    ///     sendAudio(audio);
+    ///     result = await engine.generateStepInference(); // await GPU readback
     /// }
+    /// if (result) { let audio = engine.decodeStepAudio(); sendAudio(audio); }
     /// ```
-    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = generateStep))]
-    pub async fn generate_step(&mut self) -> JsValue {
+    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = generateStepInference))]
+    pub async fn generate_step_inference(&mut self) -> JsValue {
         if !self.generating {
             return JsValue::NULL;
         }
@@ -614,11 +706,13 @@ impl StsEngine {
             None => return JsValue::NULL,
         };
 
-        // Run one step
+        // Run one step (temporal + depth inference, no Mimi)
         let t0 = now_ms();
         let output = stream.step(temporal, depth).await;
         let elapsed = now_ms() - t0;
         self.metrics.total_ms += elapsed;
+        self.metrics.total_temporal_ms += output.temporal_ms;
+        self.metrics.total_depth_ms += output.depth_ms;
         self.metrics.total_frames += 1;
 
         let i = self.gen_step;
@@ -649,22 +743,14 @@ impl StsEngine {
             self.generating = false;
         }
 
-        // Decode audio with Mimi
-        let mimi = match self.mimi.as_mut() {
-            Some(m) => m,
-            None => return JsValue::NULL,
-        };
-        let num_codebooks = self.config.num_codebooks;
-        let t0 = now_ms();
-        let pcm = mimi.decode_n(&output.model_audio_tokens, num_codebooks);
-        self.metrics.total_mimi_ms += now_ms() - t0;
+        // Store audio tokens for local Mimi decode (decodeStepAudio fallback)
+        // and also return them in the JS result for external Mimi worker decode.
+        let audio_tokens_js = js_sys::Uint32Array::new_with_length(output.model_audio_tokens.len() as u32);
+        audio_tokens_js.copy_from(&output.model_audio_tokens);
+        self.pending_audio_tokens = Some(output.model_audio_tokens);
 
-        // Build result: { audio: Float32Array, text: string|null, done: bool, step: number }
+        // Build result: { text: string|null, done: bool, step: number, audio_tokens: Uint32Array }
         let result = js_sys::Object::new();
-
-        let audio = js_sys::Float32Array::new_with_length(pcm.len() as u32);
-        audio.copy_from(&pcm);
-        js_sys::Reflect::set(&result, &"audio".into(), &audio.into()).ok();
 
         // Decode text token
         let text_token = output.text_token;
@@ -681,14 +767,54 @@ impl StsEngine {
 
         js_sys::Reflect::set(&result, &"done".into(), &JsValue::from_bool(done)).ok();
         js_sys::Reflect::set(&result, &"step".into(), &JsValue::from_f64(i as f64)).ok();
+        js_sys::Reflect::set(&result, &"audio_tokens".into(), &audio_tokens_js.into()).ok();
+        js_sys::Reflect::set(&result, &"num_codebooks".into(), &JsValue::from_f64(self.config.num_codebooks as f64)).ok();
 
         result.into()
     }
 
+    /// Decode the audio tokens from the last `generateStepInference()` call
+    /// using the Mimi codec. Returns a Float32Array of PCM samples, or null
+    /// if no tokens are pending.
+    ///
+    /// **Precondition:** `generateStepInference()` returned a non-null result.
+    /// **State:** consumes `pending_audio_tokens` (one-shot per inference step).
+    ///
+    /// This is synchronous CPU work (~35ms). Calling it after
+    /// `generateStepInference()` allows the GPU to overlap the next temporal
+    /// computation with this decode.
+    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = decodeStepAudio))]
+    pub fn decode_step_audio(&mut self) -> JsValue {
+        let tokens = match self.pending_audio_tokens.take() {
+            Some(t) => t,
+            None => return JsValue::NULL,
+        };
+        let mimi = match self.mimi.as_mut() {
+            Some(m) => m,
+            None => return JsValue::NULL,
+        };
+
+        let num_codebooks = self.config.num_codebooks;
+        let t0 = now_ms();
+        let pcm = mimi.decode_n(&tokens, num_codebooks);
+        self.metrics.total_mimi_ms += now_ms() - t0;
+
+        let audio = js_sys::Float32Array::new_with_length(pcm.len() as u32);
+        audio.copy_from(&pcm);
+        audio.into()
+    }
+
     /// Run warmup passes to pre-compile WebGPU shader pipelines.
     ///
-    /// Runs the prefill + a few generation steps to trigger shader compilation,
-    /// then resets state so the real inference starts fresh.
+    /// **Precondition:** model loaded (`loadModelFinish()` or `loadModel()`).
+    /// **State:** sets `prefilled = true`, resets metrics, resets Mimi codec.
+    /// KV cache contains system prompt prefill after this call.
+    /// **Next step:** engine is ready for `feedAudio()`.
+    ///
+    /// Runs the system prompt prefill + a few generation steps to trigger
+    /// shader compilation for both temporal and depth transformers. The
+    /// generation steps are then rolled back so the prefill KV cache stays
+    /// valid — avoiding a redundant second prefill.
     #[cfg_attr(target_family = "wasm", wasm_bindgen)]
     pub async fn warmup(&mut self) -> Result<(), JsError> {
         let temporal = self
@@ -710,17 +836,40 @@ impl StsEngine {
         stream.prefill(temporal);
 
         // Run a few generation steps to warm up depth transformer shaders
-        for _ in 0..3 {
+        let warmup_gen_steps = 3;
+        for _ in 0..warmup_gen_steps {
             stream.step(temporal, depth).await;
         }
 
-        // Reset state but keep GPU KV cache buffers allocated
-        stream.reset_keep_buffers();
-        self.prefilled = false;
+        // Undo the generation steps but keep the prefill KV cache.
+        // step() does pipelining: after each step it pre-submits the NEXT
+        // temporal forward, so there's 1 extra temporal cache entry to undo.
+        stream.undo_warmup_generation(warmup_gen_steps, 1);
+
+        // Mark prefill as done — no need to redo it
+        self.prefilled = true;
         self.metrics.reset();
 
+        // Reset Mimi streaming state (matches ensure_prefilled behavior)
+        if let Some(mimi) = self.mimi.as_mut() {
+            mimi.reset();
+        }
+
+        // Force GPU to complete all enqueued work before returning.
+        {
+            use burn::backend::wgpu::WgpuRuntime;
+            use cubecl::Runtime;
+            let client = WgpuRuntime::client(temporal.device());
+            client.flush();
+            let sync_tensor = burn::tensor::Tensor::<burn::backend::wgpu::Wgpu, 1>::zeros(
+                [1],
+                temporal.device(),
+            );
+            let _ = sync_tensor.into_data_async().await;
+        }
+
         let elapsed = now_ms() - t0;
-        wasm_log(&format!("[sts] Warmup complete ({elapsed:.0}ms)"));
+        wasm_log(&format!("[sts] Warmup complete ({elapsed:.0}ms), prefill preserved"));
         Ok(())
     }
 
@@ -739,7 +888,41 @@ impl StsEngine {
         obj.into()
     }
 
+    /// Prepare for the next turn in a multi-turn conversation.
+    ///
+    /// **Precondition:** generation has completed (or was never started).
+    /// **State:** resets Mimi codec, PCM buffer, generation flags, metrics,
+    /// and stream stop-detection counters. KV cache and token cache are
+    /// preserved — the model remembers the full conversation so far.
+    /// **Next step:** `feedAudio()` for the next user utterance.
+    #[cfg_attr(target_family = "wasm", wasm_bindgen(js_name = prepareTurn))]
+    pub fn prepare_turn(&mut self) {
+        if let Some(mimi) = &mut self.mimi {
+            mimi.reset();
+        }
+        self.pcm_buffer.clear();
+        self.generating = false;
+        self.gen_step = 0;
+        self.metrics.reset();
+
+        // Reset stream generation state (silence/text-pad counters, token
+        // histories, pending pipelined temporal). Roll back 1 temporal cache
+        // entry to undo the pre-submitted pipelined forward from the last step.
+        if let Some(stream) = &mut self.stream {
+            stream.reset_generation_state(1);
+        }
+    }
+
     /// Reset all state for a new conversation session.
+    ///
+    /// **Precondition:** none (safe to call at any time).
+    /// **State:** clears KV cache, token cache, Mimi codec, PCM buffer, all
+    /// generation flags. Sets `prefilled = false`, then immediately re-runs
+    /// `ensure_prefilled()` so the engine is ready for the next conversation
+    /// without a lazy prefill cost on first `feedAudio()`.
+    /// **Next step:** `feedAudio()` for the new conversation.
+    ///
+    /// Compare with `prepareTurn()` which keeps KV cache intact for multi-turn.
     #[cfg_attr(target_family = "wasm", wasm_bindgen)]
     pub fn reset(&mut self) {
         if let Some(stream) = &mut self.stream {
@@ -753,6 +936,10 @@ impl StsEngine {
         self.generating = false;
         self.gen_step = 0;
         self.metrics.reset();
+
+        // Re-run system prompt prefill immediately so the KV cache is
+        // populated and the first feedAudio() doesn't pay the prefill cost.
+        self.ensure_prefilled();
     }
 
     /// Check if the model is loaded and ready.
@@ -760,6 +947,7 @@ impl StsEngine {
     pub fn is_ready(&self) -> bool {
         self.temporal.is_some() && self.depth.is_some() && self.mimi.is_some()
     }
+
 }
 
 impl Default for StsEngine {

@@ -21,7 +21,10 @@ use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::activation::softmax;
 use burn::tensor::Tensor;
 
-use crate::gguf::{gpu_argmax, EmbeddingStore, Linear};
+use crate::gguf::{
+    gpu_argmax, gpu_read_token_tensors,
+    DepthGpuBuffers, EmbeddingStore, Linear,
+};
 use crate::model::{fused_attention, fused_swiglu, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{sample_greedy, sample_top_k};
@@ -265,6 +268,8 @@ pub struct DepthTransformer {
     output_linears: Vec<Linear>, // 16 x [vocab, 1024] — F32 or Q4
     config: StsConfig,
     device: WgpuDevice,
+    /// Pre-allocated GPU buffers for the GPU-optimized generation path.
+    gpu_buffers: Option<DepthGpuBuffers>,
 }
 
 impl DepthTransformer {
@@ -278,7 +283,7 @@ impl DepthTransformer {
         config: StsConfig,
         device: WgpuDevice,
     ) -> Self {
-        Self {
+        let mut dt = Self {
             input_projs,
             text_emb,
             audio_embs,
@@ -286,7 +291,28 @@ impl DepthTransformer {
             output_linears,
             config,
             device,
+            gpu_buffers: None,
+        };
+        // Upload audio embeddings to GPU and pre-allocate buffers for
+        // GPU-side embedding lookups and sampling (eliminates per-step
+        // buffer allocation overhead).
+        dt.init_gpu_buffers();
+        dt
+    }
+
+    /// Upload audio embeddings to GPU and pre-allocate reusable buffers.
+    fn init_gpu_buffers(&mut self) {
+        // Upload Q4 bytes for each audio embedding to GPU
+        for emb in &mut self.audio_embs {
+            emb.upload_to_gpu(&self.device);
         }
+        // Pre-allocate sampling + embedding output buffers
+        self.gpu_buffers = Some(DepthGpuBuffers::new(
+            self.config.depth_num_steps,
+            self.config.depth_hidden_size,
+            &self.audio_embs,
+            &self.device,
+        ));
     }
 
     /// Generate all 16 audio codebook tokens from a temporal hidden state.
@@ -302,6 +328,10 @@ impl DepthTransformer {
     /// Autoregressive chain:
     /// - Step 0: input = proj(hidden) + text_emb(text_token) → audio_token_0
     /// - Step k>0: input = proj(hidden) + audio_embs[k-1](audio_token_{k-1}) → audio_token_k
+    ///
+    /// GPU-optimized: sampling and embedding lookups happen on GPU to avoid
+    /// per-step GPU→CPU readbacks. All 16 tokens are read back in one batch
+    /// at the end.
     #[allow(clippy::too_many_arguments)]
     pub async fn generate(
         &self,
@@ -315,25 +345,165 @@ impl DepthTransformer {
         audio_penalty: f32,
     ) -> Vec<u32> {
         let num_steps = self.config.depth_num_steps;
-        let mut audio_tokens = Vec::with_capacity(num_steps);
         let dim = self.config.depth_hidden_size;
-        // Track the conditioning token for each step.
-        // Step 0 uses text_token; subsequent steps use either the sampled
-        // token or a provided (ground-truth) token from the previous step.
+
+        // GPU path is only beneficial for greedy sampling (temp <= 0).
+        // For top-k sampling, the CPU path is faster because:
+        // - Vocab is small (2048), so 8KB readback is cheap
+        // - CPU top-k is trivially fast for small vocab
+        // - GPU kernel launch overhead exceeds readback savings
+        let gpu_path_available = audio_temp <= 0.0 && self.gpu_buffers.is_some();
+
+        if gpu_path_available && provided_tokens.is_none() {
+            // === GPU-OPTIMIZED PATH ===
+            // All sampling + embedding lookups on GPU, one batch readback at end.
+            self.generate_gpu_path(
+                temporal_hidden,
+                text_token,
+                cache,
+                audio_temp,
+                audio_top_k,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await
+        } else {
+            // === CPU FALLBACK PATH ===
+            // Used when GPU embeddings not uploaded or provided_tokens override needed.
+            self.generate_cpu_path(
+                temporal_hidden,
+                text_token,
+                cache,
+                audio_temp,
+                audio_top_k,
+                provided_tokens,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await
+        }
+    }
+
+    /// GPU-optimized generation: no per-step readbacks.
+    ///
+    /// Uses pre-allocated GPU buffers for sampling and embedding lookup.
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_gpu_path(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token: u32,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        num_steps: usize,
+        dim: usize,
+    ) -> Vec<u32> {
+        let gpu = self.gpu_buffers.as_ref().expect("GPU buffers not initialized");
+
+        // Step 0: text token embedding (CPU path — text_emb is too large for GPU)
+        let projected = self.input_projs[0].forward(temporal_hidden.clone());
+        let mut emb_buf = vec![0.0f32; dim];
+        self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
+        let emb_tensor = Tensor::<Wgpu, 3>::from_data(
+            burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
+            &self.device,
+        );
+        let x = projected + emb_tensor;
+
+        let mut h = x;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(c) = cache.get_mut(layer_idx) {
+                h = layer.forward_with_cache(h, 0, c);
+            }
+        }
+
+        let logits = self.output_linears[0].forward(h);
+
+        if audio_temp <= 0.0 {
+            gpu.gpu_argmax_into(0, logits);
+        } else {
+            let history = penalty_history
+                .and_then(|h| h.first())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            gpu.gpu_sample_top_k_into(0, logits, audio_top_k, audio_temp, history, audio_penalty);
+        }
+
+        // Steps 1..num_steps: audio embedding via GPU lookup
+        for step in 1..num_steps {
+            let projected = self.input_projs[step].forward(temporal_hidden.clone());
+
+            // GPU-side embedding lookup for previous step's token
+            let emb_idx = step - 1;
+            let emb_tensor = if emb_idx < self.audio_embs.len() {
+                let q4_handle = self.audio_embs[emb_idx]
+                    .gpu_lookup_params()
+                    .0;
+                let token_handle = &gpu.token_handles[step - 1];
+                gpu.gpu_embed_lookup_into(step, emb_idx, token_handle, q4_handle)
+            } else {
+                Tensor::<Wgpu, 3>::zeros([1, 1, dim], &self.device)
+            };
+
+            let x = projected + emb_tensor;
+
+            let mut h = x;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(c) = cache.get_mut(layer_idx) {
+                    h = layer.forward_with_cache(h, step, c);
+                }
+            }
+
+            let logits = self.output_linears[step].forward(h);
+
+            if audio_temp <= 0.0 {
+                gpu.gpu_argmax_into(step, logits);
+            } else {
+                let history = penalty_history
+                    .and_then(|h| h.get(step))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                gpu.gpu_sample_top_k_into(step, logits, audio_top_k, audio_temp, history, audio_penalty);
+            }
+        }
+
+        // ONE batch readback of all tokens
+        let token_tensors = gpu.collect_token_tensors(num_steps);
+        gpu_read_token_tensors(token_tensors).await
+    }
+
+    /// CPU fallback generation: per-step readbacks (used with provided_tokens).
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_cpu_path(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token: u32,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        provided_tokens: Option<&[i32]>,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        num_steps: usize,
+        dim: usize,
+    ) -> Vec<u32> {
+        let mut audio_tokens = Vec::with_capacity(num_steps);
         let mut prev_token: u32 = text_token;
 
         for step in 0..num_steps {
-            // Project temporal hidden to depth dim
             let projected = self.input_projs[step].forward(temporal_hidden.clone());
 
-            // Add embedding of the conditioning token
             let mut emb_buf = vec![0.0f32; dim];
             if step == 0 {
-                // Step 0: conditioned on the text token from temporal
                 self.text_emb.embed_id_add_cpu(prev_token, &mut emb_buf);
             } else {
-                // Steps 1-15: conditioned on the previous step's token
-                let emb_idx = step - 1; // audio_embs[0] for step 1, etc.
+                let emb_idx = step - 1;
                 if emb_idx < self.audio_embs.len() {
                     self.audio_embs[emb_idx].embed_id_add_cpu(prev_token, &mut emb_buf);
                 }
@@ -346,8 +516,6 @@ impl DepthTransformer {
 
             let x = projected + emb_tensor;
 
-            // Run through depth transformer layers with step-specific weights
-            // Note: depth transformer has no positional embedding (depformer_pos_emb="none")
             let mut h = x;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if let Some(c) = cache.get_mut(layer_idx) {
@@ -358,8 +526,6 @@ impl DepthTransformer {
             let logits = self.output_linears[step].forward(h);
 
             let token = if audio_temp <= 0.0 {
-                // GPU argmax: reads back 4 bytes (one u32) instead of
-                // the full logits tensor (e.g. 8KB for V=2048).
                 gpu_argmax(logits).await
             } else {
                 let history = penalty_history
@@ -378,9 +544,6 @@ impl DepthTransformer {
 
             audio_tokens.push(token);
 
-            // Determine conditioning token for the next step:
-            // use the provided (ground-truth) token if available, otherwise
-            // use the token we just sampled.
             prev_token = if let Some(provided) = provided_tokens {
                 if step < provided.len() && provided[step] >= 0 {
                     provided[step] as u32

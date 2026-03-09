@@ -1276,7 +1276,7 @@ pub async fn sample_greedy(logits: Tensor<Wgpu, 3>) -> u32 {
 ///
 /// Uses a basic LCG seeded from a global counter. Not cryptographic,
 /// but sufficient for top-k sampling diversity.
-fn pseudo_random() -> f32 {
+pub(crate) fn pseudo_random() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEED: AtomicU64 = AtomicU64::new(0);
 

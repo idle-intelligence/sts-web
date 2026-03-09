@@ -18,11 +18,11 @@
 //! transformations.
 
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
-use burn::tensor::activation::{silu, softmax};
+use burn::tensor::activation::softmax;
 use burn::tensor::Tensor;
 
 use crate::gguf::{gpu_argmax, EmbeddingStore, Linear};
-use crate::model::{sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::model::{fused_swiglu, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
@@ -180,11 +180,8 @@ impl MultiLinearFeedForward {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>, step_idx: usize) -> Tensor<Wgpu, 3> {
         let combined = self.linear_ins[step_idx].forward(x);
-        let [batch, seq, total_dim] = combined.dims();
-        let half = total_dim / 2;
-        let gate = combined.clone().slice([0..batch, 0..seq, 0..half]);
-        let value = combined.slice([0..batch, 0..seq, half..total_dim]);
-        self.linear_outs[step_idx].forward(silu(gate) * value)
+        let activated = fused_swiglu(combined);
+        self.linear_outs[step_idx].forward(activated)
     }
 }
 

@@ -17,7 +17,7 @@ use burn::backend::wgpu::{
     into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
     Wgpu, WgpuDevice, WgpuRuntime,
 };
-use burn::tensor::activation::{silu, softmax};
+use burn::tensor::activation::softmax;
 use burn::tensor::{DType, Tensor, TensorPrimitive};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount, Handle};
@@ -416,6 +416,74 @@ fn fused_rms_norm(
     Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
 }
 
+// ---------------------------------------------------------------------------
+// Fused SwiGLU kernel — 1 dispatch instead of 3+ (slice, silu, mul)
+// ---------------------------------------------------------------------------
+
+struct SwigluKernelSource;
+
+impl KernelSource for SwigluKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_swiglu.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused SwiGLU activation on GPU: output[i] = silu(input[i]) * input[i + N].
+///
+/// `x`: [B, S, 2*N] from linear_in. Returns [B, S, N].
+/// Single dispatch replaces split + silu + mul.
+pub fn fused_swiglu(x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+    let cube_input: CubeTensor<WgpuRuntime> = x.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let b = cube_input.shape.dims[0];
+    let s = cube_input.shape.dims[1];
+    let total_dim = cube_input.shape.dims[2];
+    let half = total_dim / 2;
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    // Total elements = B * S * N (each row of N elements processed independently)
+    let total_elements = b * s * half;
+
+    let output_handle = client.empty(total_elements * 4);
+
+    // Info buffer: [N] where N = half of total_dim
+    let info: [u32; 1] = [total_elements as u32];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(SwigluKernelSource, CubeDim::new_1d(256));
+
+    let num_workgroups = (total_elements as u32).div_ceil(256);
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("SwiGLU kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, s, half]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
 pub struct RmsNormLayer {
     alpha_handle: Handle,
     eps: f32,
@@ -638,13 +706,8 @@ impl Q4FeedForward {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         let combined = self.linear_in.forward(x);
-        let [batch, seq, total_dim] = combined.dims();
-        let half = total_dim / 2;
-        let gate = combined
-            .clone()
-            .slice([0..batch, 0..seq, 0..half]);
-        let value = combined.slice([0..batch, 0..seq, half..total_dim]);
-        self.linear_out.forward(silu(gate) * value)
+        let activated = fused_swiglu(combined);
+        self.linear_out.forward(activated)
     }
 }
 

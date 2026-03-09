@@ -60,8 +60,8 @@ use burn::tensor::Tensor;
 use cubecl::Runtime;
 
 use crate::depth::DepthTransformer;
-use crate::gguf::gpu_argmax;
-use crate::model::{sample_top_k_with_penalty, LayerCaches, TemporalTransformer};
+use crate::gguf::{gpu_argmax_buffer, gpu_sample_top_k_with_penalty};
+use crate::model::{LayerCaches, TemporalTransformer};
 use crate::StsConfig;
 
 /// Cross-platform millisecond timer.
@@ -600,9 +600,13 @@ impl StsStream {
             (result.0, result.1, now_ms() - t0)
         };
 
-        // Step 2: Sample text token with repetition penalty
-        let text_token = if self.text_temperature <= 0.0 {
-            gpu_argmax(text_logits).await
+        // Step 2: Submit text token sampling to GPU (DON'T await yet).
+        // The argmax/sampling kernel is enqueued on GPU. By deferring the readback
+        // until after depth input projections are submitted, we eliminate the
+        // ~71ms stall where the CPU waits for the temporal forward to finish.
+        let text_token_tensor = if self.text_temperature <= 0.0 {
+            let (_handle, tensor) = gpu_argmax_buffer(text_logits);
+            tensor
         } else {
             let text_history: Vec<u32> = self
                 .text_token_history
@@ -611,30 +615,28 @@ impl StsStream {
                 .take(self.penalty_window)
                 .copied()
                 .collect();
-            sample_top_k_with_penalty(
+            let (_handle, tensor) = gpu_sample_top_k_with_penalty(
                 text_logits,
                 self.text_top_k,
                 self.text_temperature,
                 &text_history,
                 self.repetition_penalty,
-            )
-            .await
+            );
+            tensor
         };
-        self.text_token_history.push(text_token);
-        if self.text_token_history.len() > self.penalty_window {
-            self.text_token_history.drain(..self.text_token_history.len() - self.penalty_window);
-        }
 
         // Step 3: Reset depth cache for this time step
         self.depth_cache.reset_keep_buffers();
 
-        // Step 4: Depth transformer generates agent audio tokens (skip user predictions)
+        // Step 4: Depth transformer generates agent audio tokens (skip user predictions).
+        // Uses generate_deferred which computes input projections (GPU work) BEFORE
+        // reading back the text token — this overlaps with temporal argmax completion.
         let gen_steps = self.config.depth_gen_steps;
         let t_depth = now_ms();
         let penalty_hist = &self.audio_token_history;
-        let mut all_audio_tokens = depth.generate(
+        let (mut all_audio_tokens, text_token) = depth.generate_deferred(
             hidden,
-            text_token,
+            text_token_tensor,
             &mut self.depth_cache,
             self.audio_temperature,
             self.audio_top_k,
@@ -645,6 +647,12 @@ impl StsStream {
         )
         .await;
         let depth_ms = now_ms() - t_depth;
+
+        // Update text token history (was deferred from step 2)
+        self.text_token_history.push(text_token);
+        if self.text_token_history.len() > self.penalty_window {
+            self.text_token_history.drain(..self.text_token_history.len() - self.penalty_window);
+        }
 
         // Fill remaining positions (user audio predictions) with sine tokens.
         // These are unused for Mimi decode but needed in the token cache for

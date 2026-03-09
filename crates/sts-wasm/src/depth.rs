@@ -22,7 +22,7 @@ use burn::tensor::activation::softmax;
 use burn::tensor::Tensor;
 
 use crate::gguf::{
-    gpu_argmax, gpu_read_token_tensors,
+    gpu_argmax, gpu_read_token_tensor, gpu_read_token_tensors,
     DepthGpuBuffers, EmbeddingStore, Linear,
 };
 use crate::model::{fused_attention, fused_qkv_split, fused_swiglu, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
@@ -500,6 +500,167 @@ impl DepthTransformer {
             )
             .await
         }
+    }
+
+    /// Generate with a deferred text token readback.
+    ///
+    /// Like `generate()`, but accepts a `Tensor<Wgpu, 1>` containing the text
+    /// token result on GPU (not yet read back to CPU). This allows the depth
+    /// transformer's input projection GPU work to overlap with the temporal
+    /// argmax readback, eliminating the ~71ms stall between temporal and depth.
+    ///
+    /// The text token tensor is awaited after input projections are submitted
+    /// to the GPU command queue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_deferred(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token_tensor: Tensor<Wgpu, 1>,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        provided_tokens: Option<&[i32]>,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        max_steps: Option<usize>,
+    ) -> (Vec<u32>, u32) {
+        let num_steps = max_steps.unwrap_or(self.config.depth_num_steps)
+            .min(self.config.depth_num_steps);
+        let dim = self.config.depth_hidden_size;
+
+        let gpu_path_available = audio_temp <= 0.0 && self.gpu_buffers.is_some();
+
+        if gpu_path_available && provided_tokens.is_none() {
+            self.generate_gpu_path_deferred(
+                temporal_hidden,
+                text_token_tensor,
+                cache,
+                audio_temp,
+                audio_top_k,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await
+        } else {
+            // CPU fallback: need text token upfront, so await immediately
+            let text_token = gpu_read_token_tensor(text_token_tensor).await;
+            let tokens = self.generate_cpu_path(
+                temporal_hidden,
+                text_token,
+                cache,
+                audio_temp,
+                audio_top_k,
+                provided_tokens,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await;
+            (tokens, text_token)
+        }
+    }
+
+    /// GPU-optimized generation with deferred text token readback.
+    ///
+    /// Computes input projections first (GPU work that overlaps with temporal
+    /// argmax completion), then reads back the text token for step 0 embedding.
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_gpu_path_deferred(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token_tensor: Tensor<Wgpu, 1>,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        num_steps: usize,
+        dim: usize,
+    ) -> (Vec<u32>, u32) {
+        let gpu = self.gpu_buffers.as_ref().expect("GPU buffers not initialized");
+
+        // Pre-compute all input projections FIRST — these are GPU matmuls that
+        // don't need the text token. While the GPU processes these, the temporal
+        // argmax result is also completing on GPU. By the time we await the text
+        // token below, the argmax readback should be near-instant.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
+        // NOW read back the text token — GPU has had time to finish argmax
+        let text_token = gpu_read_token_tensor(text_token_tensor).await;
+
+        // Step 0: text token embedding (CPU path — text_emb is too large for GPU)
+        let mut emb_buf = vec![0.0f32; dim];
+        self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
+        let emb_tensor = Tensor::<Wgpu, 3>::from_data(
+            burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
+            &self.device,
+        );
+        let x = projected[0].clone() + emb_tensor;
+
+        let mut h = x;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(c) = cache.get_mut(layer_idx) {
+                h = layer.forward_with_cache(h, 0, c);
+            }
+        }
+
+        let logits = self.output_linears[0].forward(h);
+
+        if audio_temp <= 0.0 {
+            gpu.gpu_argmax_into(0, logits);
+        } else {
+            let history = penalty_history
+                .and_then(|h| h.first())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            gpu.gpu_sample_top_k_into(0, logits, audio_top_k, audio_temp, history, audio_penalty);
+        }
+
+        // Steps 1..num_steps: audio embedding via GPU lookup
+        #[allow(clippy::needless_range_loop)]
+        for step in 1..num_steps {
+            let emb_idx = step - 1;
+            let emb_tensor = if emb_idx < self.audio_embs.len() {
+                let q4_handle = self.audio_embs[emb_idx]
+                    .gpu_lookup_params()
+                    .0;
+                let token_handle = &gpu.token_handles[step - 1];
+                gpu.gpu_embed_lookup_into(step, emb_idx, token_handle, q4_handle)
+            } else {
+                Tensor::<Wgpu, 3>::zeros([1, 1, dim], &self.device)
+            };
+
+            let x = projected[step].clone() + emb_tensor;
+
+            let mut h = x;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(c) = cache.get_mut(layer_idx) {
+                    h = layer.forward_with_cache(h, step, c);
+                }
+            }
+
+            let logits = self.output_linears[step].forward(h);
+
+            if audio_temp <= 0.0 {
+                gpu.gpu_argmax_into(step, logits);
+            } else {
+                let history = penalty_history
+                    .and_then(|h| h.get(step))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                gpu.gpu_sample_top_k_into(step, logits, audio_top_k, audio_temp, history, audio_penalty);
+            }
+        }
+
+        // ONE batch readback of all tokens
+        let token_tensors = gpu.collect_token_tensors(num_steps);
+        let audio_tokens = gpu_read_token_tensors(token_tensors).await;
+        (audio_tokens, text_token)
     }
 
     /// GPU-optimized generation: no per-step readbacks.

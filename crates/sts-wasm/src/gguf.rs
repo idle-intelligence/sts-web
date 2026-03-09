@@ -1159,6 +1159,19 @@ pub fn gpu_sample_top_k_with_penalty(
     (result_handle, tensor)
 }
 
+/// Read a single GPU token tensor back to CPU.
+///
+/// The tensor is a 1-element f32 tensor whose bits encode a u32 token ID.
+pub async fn gpu_read_token_tensor(t: Tensor<Wgpu, 1>) -> u32 {
+    let data: Vec<f32> = t
+        .into_data_async()
+        .await
+        .expect("GPU readback failed")
+        .to_vec()
+        .expect("token readback to_vec failed");
+    data[0].to_bits()
+}
+
 /// Batch-read multiple GPU token tensors back to CPU.
 ///
 /// Each tensor is a 1-element f32 tensor whose bits encode a u32 token ID.

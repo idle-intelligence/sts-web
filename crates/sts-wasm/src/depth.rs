@@ -489,7 +489,13 @@ impl DepthTransformer {
 
         // GPU path avoids per-step readbacks by keeping all sampling on GPU.
         // Both greedy (argmax) and top-k sampling are handled on the GPU path.
+        // On native, the CPU path is faster because GPU buffer allocation for
+        // penalty tokens and sampling params adds ~27ms overhead (8 steps × ~3.4ms).
+        // The GPU path only benefits WASM where CPU readback stalls are expensive.
+        #[cfg(target_arch = "wasm32")]
         let gpu_path_available = self.gpu_buffers.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_path_available = false;
 
         if gpu_path_available && provided_tokens.is_none() {
             // === GPU-OPTIMIZED PATH ===
@@ -553,7 +559,12 @@ impl DepthTransformer {
             .min(self.config.depth_num_steps);
         let dim = self.config.depth_hidden_size;
 
+        // On native, skip GPU path — CPU readback is cheap and avoids
+        // ~27ms overhead from per-step GPU buffer allocations.
+        #[cfg(target_arch = "wasm32")]
         let gpu_path_available = self.gpu_buffers.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_path_available = false;
 
         if gpu_path_available && provided_tokens.is_none() {
             self.generate_gpu_path_deferred(

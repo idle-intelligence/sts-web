@@ -432,11 +432,17 @@ impl DepthTransformer {
         for emb in &mut self.audio_embs {
             emb.upload_to_gpu(&self.device);
         }
+        // Collect output vocab sizes for pre-allocating argmax info handles
+        let output_vocab_sizes: Vec<usize> = self.output_linears
+            .iter()
+            .map(|l| l.output_dim())
+            .collect();
         // Pre-allocate sampling + embedding output buffers
         self.gpu_buffers = Some(DepthGpuBuffers::new(
             self.config.depth_num_steps,
             self.config.depth_hidden_size,
             &self.audio_embs,
+            &output_vocab_sizes,
             &self.device,
         ));
     }

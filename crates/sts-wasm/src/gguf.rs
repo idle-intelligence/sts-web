@@ -642,6 +642,15 @@ impl Linear {
             Linear::Dense(l) => l.forward(x) + residual,
         }
     }
+
+    /// Returns the output (N) dimension of this linear layer.
+    pub fn output_dim(&self) -> usize {
+        match self {
+            Linear::Q4(l) => l.weights.shape()[0],
+            Linear::Q4K(l) => l.weights.shape()[0],
+            Linear::Dense(l) => l.weight_t.dims()[1],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1133,9 @@ pub struct DepthGpuBuffers {
     /// Info buffer for embedding lookup (constant: [dim, bytes_per_row, vocab_size]).
     /// One per audio embedding table (15 total).
     pub embed_info_handles: Vec<Handle>,
+    /// Pre-allocated argmax info handles per step (avoids create_from_slice in hot loop).
+    /// Each contains a single u32 = vocab_size for that step's output head.
+    argmax_info_handles: Vec<Handle>,
     /// Embedding dimension.
     pub dim: usize,
     /// Device for creating tensors from handles.
@@ -1132,10 +1144,14 @@ pub struct DepthGpuBuffers {
 
 impl DepthGpuBuffers {
     /// Create pre-allocated GPU buffers for depth generation.
+    ///
+    /// `output_vocab_sizes`: per-step output vocab size (e.g. 32000 for text, 2048 for audio).
+    /// Used to pre-allocate argmax info handles, avoiding `create_from_slice` in the hot loop.
     pub fn new(
         num_steps: usize,
         dim: usize,
         audio_embs: &[EmbeddingStore],
+        output_vocab_sizes: &[usize],
         device: &WgpuDevice,
     ) -> Self {
         let client = WgpuRuntime::client(device);
@@ -1164,10 +1180,22 @@ impl DepthGpuBuffers {
             })
             .collect();
 
+        // Pre-create argmax info handles per step (each contains vocab_size as u32).
+        // This avoids calling create_from_slice inside the depth autoregressive loop,
+        // which would force a command buffer flush per step (~4.5ms overhead each).
+        let argmax_info_handles: Vec<Handle> = output_vocab_sizes
+            .iter()
+            .map(|&vocab_size| {
+                let info_bytes: Vec<u8> = (vocab_size as u32).to_le_bytes().to_vec();
+                client.create_from_slice(&info_bytes)
+            })
+            .collect();
+
         Self {
             token_handles,
             embed_output_handles,
             embed_info_handles,
+            argmax_info_handles,
             dim,
             device: device.clone(),
         }
@@ -1256,6 +1284,10 @@ impl DepthGpuBuffers {
     }
 
     /// Launch GPU argmax into a pre-allocated token handle.
+    ///
+    /// Uses a pre-allocated info handle (created during init) to avoid
+    /// `create_from_slice` in the hot loop, which would force a command
+    /// buffer flush per step.
     pub fn gpu_argmax_into(
         &self,
         step: usize,
@@ -1263,18 +1295,15 @@ impl DepthGpuBuffers {
     ) -> Tensor<Wgpu, 1> {
         let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
         let cube_input = into_contiguous(cube_input);
-        let v = cube_input.shape.dims[cube_input.shape.num_dims() - 1];
         let client = cube_input.client.clone();
 
         let result_handle = &self.token_handles[step];
-
-        let info_bytes: Vec<u8> = (v as u32).to_le_bytes().to_vec();
-        let info_handle = client.create_from_slice(&info_bytes);
+        let info_handle = &self.argmax_info_handles[step];
 
         let bindings = Bindings::new()
             .with_buffer(cube_input.handle.clone().binding())
             .with_buffer(result_handle.clone().binding())
-            .with_buffer(info_handle.binding());
+            .with_buffer(info_handle.clone().binding());
 
         let kernel = SourceKernel::new(ArgmaxKernel, CubeDim::new_1d(256));
         client

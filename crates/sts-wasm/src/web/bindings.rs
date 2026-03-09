@@ -153,6 +153,12 @@ pub async fn init_wgpu_device() {
     ));
 
     let features = adapter.features() - wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
+
+    // Detect subgroup support for optimized GPU kernels
+    let subgroups_available = features.contains(wgpu::Features::SUBGROUP);
+    crate::gguf::set_subgroup_support(subgroups_available);
+    wasm_log(&format!("[wgpu] Subgroup support: {subgroups_available}"));
+
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("sts-wgpu"),

@@ -66,6 +66,9 @@ pub struct StsConfig {
     pub depth_intermediate_size: usize,
     /// Number of multi-linear steps in the depth transformer (one per output stream).
     pub depth_num_steps: usize,
+    /// Number of depth steps to run during generation (model speaking).
+    /// Steps beyond this are filled with sine tokens. Default 8 (skip user audio predictions).
+    pub depth_gen_steps: usize,
 
     // -- Audio / text vocab --
 
@@ -131,6 +134,7 @@ impl Default for StsConfig {
             depth_num_kv_heads: 16, // MHA
             depth_intermediate_size: 2816, // gating [5632, 1024] = 2 * 2816
             depth_num_steps: 16, // multi-linear: 16 weight sets
+            depth_gen_steps: 8, // only run 8 steps during generation (skip user audio predictions)
 
             // Audio / text vocab
             text_vocab_size: 32000,

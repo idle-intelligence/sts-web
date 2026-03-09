@@ -549,6 +549,7 @@ impl StsStream {
                 Some(&provided),
                 None, // No penalty during prefill
                 1.0,
+                None, // Full 16 steps during prefill
             )
             .await;
             self.prefill_depth_ms += now_ms() - t_depth;
@@ -627,10 +628,11 @@ impl StsStream {
         // Step 3: Reset depth cache for this time step
         self.depth_cache.reset_keep_buffers();
 
-        // Step 4: Depth transformer generates 16 audio tokens
+        // Step 4: Depth transformer generates agent audio tokens (skip user predictions)
+        let gen_steps = self.config.depth_gen_steps;
         let t_depth = now_ms();
         let penalty_hist = &self.audio_token_history;
-        let all_audio_tokens = depth.generate(
+        let mut all_audio_tokens = depth.generate(
             hidden,
             text_token,
             &mut self.depth_cache,
@@ -639,9 +641,28 @@ impl StsStream {
             None, // No provided tokens during generation
             Some(penalty_hist),
             self.repetition_penalty,
+            Some(gen_steps), // Only run agent audio steps, skip user predictions
         )
         .await;
         let depth_ms = now_ms() - t_depth;
+
+        // Fill remaining positions (user audio predictions) with sine tokens.
+        // These are unused for Mimi decode but needed in the token cache for
+        // conditioning the next temporal step.
+        let full_steps = self.config.depth_num_steps;
+        if all_audio_tokens.len() < full_steps {
+            for i in all_audio_tokens.len()..full_steps {
+                // Steps 0-7 are agent audio, steps 8-15 are user audio.
+                // User codebook index = i - nq (maps to sine_tokens[0..7]).
+                let user_cb = i - nq;
+                let sine_tok = if user_cb < self.config.sine_tokens.len() {
+                    self.config.sine_tokens[user_cb]
+                } else {
+                    self.config.sine_tokens[0] // fallback
+                };
+                all_audio_tokens.push(sine_tok);
+            }
+        }
 
         // Split depformer output into agent (0-7) and user (8-15)
         let agent_end = nq.min(all_audio_tokens.len());

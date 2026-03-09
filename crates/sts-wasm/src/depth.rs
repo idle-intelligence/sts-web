@@ -461,8 +461,10 @@ impl DepthTransformer {
         provided_tokens: Option<&[i32]>,
         penalty_history: Option<&[Vec<u32>]>,
         audio_penalty: f32,
+        max_steps: Option<usize>,
     ) -> Vec<u32> {
-        let num_steps = self.config.depth_num_steps;
+        let num_steps = max_steps.unwrap_or(self.config.depth_num_steps)
+            .min(self.config.depth_num_steps);
         let dim = self.config.depth_hidden_size;
 
         // GPU path is only beneficial for greedy sampling (temp <= 0).

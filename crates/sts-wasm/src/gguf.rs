@@ -31,11 +31,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // ---------------------------------------------------------------------------
 
 /// Set to `true` if the GPU supports subgroup operations (e.g. subgroupAdd).
-/// For WASM: set during `init_wgpu_device()`.
-/// For native macOS: defaults to true (Apple Silicon always supports subgroups).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(true);
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+/// Defaults to false — Naga (wgpu's shader compiler) doesn't yet support
+/// `enable subgroups;` in WGSL, so this must be explicitly enabled at runtime
+/// only when the browser/runtime confirms support.
 static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(false);
 
 /// Call during device init to enable subgroup-optimized kernels.

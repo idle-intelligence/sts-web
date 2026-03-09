@@ -10,11 +10,13 @@
 //
 // Computes: output[B, 1, N] = input[B, 1, K] x weights[N, K]^T
 //
-// Q4_K block layout (144 bytes per 256 weights):
+// Q4_K block layout (144 bytes = 36 u32s per 256 weights):
 //   Bytes  0-1:   d     (f16 super-scale)
 //   Bytes  2-3:   dmin  (f16 super-min)
-//   Bytes  4-15:  scales (12 bytes, packed 6-bit scale/min per sub-block)
-//   Bytes 16-143: qs    (128 bytes, packed 4-bit weights)
+//   Bytes  4-15:  scales (12 bytes = 3 u32s, packed 6-bit scale/min per sub-block)
+//   Bytes 16-143: qs    (128 bytes = 32 u32s, packed 4-bit weights)
+//
+// All fields are u32-aligned because block size (144) is divisible by 4.
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
 @group(0) @binding(1) var<storage, read> input: array<f32>;
@@ -25,48 +27,9 @@
 // Input vector cached in shared memory in chunks.
 const WG_SIZE: u32 = 256u;
 const INPUT_CHUNK: u32 = 4096u;  // max floats cached at once (16KB shared mem)
+const BLOCK_WORDS: u32 = 36u;    // 144 bytes / 4
 
 var<workgroup> shared_input: array<f32, 4096>;
-
-// Read a u32 from an arbitrary byte offset in the weights buffer.
-fn read_u32_unaligned(byte_offset: u32) -> u32 {
-    let word = byte_offset >> 2u;
-    let shift = (byte_offset & 3u) << 3u;
-    if (shift == 0u) {
-        return weights[word];
-    }
-    return (weights[word] >> shift) | (weights[word + 1u] << (32u - shift));
-}
-
-// Read a single byte from the weights buffer.
-fn read_byte(byte_offset: u32) -> u32 {
-    let word = byte_offset >> 2u;
-    let shift = (byte_offset & 3u) << 3u;
-    return (weights[word] >> shift) & 0xFFu;
-}
-
-// Read an f16 value stored at byte_offset.
-fn read_f16(byte_offset: u32) -> f32 {
-    let bits = read_u32_unaligned(byte_offset) & 0xFFFFu;
-    return unpack2x16float(bits).x;
-}
-
-// Unpack the 6-bit scale and min for sub-block j (0..7) within a Q4_K block.
-fn get_scale_min_k4(j: u32, block_byte_offset: u32) -> vec2<f32> {
-    let scales_offset = block_byte_offset + 4u;
-    var sc: u32;
-    var m: u32;
-    if (j < 4u) {
-        sc = read_byte(scales_offset + j) & 63u;
-        m  = read_byte(scales_offset + j + 4u) & 63u;
-    } else {
-        sc = (read_byte(scales_offset + j + 4u) & 0xFu)
-           | ((read_byte(scales_offset + j - 4u) >> 6u) << 4u);
-        m  = (read_byte(scales_offset + j + 4u) >> 4u)
-           | ((read_byte(scales_offset + j) >> 6u) << 4u);
-    }
-    return vec2<f32>(f32(sc), f32(m));
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn main(
@@ -111,77 +74,275 @@ fn main(
 
             for (var blk: u32 = first_blk; blk <= last_blk; blk = blk + 1u) {
                 let global_block = n * blocks_per_row + blk;
-                let block_byte = global_block * 144u;
+                let block_word = global_block * BLOCK_WORDS;
                 let k_base = blk * 256u;
 
-                // Read super-block header
-                let d    = read_f16(block_byte);
-                let dmin = read_f16(block_byte + 2u);
+                // Read d (f16) and dmin (f16) packed in one u32 at word 0
+                let d_dmin_bits = weights[block_word];
+                let d_dmin = unpack2x16float(d_dmin_bits);
+                let d    = d_dmin.x;
+                let dmin = d_dmin.y;
 
-                let qs_offset = block_byte + 16u;
+                // Bulk-load 12 scale bytes as 3 u32s (words 1-3)
+                let sc0 = weights[block_word + 1u];
+                let sc1 = weights[block_word + 2u];
+                let sc2 = weights[block_word + 3u];
 
-                // Process 8 sub-blocks (4 iterations, 2 sub-blocks per iteration)
-                for (var it: u32 = 0u; it < 4u; it = it + 1u) {
-                    let sb_lo = 2u * it;
-                    let sb_hi = 2u * it + 1u;
+                // Extract all 8 scale/min pairs from the 3 registers.
+                // Bytes layout of sc0..sc2 (12 bytes, indices 0..11):
+                //   sc0: bytes [0,1,2,3]  sc1: bytes [4,5,6,7]  sc2: bytes [8,9,10,11]
+                //
+                // For j < 4:  scale[j] = byte[j] & 63,  min[j] = byte[j+4] & 63
+                // For j >= 4: scale[j] = (byte[j+4] & 0xF) | ((byte[j-4] >> 6) << 4)
+                //             min[j]   = (byte[j+4] >> 4)   | ((byte[j]   >> 6) << 4)
 
-                    let sm_lo = get_scale_min_k4(sb_lo, block_byte);
-                    let sm_hi = get_scale_min_k4(sb_hi, block_byte);
+                // Extract individual bytes from the 3 u32s
+                let b0  = sc0 & 0xFFu;
+                let b1  = (sc0 >> 8u) & 0xFFu;
+                let b2  = (sc0 >> 16u) & 0xFFu;
+                let b3  = (sc0 >> 24u) & 0xFFu;
+                let b4  = sc1 & 0xFFu;
+                let b5  = (sc1 >> 8u) & 0xFFu;
+                let b6  = (sc1 >> 16u) & 0xFFu;
+                let b7  = (sc1 >> 24u) & 0xFFu;
+                let b8  = sc2 & 0xFFu;
+                let b9  = (sc2 >> 8u) & 0xFFu;
+                let b10 = (sc2 >> 16u) & 0xFFu;
+                let b11 = (sc2 >> 24u) & 0xFFu;
 
-                    let d1  = d * sm_lo.x;
-                    let m1  = dmin * sm_lo.y;
-                    let d2  = d * sm_hi.x;
-                    let m2  = dmin * sm_hi.y;
+                // Sub-blocks 0-3: scale = byte[j] & 63, min = byte[j+4] & 63
+                let scale0 = f32(b0 & 63u);  let min0 = f32(b4 & 63u);
+                let scale1 = f32(b1 & 63u);  let min1 = f32(b5 & 63u);
+                let scale2 = f32(b2 & 63u);  let min2 = f32(b6 & 63u);
+                let scale3 = f32(b3 & 63u);  let min3 = f32(b7 & 63u);
 
-                    // Weight indices within K
-                    let k_lo = k_base + sb_lo * 32u;
-                    let k_hi = k_base + sb_hi * 32u;
+                // Sub-blocks 4-7: scale = (byte[j+4] & 0xF) | ((byte[j-4] >> 6) << 4)
+                //                  min   = (byte[j+4] >> 4)  | ((byte[j]   >> 6) << 4)
+                let scale4 = f32((b8  & 0xFu) | ((b0 >> 6u) << 4u));
+                let min4   = f32((b8  >> 4u)   | ((b4 >> 6u) << 4u));
+                let scale5 = f32((b9  & 0xFu) | ((b1 >> 6u) << 4u));
+                let min5   = f32((b9  >> 4u)   | ((b5 >> 6u) << 4u));
+                let scale6 = f32((b10 & 0xFu) | ((b2 >> 6u) << 4u));
+                let min6   = f32((b10 >> 4u)   | ((b6 >> 6u) << 4u));
+                let scale7 = f32((b11 & 0xFu) | ((b3 >> 6u) << 4u));
+                let min7   = f32((b11 >> 4u)   | ((b7 >> 6u) << 4u));
 
-                    // Shared memory offsets (relative to chunk start)
-                    let sh_lo = k_lo - chunk_k_start;
-                    let sh_hi = k_hi - chunk_k_start;
+                // qs starts at word 4 within the block (byte 16)
+                let qs_word = block_word + 4u;
 
-                    let qs_iter_offset = qs_offset + it * 32u;
+                // Process 8 sub-blocks in 4 iterations (2 sub-blocks per iteration)
+                // Each iteration: 32 bytes of qs = 8 u32s
+                // Low nibbles -> even sub-block, high nibbles -> odd sub-block
 
-                    for (var wi: u32 = 0u; wi < 8u; wi = wi + 1u) {
-                        let packed = read_u32_unaligned(qs_iter_offset + wi * 4u);
-                        let byte0 = packed & 0xFFu;
-                        let byte1 = (packed >> 8u) & 0xFFu;
-                        let byte2 = (packed >> 16u) & 0xFFu;
-                        let byte3 = (packed >> 24u) & 0xFFu;
+                // --- Iteration 0: sub-blocks 0,1 ---
+                {
+                    let d1 = d * scale0;  let m1 = dmin * min0;
+                    let d2 = d * scale1;  let m2 = dmin * min1;
+                    let sh_lo = k_base - chunk_k_start;
+                    let sh_hi = sh_lo + 32u;
+                    let qw = qs_word;
 
-                        let base_j = wi * 4u;
+                    // Load 8 u32s as 2 vec4<u32>
+                    let q0 = vec4<u32>(weights[qw], weights[qw + 1u], weights[qw + 2u], weights[qw + 3u]);
+                    let q1 = vec4<u32>(weights[qw + 4u], weights[qw + 5u], weights[qw + 6u], weights[qw + 7u]);
 
-                        // Low nibbles -> sub-block sb_lo
-                        let nib_lo = vec4<f32>(
-                            f32(byte0 & 0xFu),
-                            f32(byte1 & 0xFu),
-                            f32(byte2 & 0xFu),
-                            f32(byte3 & 0xFu)
-                        );
-                        let in_lo = vec4<f32>(
-                            shared_input[sh_lo + base_j],
-                            shared_input[sh_lo + base_j + 1u],
-                            shared_input[sh_lo + base_j + 2u],
-                            shared_input[sh_lo + base_j + 3u],
-                        );
-                        acc += dot(nib_lo * d1 - vec4<f32>(m1), in_lo);
+                    // Process q0 (16 weights: 4 per component)
+                    acc += dot(vec4<f32>(f32(q0.x & 0xFu), f32((q0.x >> 8u) & 0xFu), f32((q0.x >> 16u) & 0xFu), f32((q0.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo], shared_input[sh_lo + 1u], shared_input[sh_lo + 2u], shared_input[sh_lo + 3u]));
+                    acc += dot(vec4<f32>(f32((q0.x >> 4u) & 0xFu), f32((q0.x >> 12u) & 0xFu), f32((q0.x >> 20u) & 0xFu), f32((q0.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi], shared_input[sh_hi + 1u], shared_input[sh_hi + 2u], shared_input[sh_hi + 3u]));
 
-                        // High nibbles -> sub-block sb_hi
-                        let nib_hi = vec4<f32>(
-                            f32((byte0 >> 4u) & 0xFu),
-                            f32((byte1 >> 4u) & 0xFu),
-                            f32((byte2 >> 4u) & 0xFu),
-                            f32((byte3 >> 4u) & 0xFu)
-                        );
-                        let in_hi = vec4<f32>(
-                            shared_input[sh_hi + base_j],
-                            shared_input[sh_hi + base_j + 1u],
-                            shared_input[sh_hi + base_j + 2u],
-                            shared_input[sh_hi + base_j + 3u],
-                        );
-                        acc += dot(nib_hi * d2 - vec4<f32>(m2), in_hi);
-                    }
+                    acc += dot(vec4<f32>(f32(q0.y & 0xFu), f32((q0.y >> 8u) & 0xFu), f32((q0.y >> 16u) & 0xFu), f32((q0.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 4u], shared_input[sh_lo + 5u], shared_input[sh_lo + 6u], shared_input[sh_lo + 7u]));
+                    acc += dot(vec4<f32>(f32((q0.y >> 4u) & 0xFu), f32((q0.y >> 12u) & 0xFu), f32((q0.y >> 20u) & 0xFu), f32((q0.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 4u], shared_input[sh_hi + 5u], shared_input[sh_hi + 6u], shared_input[sh_hi + 7u]));
+
+                    acc += dot(vec4<f32>(f32(q0.z & 0xFu), f32((q0.z >> 8u) & 0xFu), f32((q0.z >> 16u) & 0xFu), f32((q0.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 8u], shared_input[sh_lo + 9u], shared_input[sh_lo + 10u], shared_input[sh_lo + 11u]));
+                    acc += dot(vec4<f32>(f32((q0.z >> 4u) & 0xFu), f32((q0.z >> 12u) & 0xFu), f32((q0.z >> 20u) & 0xFu), f32((q0.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 8u], shared_input[sh_hi + 9u], shared_input[sh_hi + 10u], shared_input[sh_hi + 11u]));
+
+                    acc += dot(vec4<f32>(f32(q0.w & 0xFu), f32((q0.w >> 8u) & 0xFu), f32((q0.w >> 16u) & 0xFu), f32((q0.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 12u], shared_input[sh_lo + 13u], shared_input[sh_lo + 14u], shared_input[sh_lo + 15u]));
+                    acc += dot(vec4<f32>(f32((q0.w >> 4u) & 0xFu), f32((q0.w >> 12u) & 0xFu), f32((q0.w >> 20u) & 0xFu), f32((q0.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 12u], shared_input[sh_hi + 13u], shared_input[sh_hi + 14u], shared_input[sh_hi + 15u]));
+
+                    // Process q1 (next 16 weights)
+                    acc += dot(vec4<f32>(f32(q1.x & 0xFu), f32((q1.x >> 8u) & 0xFu), f32((q1.x >> 16u) & 0xFu), f32((q1.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 16u], shared_input[sh_lo + 17u], shared_input[sh_lo + 18u], shared_input[sh_lo + 19u]));
+                    acc += dot(vec4<f32>(f32((q1.x >> 4u) & 0xFu), f32((q1.x >> 12u) & 0xFu), f32((q1.x >> 20u) & 0xFu), f32((q1.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 16u], shared_input[sh_hi + 17u], shared_input[sh_hi + 18u], shared_input[sh_hi + 19u]));
+
+                    acc += dot(vec4<f32>(f32(q1.y & 0xFu), f32((q1.y >> 8u) & 0xFu), f32((q1.y >> 16u) & 0xFu), f32((q1.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 20u], shared_input[sh_lo + 21u], shared_input[sh_lo + 22u], shared_input[sh_lo + 23u]));
+                    acc += dot(vec4<f32>(f32((q1.y >> 4u) & 0xFu), f32((q1.y >> 12u) & 0xFu), f32((q1.y >> 20u) & 0xFu), f32((q1.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 20u], shared_input[sh_hi + 21u], shared_input[sh_hi + 22u], shared_input[sh_hi + 23u]));
+
+                    acc += dot(vec4<f32>(f32(q1.z & 0xFu), f32((q1.z >> 8u) & 0xFu), f32((q1.z >> 16u) & 0xFu), f32((q1.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 24u], shared_input[sh_lo + 25u], shared_input[sh_lo + 26u], shared_input[sh_lo + 27u]));
+                    acc += dot(vec4<f32>(f32((q1.z >> 4u) & 0xFu), f32((q1.z >> 12u) & 0xFu), f32((q1.z >> 20u) & 0xFu), f32((q1.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 24u], shared_input[sh_hi + 25u], shared_input[sh_hi + 26u], shared_input[sh_hi + 27u]));
+
+                    acc += dot(vec4<f32>(f32(q1.w & 0xFu), f32((q1.w >> 8u) & 0xFu), f32((q1.w >> 16u) & 0xFu), f32((q1.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 28u], shared_input[sh_lo + 29u], shared_input[sh_lo + 30u], shared_input[sh_lo + 31u]));
+                    acc += dot(vec4<f32>(f32((q1.w >> 4u) & 0xFu), f32((q1.w >> 12u) & 0xFu), f32((q1.w >> 20u) & 0xFu), f32((q1.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 28u], shared_input[sh_hi + 29u], shared_input[sh_hi + 30u], shared_input[sh_hi + 31u]));
+                }
+
+                // --- Iteration 1: sub-blocks 2,3 ---
+                {
+                    let d1 = d * scale2;  let m1 = dmin * min2;
+                    let d2 = d * scale3;  let m2 = dmin * min3;
+                    let sh_lo = k_base + 64u - chunk_k_start;
+                    let sh_hi = sh_lo + 32u;
+                    let qw = qs_word + 8u;
+
+                    let q0 = vec4<u32>(weights[qw], weights[qw + 1u], weights[qw + 2u], weights[qw + 3u]);
+                    let q1 = vec4<u32>(weights[qw + 4u], weights[qw + 5u], weights[qw + 6u], weights[qw + 7u]);
+
+                    acc += dot(vec4<f32>(f32(q0.x & 0xFu), f32((q0.x >> 8u) & 0xFu), f32((q0.x >> 16u) & 0xFu), f32((q0.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo], shared_input[sh_lo + 1u], shared_input[sh_lo + 2u], shared_input[sh_lo + 3u]));
+                    acc += dot(vec4<f32>(f32((q0.x >> 4u) & 0xFu), f32((q0.x >> 12u) & 0xFu), f32((q0.x >> 20u) & 0xFu), f32((q0.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi], shared_input[sh_hi + 1u], shared_input[sh_hi + 2u], shared_input[sh_hi + 3u]));
+
+                    acc += dot(vec4<f32>(f32(q0.y & 0xFu), f32((q0.y >> 8u) & 0xFu), f32((q0.y >> 16u) & 0xFu), f32((q0.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 4u], shared_input[sh_lo + 5u], shared_input[sh_lo + 6u], shared_input[sh_lo + 7u]));
+                    acc += dot(vec4<f32>(f32((q0.y >> 4u) & 0xFu), f32((q0.y >> 12u) & 0xFu), f32((q0.y >> 20u) & 0xFu), f32((q0.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 4u], shared_input[sh_hi + 5u], shared_input[sh_hi + 6u], shared_input[sh_hi + 7u]));
+
+                    acc += dot(vec4<f32>(f32(q0.z & 0xFu), f32((q0.z >> 8u) & 0xFu), f32((q0.z >> 16u) & 0xFu), f32((q0.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 8u], shared_input[sh_lo + 9u], shared_input[sh_lo + 10u], shared_input[sh_lo + 11u]));
+                    acc += dot(vec4<f32>(f32((q0.z >> 4u) & 0xFu), f32((q0.z >> 12u) & 0xFu), f32((q0.z >> 20u) & 0xFu), f32((q0.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 8u], shared_input[sh_hi + 9u], shared_input[sh_hi + 10u], shared_input[sh_hi + 11u]));
+
+                    acc += dot(vec4<f32>(f32(q0.w & 0xFu), f32((q0.w >> 8u) & 0xFu), f32((q0.w >> 16u) & 0xFu), f32((q0.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 12u], shared_input[sh_lo + 13u], shared_input[sh_lo + 14u], shared_input[sh_lo + 15u]));
+                    acc += dot(vec4<f32>(f32((q0.w >> 4u) & 0xFu), f32((q0.w >> 12u) & 0xFu), f32((q0.w >> 20u) & 0xFu), f32((q0.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 12u], shared_input[sh_hi + 13u], shared_input[sh_hi + 14u], shared_input[sh_hi + 15u]));
+
+                    acc += dot(vec4<f32>(f32(q1.x & 0xFu), f32((q1.x >> 8u) & 0xFu), f32((q1.x >> 16u) & 0xFu), f32((q1.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 16u], shared_input[sh_lo + 17u], shared_input[sh_lo + 18u], shared_input[sh_lo + 19u]));
+                    acc += dot(vec4<f32>(f32((q1.x >> 4u) & 0xFu), f32((q1.x >> 12u) & 0xFu), f32((q1.x >> 20u) & 0xFu), f32((q1.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 16u], shared_input[sh_hi + 17u], shared_input[sh_hi + 18u], shared_input[sh_hi + 19u]));
+
+                    acc += dot(vec4<f32>(f32(q1.y & 0xFu), f32((q1.y >> 8u) & 0xFu), f32((q1.y >> 16u) & 0xFu), f32((q1.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 20u], shared_input[sh_lo + 21u], shared_input[sh_lo + 22u], shared_input[sh_lo + 23u]));
+                    acc += dot(vec4<f32>(f32((q1.y >> 4u) & 0xFu), f32((q1.y >> 12u) & 0xFu), f32((q1.y >> 20u) & 0xFu), f32((q1.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 20u], shared_input[sh_hi + 21u], shared_input[sh_hi + 22u], shared_input[sh_hi + 23u]));
+
+                    acc += dot(vec4<f32>(f32(q1.z & 0xFu), f32((q1.z >> 8u) & 0xFu), f32((q1.z >> 16u) & 0xFu), f32((q1.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 24u], shared_input[sh_lo + 25u], shared_input[sh_lo + 26u], shared_input[sh_lo + 27u]));
+                    acc += dot(vec4<f32>(f32((q1.z >> 4u) & 0xFu), f32((q1.z >> 12u) & 0xFu), f32((q1.z >> 20u) & 0xFu), f32((q1.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 24u], shared_input[sh_hi + 25u], shared_input[sh_hi + 26u], shared_input[sh_hi + 27u]));
+
+                    acc += dot(vec4<f32>(f32(q1.w & 0xFu), f32((q1.w >> 8u) & 0xFu), f32((q1.w >> 16u) & 0xFu), f32((q1.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 28u], shared_input[sh_lo + 29u], shared_input[sh_lo + 30u], shared_input[sh_lo + 31u]));
+                    acc += dot(vec4<f32>(f32((q1.w >> 4u) & 0xFu), f32((q1.w >> 12u) & 0xFu), f32((q1.w >> 20u) & 0xFu), f32((q1.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 28u], shared_input[sh_hi + 29u], shared_input[sh_hi + 30u], shared_input[sh_hi + 31u]));
+                }
+
+                // --- Iteration 2: sub-blocks 4,5 ---
+                {
+                    let d1 = d * scale4;  let m1 = dmin * min4;
+                    let d2 = d * scale5;  let m2 = dmin * min5;
+                    let sh_lo = k_base + 128u - chunk_k_start;
+                    let sh_hi = sh_lo + 32u;
+                    let qw = qs_word + 16u;
+
+                    let q0 = vec4<u32>(weights[qw], weights[qw + 1u], weights[qw + 2u], weights[qw + 3u]);
+                    let q1 = vec4<u32>(weights[qw + 4u], weights[qw + 5u], weights[qw + 6u], weights[qw + 7u]);
+
+                    acc += dot(vec4<f32>(f32(q0.x & 0xFu), f32((q0.x >> 8u) & 0xFu), f32((q0.x >> 16u) & 0xFu), f32((q0.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo], shared_input[sh_lo + 1u], shared_input[sh_lo + 2u], shared_input[sh_lo + 3u]));
+                    acc += dot(vec4<f32>(f32((q0.x >> 4u) & 0xFu), f32((q0.x >> 12u) & 0xFu), f32((q0.x >> 20u) & 0xFu), f32((q0.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi], shared_input[sh_hi + 1u], shared_input[sh_hi + 2u], shared_input[sh_hi + 3u]));
+
+                    acc += dot(vec4<f32>(f32(q0.y & 0xFu), f32((q0.y >> 8u) & 0xFu), f32((q0.y >> 16u) & 0xFu), f32((q0.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 4u], shared_input[sh_lo + 5u], shared_input[sh_lo + 6u], shared_input[sh_lo + 7u]));
+                    acc += dot(vec4<f32>(f32((q0.y >> 4u) & 0xFu), f32((q0.y >> 12u) & 0xFu), f32((q0.y >> 20u) & 0xFu), f32((q0.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 4u], shared_input[sh_hi + 5u], shared_input[sh_hi + 6u], shared_input[sh_hi + 7u]));
+
+                    acc += dot(vec4<f32>(f32(q0.z & 0xFu), f32((q0.z >> 8u) & 0xFu), f32((q0.z >> 16u) & 0xFu), f32((q0.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 8u], shared_input[sh_lo + 9u], shared_input[sh_lo + 10u], shared_input[sh_lo + 11u]));
+                    acc += dot(vec4<f32>(f32((q0.z >> 4u) & 0xFu), f32((q0.z >> 12u) & 0xFu), f32((q0.z >> 20u) & 0xFu), f32((q0.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 8u], shared_input[sh_hi + 9u], shared_input[sh_hi + 10u], shared_input[sh_hi + 11u]));
+
+                    acc += dot(vec4<f32>(f32(q0.w & 0xFu), f32((q0.w >> 8u) & 0xFu), f32((q0.w >> 16u) & 0xFu), f32((q0.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 12u], shared_input[sh_lo + 13u], shared_input[sh_lo + 14u], shared_input[sh_lo + 15u]));
+                    acc += dot(vec4<f32>(f32((q0.w >> 4u) & 0xFu), f32((q0.w >> 12u) & 0xFu), f32((q0.w >> 20u) & 0xFu), f32((q0.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 12u], shared_input[sh_hi + 13u], shared_input[sh_hi + 14u], shared_input[sh_hi + 15u]));
+
+                    acc += dot(vec4<f32>(f32(q1.x & 0xFu), f32((q1.x >> 8u) & 0xFu), f32((q1.x >> 16u) & 0xFu), f32((q1.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 16u], shared_input[sh_lo + 17u], shared_input[sh_lo + 18u], shared_input[sh_lo + 19u]));
+                    acc += dot(vec4<f32>(f32((q1.x >> 4u) & 0xFu), f32((q1.x >> 12u) & 0xFu), f32((q1.x >> 20u) & 0xFu), f32((q1.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 16u], shared_input[sh_hi + 17u], shared_input[sh_hi + 18u], shared_input[sh_hi + 19u]));
+
+                    acc += dot(vec4<f32>(f32(q1.y & 0xFu), f32((q1.y >> 8u) & 0xFu), f32((q1.y >> 16u) & 0xFu), f32((q1.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 20u], shared_input[sh_lo + 21u], shared_input[sh_lo + 22u], shared_input[sh_lo + 23u]));
+                    acc += dot(vec4<f32>(f32((q1.y >> 4u) & 0xFu), f32((q1.y >> 12u) & 0xFu), f32((q1.y >> 20u) & 0xFu), f32((q1.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 20u], shared_input[sh_hi + 21u], shared_input[sh_hi + 22u], shared_input[sh_hi + 23u]));
+
+                    acc += dot(vec4<f32>(f32(q1.z & 0xFu), f32((q1.z >> 8u) & 0xFu), f32((q1.z >> 16u) & 0xFu), f32((q1.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 24u], shared_input[sh_lo + 25u], shared_input[sh_lo + 26u], shared_input[sh_lo + 27u]));
+                    acc += dot(vec4<f32>(f32((q1.z >> 4u) & 0xFu), f32((q1.z >> 12u) & 0xFu), f32((q1.z >> 20u) & 0xFu), f32((q1.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 24u], shared_input[sh_hi + 25u], shared_input[sh_hi + 26u], shared_input[sh_hi + 27u]));
+
+                    acc += dot(vec4<f32>(f32(q1.w & 0xFu), f32((q1.w >> 8u) & 0xFu), f32((q1.w >> 16u) & 0xFu), f32((q1.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 28u], shared_input[sh_lo + 29u], shared_input[sh_lo + 30u], shared_input[sh_lo + 31u]));
+                    acc += dot(vec4<f32>(f32((q1.w >> 4u) & 0xFu), f32((q1.w >> 12u) & 0xFu), f32((q1.w >> 20u) & 0xFu), f32((q1.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 28u], shared_input[sh_hi + 29u], shared_input[sh_hi + 30u], shared_input[sh_hi + 31u]));
+                }
+
+                // --- Iteration 3: sub-blocks 6,7 ---
+                {
+                    let d1 = d * scale6;  let m1 = dmin * min6;
+                    let d2 = d * scale7;  let m2 = dmin * min7;
+                    let sh_lo = k_base + 192u - chunk_k_start;
+                    let sh_hi = sh_lo + 32u;
+                    let qw = qs_word + 24u;
+
+                    let q0 = vec4<u32>(weights[qw], weights[qw + 1u], weights[qw + 2u], weights[qw + 3u]);
+                    let q1 = vec4<u32>(weights[qw + 4u], weights[qw + 5u], weights[qw + 6u], weights[qw + 7u]);
+
+                    acc += dot(vec4<f32>(f32(q0.x & 0xFu), f32((q0.x >> 8u) & 0xFu), f32((q0.x >> 16u) & 0xFu), f32((q0.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo], shared_input[sh_lo + 1u], shared_input[sh_lo + 2u], shared_input[sh_lo + 3u]));
+                    acc += dot(vec4<f32>(f32((q0.x >> 4u) & 0xFu), f32((q0.x >> 12u) & 0xFu), f32((q0.x >> 20u) & 0xFu), f32((q0.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi], shared_input[sh_hi + 1u], shared_input[sh_hi + 2u], shared_input[sh_hi + 3u]));
+
+                    acc += dot(vec4<f32>(f32(q0.y & 0xFu), f32((q0.y >> 8u) & 0xFu), f32((q0.y >> 16u) & 0xFu), f32((q0.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 4u], shared_input[sh_lo + 5u], shared_input[sh_lo + 6u], shared_input[sh_lo + 7u]));
+                    acc += dot(vec4<f32>(f32((q0.y >> 4u) & 0xFu), f32((q0.y >> 12u) & 0xFu), f32((q0.y >> 20u) & 0xFu), f32((q0.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 4u], shared_input[sh_hi + 5u], shared_input[sh_hi + 6u], shared_input[sh_hi + 7u]));
+
+                    acc += dot(vec4<f32>(f32(q0.z & 0xFu), f32((q0.z >> 8u) & 0xFu), f32((q0.z >> 16u) & 0xFu), f32((q0.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 8u], shared_input[sh_lo + 9u], shared_input[sh_lo + 10u], shared_input[sh_lo + 11u]));
+                    acc += dot(vec4<f32>(f32((q0.z >> 4u) & 0xFu), f32((q0.z >> 12u) & 0xFu), f32((q0.z >> 20u) & 0xFu), f32((q0.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 8u], shared_input[sh_hi + 9u], shared_input[sh_hi + 10u], shared_input[sh_hi + 11u]));
+
+                    acc += dot(vec4<f32>(f32(q0.w & 0xFu), f32((q0.w >> 8u) & 0xFu), f32((q0.w >> 16u) & 0xFu), f32((q0.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 12u], shared_input[sh_lo + 13u], shared_input[sh_lo + 14u], shared_input[sh_lo + 15u]));
+                    acc += dot(vec4<f32>(f32((q0.w >> 4u) & 0xFu), f32((q0.w >> 12u) & 0xFu), f32((q0.w >> 20u) & 0xFu), f32((q0.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 12u], shared_input[sh_hi + 13u], shared_input[sh_hi + 14u], shared_input[sh_hi + 15u]));
+
+                    acc += dot(vec4<f32>(f32(q1.x & 0xFu), f32((q1.x >> 8u) & 0xFu), f32((q1.x >> 16u) & 0xFu), f32((q1.x >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 16u], shared_input[sh_lo + 17u], shared_input[sh_lo + 18u], shared_input[sh_lo + 19u]));
+                    acc += dot(vec4<f32>(f32((q1.x >> 4u) & 0xFu), f32((q1.x >> 12u) & 0xFu), f32((q1.x >> 20u) & 0xFu), f32((q1.x >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 16u], shared_input[sh_hi + 17u], shared_input[sh_hi + 18u], shared_input[sh_hi + 19u]));
+
+                    acc += dot(vec4<f32>(f32(q1.y & 0xFu), f32((q1.y >> 8u) & 0xFu), f32((q1.y >> 16u) & 0xFu), f32((q1.y >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 20u], shared_input[sh_lo + 21u], shared_input[sh_lo + 22u], shared_input[sh_lo + 23u]));
+                    acc += dot(vec4<f32>(f32((q1.y >> 4u) & 0xFu), f32((q1.y >> 12u) & 0xFu), f32((q1.y >> 20u) & 0xFu), f32((q1.y >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 20u], shared_input[sh_hi + 21u], shared_input[sh_hi + 22u], shared_input[sh_hi + 23u]));
+
+                    acc += dot(vec4<f32>(f32(q1.z & 0xFu), f32((q1.z >> 8u) & 0xFu), f32((q1.z >> 16u) & 0xFu), f32((q1.z >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 24u], shared_input[sh_lo + 25u], shared_input[sh_lo + 26u], shared_input[sh_lo + 27u]));
+                    acc += dot(vec4<f32>(f32((q1.z >> 4u) & 0xFu), f32((q1.z >> 12u) & 0xFu), f32((q1.z >> 20u) & 0xFu), f32((q1.z >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 24u], shared_input[sh_hi + 25u], shared_input[sh_hi + 26u], shared_input[sh_hi + 27u]));
+
+                    acc += dot(vec4<f32>(f32(q1.w & 0xFu), f32((q1.w >> 8u) & 0xFu), f32((q1.w >> 16u) & 0xFu), f32((q1.w >> 24u) & 0xFu)) * d1 - vec4<f32>(m1),
+                              vec4<f32>(shared_input[sh_lo + 28u], shared_input[sh_lo + 29u], shared_input[sh_lo + 30u], shared_input[sh_lo + 31u]));
+                    acc += dot(vec4<f32>(f32((q1.w >> 4u) & 0xFu), f32((q1.w >> 12u) & 0xFu), f32((q1.w >> 20u) & 0xFu), f32((q1.w >> 28u) & 0xFu)) * d2 - vec4<f32>(m2),
+                              vec4<f32>(shared_input[sh_hi + 28u], shared_input[sh_hi + 29u], shared_input[sh_hi + 30u], shared_input[sh_hi + 31u]));
                 }
             }
         }

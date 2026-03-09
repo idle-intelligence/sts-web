@@ -73,28 +73,35 @@ impl RoPE {
     }
 
     /// Apply RoPE rotation to a single [B, S, H, D] tensor using Burn ops.
+    ///
+    /// Uses interleaved convention: pairs at adjacent indices [r0, i0, r1, i1, ...]
+    /// as required by PersonaPlex/Moshi (not split-half).
     fn apply_rope_to_tensor(&self, x: Tensor<Wgpu, 4>, offset: usize) -> Tensor<Wgpu, 4> {
         let [batch, seq, heads, head_dim] = x.dims();
-        let half = self.half_dim;
+        let half = self.half_dim; // head_dim / 2
 
-        // Split head_dim into first half and second half
-        let x1 = x.clone().slice([0..batch, 0..seq, 0..heads, 0..half]);
-        let x2 = x.slice([0..batch, 0..seq, 0..heads, half..head_dim]);
+        // Reshape to separate real/imaginary pairs: [B, S, H, half_dim, 2]
+        let x = x.reshape([batch, seq, heads, half, 2]);
+
+        // Extract real (index 0) and imaginary (index 1) parts
+        // Both are [B, S, H, half, 1]
+        let x_real = x.clone().slice([0..batch, 0..seq, 0..heads, 0..half, 0..1]);
+        let x_imag = x.slice([0..batch, 0..seq, 0..heads, 0..half, 1..2]);
 
         // Get cos/sin for positions [offset..offset+seq]
-        let cos = self.cos_table.clone().slice([offset..offset + seq, 0..half]);
-        let sin = self.sin_table.clone().slice([offset..offset + seq, 0..half]);
+        let cos = self.cos_table.clone().slice([offset..offset + seq, 0..half])
+            .reshape([1, seq, 1, half, 1]);
+        let sin = self.sin_table.clone().slice([offset..offset + seq, 0..half])
+            .reshape([1, seq, 1, half, 1]);
 
-        // Reshape for broadcasting: [1, seq, 1, half]
-        let cos = cos.reshape([1, seq, 1, half]);
-        let sin = sin.reshape([1, seq, 1, half]);
+        // Apply rotation: out_r = x_r * cos - x_i * sin
+        //                 out_i = x_r * sin + x_i * cos
+        let out_real = x_real.clone() * cos.clone() - x_imag.clone() * sin.clone();
+        let out_imag = x_real * sin + x_imag * cos;
 
-        // Apply rotation (Burn fuses these element-wise ops)
-        let out1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
-        let out2 = x1 * sin + x2 * cos;
-
-        // Concatenate back: [batch, seq, heads, head_dim]
-        Tensor::cat(vec![out1, out2], 3)
+        // Stack back to interleaved [r0, i0, r1, i1, ...] and reshape
+        Tensor::cat(vec![out_real, out_imag], 4) // [B, S, H, half, 2]
+            .reshape([batch, seq, heads, head_dim])
     }
 
     /// Apply rotary embeddings to Q and K tensors using Burn element-wise ops.

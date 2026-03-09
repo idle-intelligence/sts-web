@@ -175,6 +175,21 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         // Now shared_vals/shared_idxs[0..K] contain top-K logits
 
+        // Sort top-K by descending value (insertion sort, K is small)
+        // Required so cumulative probability sampling matches CPU path
+        for (var si = 1u; si < K; si = si + 1u) {
+            let key_val = shared_vals[si];
+            let key_idx = shared_idxs[si];
+            var sj: i32 = i32(si) - 1;
+            while (sj >= 0 && shared_vals[u32(sj)] < key_val) {
+                shared_vals[u32(sj + 1)] = shared_vals[u32(sj)];
+                shared_idxs[u32(sj + 1)] = shared_idxs[u32(sj)];
+                sj = sj - 1;
+            }
+            shared_vals[u32(sj + 1)] = key_val;
+            shared_idxs[u32(sj + 1)] = key_idx;
+        }
+
         // Softmax over top-K
         // Find max for numerical stability
         var max_val: f32 = shared_vals[0];

@@ -601,12 +601,11 @@ impl StsStream {
         };
 
         // Step 2: Submit text token sampling to GPU (DON'T await yet).
-        // The argmax/sampling kernel is enqueued on GPU. By deferring the readback
-        // until after depth input projections are submitted, we eliminate the
-        // ~71ms stall where the CPU waits for the temporal forward to finish.
-        let text_token_tensor = if self.text_temperature <= 0.0 {
-            let (_handle, tensor) = gpu_argmax_buffer(text_logits);
-            tensor
+        // The argmax/sampling kernel is enqueued on GPU. We keep both the Handle
+        // (for GPU-side text embedding in depth step 0) and the Tensor (for
+        // batch readback at the end). No CPU readback happens here.
+        let (text_token_handle, text_token_tensor) = if self.text_temperature <= 0.0 {
+            gpu_argmax_buffer(text_logits)
         } else {
             let text_history: Vec<u32> = self
                 .text_token_history
@@ -615,28 +614,29 @@ impl StsStream {
                 .take(self.penalty_window)
                 .copied()
                 .collect();
-            let (_handle, tensor) = gpu_sample_top_k_with_penalty(
+            gpu_sample_top_k_with_penalty(
                 text_logits,
                 self.text_top_k,
                 self.text_temperature,
                 &text_history,
                 self.repetition_penalty,
-            );
-            tensor
+            )
         };
 
         // Step 3: Reset depth cache for this time step
         self.depth_cache.reset_keep_buffers();
 
         // Step 4: Depth transformer generates agent audio tokens (skip user predictions).
-        // Uses generate_deferred which computes input projections (GPU work) BEFORE
-        // reading back the text token — this overlaps with temporal argmax completion.
+        // Uses generate_deferred with the GPU Handle for text embedding lookup —
+        // ZERO CPU readback between temporal and depth. Text token is read back
+        // at the end in a single batch with audio tokens.
         let gen_steps = self.config.depth_gen_steps;
         let t_depth = now_ms();
         let penalty_hist = &self.audio_token_history;
         let (mut all_audio_tokens, text_token) = depth.generate_deferred(
             hidden,
             text_token_tensor,
+            text_token_handle,
             &mut self.depth_cache,
             self.audio_temperature,
             self.audio_top_k,

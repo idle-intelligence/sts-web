@@ -1136,6 +1136,12 @@ pub struct DepthGpuBuffers {
     /// Pre-allocated argmax info handles per step (avoids create_from_slice in hot loop).
     /// Each contains a single u32 = vocab_size for that step's output head.
     argmax_info_handles: Vec<Handle>,
+    /// Pre-allocated output handle for step 0 text embedding GPU lookup.
+    text_emb_output_handle: Option<Handle>,
+    /// Info handle for text embedding GPU lookup: [dim, bytes_per_row, vocab_size].
+    text_emb_info_handle: Option<Handle>,
+    /// GPU handle to the text embedding Q4 data (if uploaded).
+    text_emb_q4_handle: Option<Handle>,
     /// Embedding dimension.
     pub dim: usize,
     /// Device for creating tensors from handles.
@@ -1147,11 +1153,14 @@ impl DepthGpuBuffers {
     ///
     /// `output_vocab_sizes`: per-step output vocab size (e.g. 32000 for text, 2048 for audio).
     /// Used to pre-allocate argmax info handles, avoiding `create_from_slice` in the hot loop.
+    /// `text_emb`: optional text embedding store — if provided and uploaded to GPU,
+    /// enables fully GPU-side text embedding at step 0 (no CPU readback needed).
     pub fn new(
         num_steps: usize,
         dim: usize,
         audio_embs: &[EmbeddingStore],
         output_vocab_sizes: &[usize],
+        text_emb: Option<&EmbeddingStore>,
         device: &WgpuDevice,
     ) -> Self {
         let client = WgpuRuntime::client(device);
@@ -1191,11 +1200,34 @@ impl DepthGpuBuffers {
             })
             .collect();
 
+        // Pre-allocate text embedding GPU lookup buffers (step 0).
+        // This allows step 0 to use GPU embedding lookup with the argmax handle,
+        // eliminating the CPU readback stall between temporal and depth.
+        let (text_emb_output_handle, text_emb_info_handle, text_emb_q4_handle) =
+            if let Some(emb) = text_emb {
+                if let Some((q4_handle, _dim, vocab_size, bytes_per_row, _dev)) = emb.gpu_lookup_params_opt() {
+                    let output_handle = client.empty(dim * 4);
+                    let mut info_bytes = Vec::with_capacity(12);
+                    info_bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+                    info_bytes.extend_from_slice(&(bytes_per_row as u32).to_le_bytes());
+                    info_bytes.extend_from_slice(&(vocab_size as u32).to_le_bytes());
+                    let info_handle = client.create_from_slice(&info_bytes);
+                    (Some(output_handle), Some(info_handle), Some(q4_handle.clone()))
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
+
         Self {
             token_handles,
             embed_output_handles,
             embed_info_handles,
             argmax_info_handles,
+            text_emb_output_handle,
+            text_emb_info_handle,
+            text_emb_q4_handle,
             dim,
             device: device.clone(),
         }
@@ -1366,6 +1398,48 @@ impl DepthGpuBuffers {
             DType::F32,
         );
         Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+    }
+
+    /// GPU-side text embedding lookup for step 0 using a token handle.
+    ///
+    /// Uses the pre-allocated text embedding output buffer and the uploaded
+    /// text embedding Q4 data. The `token_handle` is the argmax/sampling
+    /// result handle from temporal — no CPU readback needed.
+    ///
+    /// Returns Some(tensor [1, 1, dim]) if GPU text embedding is available,
+    /// None if text_emb was not uploaded to GPU.
+    pub fn gpu_text_embed_lookup(&self, token_handle: &Handle) -> Option<Tensor<Wgpu, 3>> {
+        let output_handle = self.text_emb_output_handle.as_ref()?;
+        let info_handle = self.text_emb_info_handle.as_ref()?;
+        let q4_handle = self.text_emb_q4_handle.as_ref()?;
+
+        let client = WgpuRuntime::client(&self.device);
+
+        let bindings = Bindings::new()
+            .with_buffer(token_handle.clone().binding())
+            .with_buffer(q4_handle.clone().binding())
+            .with_buffer(output_handle.clone().binding())
+            .with_buffer(info_handle.clone().binding());
+
+        let kernel = SourceKernel::new(EmbedQ4Kernel, CubeDim::new_1d(256));
+        let num_workgroups = (self.dim as u32).div_ceil(256);
+
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_1d(num_workgroups),
+                bindings,
+            )
+            .expect("Text embedding Q4 lookup kernel launch failed");
+
+        let output_tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1, 1, self.dim]),
+            output_handle.clone(),
+            DType::F32,
+        );
+        Some(Tensor::from_primitive(TensorPrimitive::Float(output_tensor)))
     }
 
     /// Collect all token tensors for batch readback.

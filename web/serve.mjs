@@ -38,6 +38,7 @@ const server = createServer((req, res) => {
     // CORS headers (needed for WASM + WebGPU in cross-origin workers)
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
     res.setHeader("Cross-Origin-Embedder-Policy", "credentialless");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
 
     let filePath;
     if (pathname === "/" || pathname === "/index.html") {

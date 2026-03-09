@@ -22,7 +22,7 @@ use burn::tensor::activation::softmax;
 use burn::tensor::Tensor;
 
 use crate::gguf::{gpu_argmax, EmbeddingStore, Linear};
-use crate::model::{fused_swiglu, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::model::{fused_attention, fused_swiglu, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
@@ -120,34 +120,38 @@ impl MultiLinearAttention {
             (k, v)
         };
 
-        let k_t = k.swap_dims(2, 3);
-        let scores = q.matmul(k_t) * self.scale;
+        // Fused attention for single-token decode (generation mode).
+        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            fused_attention(q, k, v, self.scale)
+        } else {
+            let k_t = k.swap_dims(2, 3);
+            let scores = q.matmul(k_t) * self.scale;
 
-        // Causal mask for depth steps (only needed if seq_len > 1, which
-        // shouldn't happen in step-by-step inference, but handle it)
-        let scores = if seq_len > 1 {
-            let device = scores.device();
-            let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
-            for i in 0..seq_len {
-                let actual_pos = offset + i;
-                for j in 0..total_seq_len {
-                    if j > actual_pos {
-                        mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
+            // Causal mask for depth steps (only needed if seq_len > 1)
+            let scores = if seq_len > 1 {
+                let device = scores.device();
+                let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
+                for i in 0..seq_len {
+                    let actual_pos = offset + i;
+                    for j in 0..total_seq_len {
+                        if j > actual_pos {
+                            mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
+                        }
                     }
                 }
-            }
-            let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-            let mask: Tensor<Wgpu, 4> = mask
-                .reshape([seq_len, total_seq_len])
-                .unsqueeze_dim::<3>(0)
-                .unsqueeze_dim(0);
-            scores + mask
-        } else {
-            scores
-        };
+                let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
+                let mask: Tensor<Wgpu, 4> = mask
+                    .reshape([seq_len, total_seq_len])
+                    .unsqueeze_dim::<3>(0)
+                    .unsqueeze_dim(0);
+                scores + mask
+            } else {
+                scores
+            };
 
-        let attn = softmax(scores, 3);
-        let out = attn.matmul(v);
+            let attn = softmax(scores, 3);
+            attn.matmul(v)
+        };
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
         self.out_projs[step_idx].forward(out)

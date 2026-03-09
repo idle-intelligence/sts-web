@@ -567,6 +567,97 @@ fn apply_causal_mask(
 }
 
 // ---------------------------------------------------------------------------
+// Fused Attention -- single-token decode (Flash-decoding style)
+// ---------------------------------------------------------------------------
+
+struct FusedAttentionKernelSource;
+
+impl KernelSource for FusedAttentionKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_attention.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused single-token attention: QK^T + softmax + V in one GPU dispatch.
+///
+/// Only valid for single-token decode (q_seq_len == 1).
+/// q shape: [1, num_heads, 1, head_dim] -> reshaped to [num_heads, head_dim]
+/// k shape: [1, num_heads, S, head_dim] -> [num_heads, S, head_dim]
+/// v shape: [1, num_heads, S, head_dim] -> [num_heads, S, head_dim]
+/// Returns: [1, num_heads, 1, head_dim]
+///
+/// Replaces: matmul(Q, K^T), scale, softmax, matmul(attn, V) — ~6 dispatches -> 1.
+pub fn fused_attention(
+    q: Tensor<Wgpu, 4>,
+    k: Tensor<Wgpu, 4>,
+    v: Tensor<Wgpu, 4>,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    let [_b, num_heads, _one, head_dim] = q.dims();
+    let [_b2, _h2, seq_len, _hd2] = k.dims();
+
+    // Reshape to 2D/3D for the kernel (drop batch and singleton dims)
+    let q = q.reshape([num_heads, head_dim]);
+    let k = k.reshape([num_heads, seq_len, head_dim]);
+    let v = v.reshape([num_heads, seq_len, head_dim]);
+
+    let cube_q: CubeTensor<WgpuRuntime> = q.into_primitive().tensor();
+    let cube_k: CubeTensor<WgpuRuntime> = k.into_primitive().tensor();
+    let cube_v: CubeTensor<WgpuRuntime> = v.into_primitive().tensor();
+
+    let cube_q = into_contiguous(cube_q);
+    let cube_k = into_contiguous(cube_k);
+    let cube_v = into_contiguous(cube_v);
+
+    let client = cube_q.client.clone();
+    let device = cube_q.device.clone();
+
+    let output_size = num_heads * head_dim;
+    let output_handle = client.empty(output_size * 4);
+
+    // Info buffer: [num_heads, head_dim, seq_len, scale_bits]
+    let info: [u32; 4] = [
+        num_heads as u32,
+        head_dim as u32,
+        seq_len as u32,
+        scale.to_bits(),
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_q.handle.clone().binding())
+        .with_buffer(cube_k.handle.clone().binding())
+        .with_buffer(cube_v.handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(FusedAttentionKernelSource, CubeDim::new_1d(256));
+
+    // One workgroup per head
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_heads as u32),
+            bindings,
+        )
+        .expect("Fused attention kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![1, num_heads, 1, head_dim]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
+// ---------------------------------------------------------------------------
 // Q4Attention -- MHA with combined QKV projection
 // ---------------------------------------------------------------------------
 
@@ -668,11 +759,17 @@ impl Q4Attention {
             (k, v)
         };
 
-        let k_t = k.swap_dims(2, 3);
-        let scores = q.matmul(k_t) * self.scale;
-        let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
-        let attn = softmax(scores, 3);
-        let out = attn.matmul(v);
+        // Fused attention for single-token decode (generation mode).
+        // Replaces: Q@K^T, scale, causal_mask, softmax, @V — ~6 dispatches -> 1.
+        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            fused_attention(q, k, v, self.scale)
+        } else {
+            let k_t = k.swap_dims(2, 3);
+            let scores = q.matmul(k_t) * self.scale;
+            let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
+            let attn = softmax(scores, 3);
+            attn.matmul(v)
+        };
 
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);

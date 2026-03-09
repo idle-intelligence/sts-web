@@ -97,9 +97,8 @@ impl MultiLinearAttention {
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // No positional embedding for depth transformer (depformer_pos_emb="none" in Moshi)
-        // Q and K are used directly without RoPE.
 
-        let q = q.swap_dims(1, 2);
+        // K, V need swap for cache; Q skips swap_dims for fused_attention
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -124,9 +123,12 @@ impl MultiLinearAttention {
         };
 
         // Fused attention for single-token decode (generation mode).
+        // Q is [B, S, H, D] (no swap_dims), K/V are [B, H, S, D] from cache.
         let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
             fused_attention(q, k, v, self.scale)
         } else {
+            // Prefill path: need Q in [B, H, S, D]
+            let q = q.swap_dims(1, 2);
             let k_t = k.swap_dims(2, 3);
             let scores = q.matmul(k_t) * self.scale;
 
@@ -183,7 +185,7 @@ impl MultiLinearAttention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        let q = q.swap_dims(1, 2);
+        // K, V need swap for cache; Q skips swap_dims for fused_attention
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -209,6 +211,8 @@ impl MultiLinearAttention {
         let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
             fused_attention(q, k, v, self.scale)
         } else {
+            // Prefill path: need Q in [B, H, S, D]
+            let q = q.swap_dims(1, 2);
             let k_t = k.swap_dims(2, 3);
             let scores = q.matmul(k_t) * self.scale;
 

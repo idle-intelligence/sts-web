@@ -584,34 +584,47 @@ impl KernelSource for FusedAttentionKernelSource {
 
 /// Fused single-token attention: QK^T + softmax + V in one GPU dispatch.
 ///
-/// Only valid for single-token decode (q_seq_len == 1).
-/// q shape: [1, num_heads, 1, head_dim] -> reshaped to [num_heads, head_dim]
-/// k shape: [1, num_heads, S, head_dim] -> [num_heads, S, head_dim]
-/// v shape: [1, num_heads, S, head_dim] -> [num_heads, S, head_dim]
-/// Returns: [1, num_heads, 1, head_dim]
+/// Only valid for single-token decode (q_seq_len == 1, batch == 1).
+///
+/// Accepts tensors in their natural layouts to avoid unnecessary copies:
+/// - q: `[1, 1, num_heads, head_dim]` (BEFORE swap_dims — saves 1 copy dispatch)
+/// - k: `[1, num_heads, S, head_dim]` (from KV cache — may be non-contiguous slice)
+/// - v: `[1, num_heads, S, head_dim]` (from KV cache — may be non-contiguous slice)
+///
+/// The kernel uses stride-aware addressing for K/V to handle cache slices
+/// without requiring `into_contiguous()` copies. Q is always contiguous after
+/// slice+reshape (B=S=1, so leading dims don't matter).
+///
+/// Returns: `[1, num_heads, 1, head_dim]`
 ///
 /// Replaces: matmul(Q, K^T), scale, softmax, matmul(attn, V) — ~6 dispatches -> 1.
+/// Also eliminates 3 `into_contiguous` copy dispatches per call (Q swap_dims + K/V cache slice).
 pub fn fused_attention(
     q: Tensor<Wgpu, 4>,
     k: Tensor<Wgpu, 4>,
     v: Tensor<Wgpu, 4>,
     scale: f32,
 ) -> Tensor<Wgpu, 4> {
-    let [_b, num_heads, _one, head_dim] = q.dims();
+    let [_b, _one, num_heads, head_dim] = q.dims();
     let [_b2, _h2, seq_len, _hd2] = k.dims();
 
-    // Reshape to 2D/3D for the kernel (drop batch and singleton dims)
-    let q = q.reshape([num_heads, head_dim]);
-    let k = k.reshape([num_heads, seq_len, head_dim]);
-    let v = v.reshape([num_heads, seq_len, head_dim]);
-
+    // Q: [1, 1, H, D] — contiguous after slice+reshape (B=S=1).
+    // Just reinterpret as [H, D] without copying.
     let cube_q: CubeTensor<WgpuRuntime> = q.into_primitive().tensor();
+    // Q is contiguous: shape [1,1,H,D] with strides [H*D, H*D, D, 1].
+    // The leading dims are size 1 so the "wrong" strides don't matter —
+    // the H*D elements are packed. Skip into_contiguous.
+    let q_handle = cube_q.handle.clone();
+
+    // K, V: [1, H, S, D] from KV cache. May be non-contiguous (cache slice
+    // has head_stride = max_len * D instead of S * D). Extract the actual
+    // head stride so the kernel can address correctly.
     let cube_k: CubeTensor<WgpuRuntime> = k.into_primitive().tensor();
     let cube_v: CubeTensor<WgpuRuntime> = v.into_primitive().tensor();
-
-    let cube_q = into_contiguous(cube_q);
-    let cube_k = into_contiguous(cube_k);
-    let cube_v = into_contiguous(cube_v);
+    // strides[1] = head stride in elements (stride for the H dimension)
+    let kv_head_stride = cube_k.strides[1];
+    let k_handle = cube_k.handle.clone();
+    let v_handle = cube_v.handle.clone();
 
     let client = cube_q.client.clone();
     let device = cube_q.device.clone();
@@ -619,20 +632,21 @@ pub fn fused_attention(
     let output_size = num_heads * head_dim;
     let output_handle = client.empty(output_size * 4);
 
-    // Info buffer: [num_heads, head_dim, seq_len, scale_bits]
-    let info: [u32; 4] = [
+    // Info buffer: [num_heads, head_dim, seq_len, scale_bits, kv_head_stride]
+    let info: [u32; 5] = [
         num_heads as u32,
         head_dim as u32,
         seq_len as u32,
         scale.to_bits(),
+        kv_head_stride as u32,
     ];
     let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
     let info_handle = client.create_from_slice(&info_bytes);
 
     let bindings = Bindings::new()
-        .with_buffer(cube_q.handle.clone().binding())
-        .with_buffer(cube_k.handle.clone().binding())
-        .with_buffer(cube_v.handle.clone().binding())
+        .with_buffer(q_handle.binding())
+        .with_buffer(k_handle.binding())
+        .with_buffer(v_handle.binding())
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
@@ -734,8 +748,8 @@ impl Q4Attention {
 
         let (q, k) = rope.apply(q, k, offset);
 
-        // [batch, heads, seq, head_dim]
-        let q = q.swap_dims(1, 2);
+        // K, V need [B, H, S, D] layout for KV cache storage.
+        // Q does NOT need swap_dims for fused_attention (saves 1 copy dispatch).
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -760,10 +774,13 @@ impl Q4Attention {
         };
 
         // Fused attention for single-token decode (generation mode).
-        // Replaces: Q@K^T, scale, causal_mask, softmax, @V — ~6 dispatches -> 1.
+        // Q is [B, S, H, D] (no swap_dims), K/V are [B, H, S, D] from cache.
+        // fused_attention handles both layouts and non-contiguous cache slices.
         let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
             fused_attention(q, k, v, self.scale)
         } else {
+            // Prefill path: need Q in [B, H, S, D] for standard matmul attention
+            let q = q.swap_dims(1, 2);
             let k_t = k.swap_dims(2, 3);
             let scores = q.matmul(k_t) * self.scale;
             let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
@@ -796,7 +813,7 @@ impl Q4Attention {
 
         let (q, k) = rope.apply(q, k, offset);
 
-        let q = q.swap_dims(1, 2);
+        // K, V need swap for cache; Q skips swap_dims for fused_attention
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -822,6 +839,8 @@ impl Q4Attention {
         let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
             fused_attention(q, k, v, self.scale)
         } else {
+            // Prefill path: need Q in [B, H, S, D]
+            let q = q.swap_dims(1, 2);
             let k_t = k.swap_dims(2, 3);
             let scores = q.matmul(k_t) * self.scale;
             let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);

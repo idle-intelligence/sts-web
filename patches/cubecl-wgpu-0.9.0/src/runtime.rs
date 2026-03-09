@@ -111,8 +111,10 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         #[cfg(test)]
         const DEFAULT_MAX_TASKS: usize = 1;
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_family = "wasm"))]
         const DEFAULT_MAX_TASKS: usize = 256;
+        #[cfg(all(not(test), not(target_family = "wasm")))]
+        const DEFAULT_MAX_TASKS: usize = 32;
 
         let tasks_max = match std::env::var("CUBECL_WGPU_MAX_TASKS") {
             Ok(value) => value

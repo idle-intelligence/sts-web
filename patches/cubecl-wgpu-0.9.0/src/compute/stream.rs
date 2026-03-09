@@ -18,8 +18,17 @@ use cubecl_core::{
 };
 use cubecl_ir::MemoryDeviceProperties;
 use cubecl_runtime::{logging::ServerLogger, timestamp_profiler::TimestampProfiler};
-use std::{future::Future, num::NonZero, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    hash::{Hash, Hasher},
+    num::NonZero,
+    pin::Pin,
+    sync::Arc,
+};
 use wgpu::ComputePipeline;
+
+const BIND_GROUP_CACHE_MAX: usize = 1024;
 
 #[derive(Debug)]
 enum Timings {
@@ -39,6 +48,9 @@ pub struct WgpuStream {
     encoder: wgpu::CommandEncoder,
     poll: WgpuPoll,
     submission_load: SubmissionLoad,
+    /// Cache of bind groups keyed by a hash of (pipeline pointer, buffer bindings).
+    /// Avoids calling `device.create_bind_group()` on every dispatch.
+    bind_group_cache: HashMap<u64, wgpu::BindGroup>,
 }
 
 impl WgpuStream {
@@ -86,6 +98,7 @@ impl WgpuStream {
             tasks_max,
             poll,
             submission_load: SubmissionLoad::default(),
+            bind_group_cache: HashMap::new(),
         }
     }
 
@@ -380,19 +393,34 @@ impl WgpuStream {
         self.tasks_count = 0;
     }
 
+    /// Compute a cache key for a bind group from pipeline identity and buffer bindings.
+    fn compute_bind_group_key(
+        pipeline: &Arc<ComputePipeline>,
+        resources: &[&WgpuResource],
+    ) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Pipeline identity: use Arc pointer address.
+        (Arc::as_ptr(pipeline) as usize).hash(&mut hasher);
+        // Each binding: hash buffer identity + offset + size.
+        for r in resources {
+            r.buffer.hash(&mut hasher);
+            r.offset.hash(&mut hasher);
+            r.size.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn register_pipeline<'a>(
         &mut self,
         pipeline: Arc<ComputePipeline>,
         resources: impl Iterator<Item = &'a WgpuResource>,
         dispatch: &CubeCount,
     ) {
-        let entries = resources
-            .enumerate()
-            .map(|(i, r)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: r.as_wgpu_bind_resource(),
-            })
-            .collect::<Vec<_>>();
+        // Collect resources so we can hash them and also create bind group entries.
+        let resources: Vec<&'a WgpuResource> = resources.collect();
+
+        // Compute a cache key from pipeline identity + buffer bindings.
+        let cache_key = Self::compute_bind_group_key(&pipeline, &resources);
 
         // Start a new compute pass if needed. The forget_lifetime allows
         // to store this with a 'static lifetime, but the compute pass must
@@ -419,15 +447,37 @@ impl WgpuStream {
 
         self.tasks_count += 1;
 
-        let group_layout = pipeline.get_bind_group_layout(0);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &group_layout,
-            entries: &entries,
-        });
-
         pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+
+        if let Some(cached_bg) = self.bind_group_cache.get(&cache_key) {
+            // Fast path: reuse cached bind group.
+            pass.set_bind_group(0, cached_bg, &[]);
+        } else {
+            // Slow path: create new bind group and cache it.
+            let entries: Vec<wgpu::BindGroupEntry<'_>> = resources
+                .iter()
+                .enumerate()
+                .map(|(i, r)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: r.as_wgpu_bind_resource(),
+                })
+                .collect();
+
+            let group_layout = pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &group_layout,
+                entries: &entries,
+            });
+
+            pass.set_bind_group(0, &bind_group, &[]);
+
+            // Evict entire cache if it grows too large.
+            if self.bind_group_cache.len() >= BIND_GROUP_CACHE_MAX {
+                self.bind_group_cache.clear();
+            }
+            self.bind_group_cache.insert(cache_key, bind_group);
+        }
 
         match dispatch.clone() {
             CubeCount::Static(x, y, z) => {

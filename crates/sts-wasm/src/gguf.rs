@@ -24,6 +24,29 @@ use cubecl::{CubeTask, Runtime};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ---------------------------------------------------------------------------
+// Subgroup feature detection
+// ---------------------------------------------------------------------------
+
+/// Set to `true` if the GPU supports subgroup operations (e.g. subgroupAdd).
+/// For WASM: set during `init_wgpu_device()`.
+/// For native macOS: defaults to true (Apple Silicon always supports subgroups).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(true);
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(false);
+
+/// Call during device init to enable subgroup-optimized kernels.
+pub fn set_subgroup_support(supported: bool) {
+    HAS_SUBGROUPS.store(supported, Ordering::Relaxed);
+}
+
+/// Check if subgroup-optimized kernels should be used.
+pub fn has_subgroup_support() -> bool {
+    HAS_SUBGROUPS.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -766,8 +789,25 @@ impl KernelSource for Q4KMatvecKernel {
     }
 }
 
+/// Subgroup-optimized Q4_K matvec kernel for M=1.
+/// Each subgroup (32 threads on Apple Silicon) cooperatively computes one output row,
+/// splitting K across threads and reducing with subgroupAdd().
+/// Falls back to Q4KMatvecKernel when subgroups are unavailable.
+struct Q4KMatvecSubgroupKernel;
+
+impl KernelSource for Q4KMatvecSubgroupKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4k_matvec_subgroup.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
 /// Fused Q4_K dequant+matmul on GPU.
 /// For M=1 (single-token generation), dispatches the cooperative matvec kernel.
+/// Uses subgroup-optimized variant when available.
 /// For M>1 (prefill), uses the naive one-thread-per-output kernel.
 pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
@@ -798,18 +838,34 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
         .with_buffer(info_handle.binding());
 
     if m == 1 {
-        // Matvec with shared-memory input caching: 256 threads per workgroup,
-        // each thread computes one output element, input vector cached in shared mem.
-        let kernel = SourceKernel::new(Q4KMatvecKernel, CubeDim::new_1d(256));
-        let wg_x = n.div_ceil(256) as u32;
-        let wg_y = b as u32;
-        client
-            .launch(
-                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
-                CubeCount::new_2d(wg_x, wg_y),
-                bindings,
-            )
-            .expect("Q4_K matvec kernel launch failed");
+        if has_subgroup_support() {
+            // Subgroup-optimized: each subgroup (32 threads) computes one output row.
+            // 256 threads / 32 = 8 rows per workgroup.
+            const SUBGROUP_SIZE: usize = 32;
+            let rows_per_wg = 256 / SUBGROUP_SIZE;
+            let kernel = SourceKernel::new(Q4KMatvecSubgroupKernel, CubeDim::new_1d(256));
+            let wg_x = n.div_ceil(rows_per_wg) as u32;
+            let wg_y = b as u32;
+            client
+                .launch(
+                    Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                    CubeCount::new_2d(wg_x, wg_y),
+                    bindings,
+                )
+                .expect("Q4_K subgroup matvec kernel launch failed");
+        } else {
+            // Fallback: shared-memory input caching, one thread per output element.
+            let kernel = SourceKernel::new(Q4KMatvecKernel, CubeDim::new_1d(256));
+            let wg_x = n.div_ceil(256) as u32;
+            let wg_y = b as u32;
+            client
+                .launch(
+                    Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                    CubeCount::new_2d(wg_x, wg_y),
+                    bindings,
+                )
+                .expect("Q4_K matvec kernel launch failed");
+        }
     } else {
         // Naive kernel: one thread per output element
         let kernel = SourceKernel::new(
@@ -1103,17 +1159,19 @@ pub async fn gpu_read_token_tensor(t: Tensor<Wgpu, 1>) -> u32 {
 /// Each tensor is a 1-element f32 tensor whose bits encode a u32 token ID.
 /// Returns the token IDs in order.
 pub async fn gpu_read_token_tensors(tensors: Vec<Tensor<Wgpu, 1>>) -> Vec<u32> {
-    let mut tokens = Vec::with_capacity(tensors.len());
-    for t in tensors {
-        let data: Vec<f32> = t
-            .into_data_async()
-            .await
-            .expect("GPU readback failed")
-            .to_vec()
-            .expect("token readback to_vec failed");
-        tokens.push(data[0].to_bits());
+    if tensors.is_empty() {
+        return Vec::new();
     }
-    tokens
+    // Concatenate all 1-element tensors into a single [N] tensor on GPU,
+    // then do one readback instead of N separate ones.
+    let stacked = Tensor::cat(tensors, 0);
+    let data: Vec<f32> = stacked
+        .into_data_async()
+        .await
+        .expect("GPU readback failed")
+        .to_vec()
+        .expect("token readback to_vec failed");
+    data.iter().map(|v| v.to_bits()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1194,12 @@ pub struct DepthGpuBuffers {
     /// Pre-allocated argmax info handles per step (avoids create_from_slice in hot loop).
     /// Each contains a single u32 = vocab_size for that step's output head.
     argmax_info_handles: Vec<Handle>,
+    /// Pre-allocated output handle for step 0 text embedding GPU lookup.
+    text_emb_output_handle: Option<Handle>,
+    /// Info handle for text embedding GPU lookup: [dim, bytes_per_row, vocab_size].
+    text_emb_info_handle: Option<Handle>,
+    /// GPU handle to the text embedding Q4 data (if uploaded).
+    text_emb_q4_handle: Option<Handle>,
     /// Embedding dimension.
     pub dim: usize,
     /// Device for creating tensors from handles.
@@ -1147,11 +1211,14 @@ impl DepthGpuBuffers {
     ///
     /// `output_vocab_sizes`: per-step output vocab size (e.g. 32000 for text, 2048 for audio).
     /// Used to pre-allocate argmax info handles, avoiding `create_from_slice` in the hot loop.
+    /// `text_emb`: optional text embedding store — if provided and uploaded to GPU,
+    /// enables fully GPU-side text embedding at step 0 (no CPU readback needed).
     pub fn new(
         num_steps: usize,
         dim: usize,
         audio_embs: &[EmbeddingStore],
         output_vocab_sizes: &[usize],
+        text_emb: Option<&EmbeddingStore>,
         device: &WgpuDevice,
     ) -> Self {
         let client = WgpuRuntime::client(device);
@@ -1191,11 +1258,34 @@ impl DepthGpuBuffers {
             })
             .collect();
 
+        // Pre-allocate text embedding GPU lookup buffers (step 0).
+        // This allows step 0 to use GPU embedding lookup with the argmax handle,
+        // eliminating the CPU readback stall between temporal and depth.
+        let (text_emb_output_handle, text_emb_info_handle, text_emb_q4_handle) =
+            if let Some(emb) = text_emb {
+                if let Some((q4_handle, _dim, vocab_size, bytes_per_row, _dev)) = emb.gpu_lookup_params_opt() {
+                    let output_handle = client.empty(dim * 4);
+                    let mut info_bytes = Vec::with_capacity(12);
+                    info_bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+                    info_bytes.extend_from_slice(&(bytes_per_row as u32).to_le_bytes());
+                    info_bytes.extend_from_slice(&(vocab_size as u32).to_le_bytes());
+                    let info_handle = client.create_from_slice(&info_bytes);
+                    (Some(output_handle), Some(info_handle), Some(q4_handle.clone()))
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
+
         Self {
             token_handles,
             embed_output_handles,
             embed_info_handles,
             argmax_info_handles,
+            text_emb_output_handle,
+            text_emb_info_handle,
+            text_emb_q4_handle,
             dim,
             device: device.clone(),
         }
@@ -1365,6 +1455,48 @@ impl DepthGpuBuffers {
             DType::F32,
         );
         Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+    }
+
+    /// GPU-side text embedding lookup for step 0 using a token handle.
+    ///
+    /// Uses the pre-allocated text embedding output buffer and the uploaded
+    /// text embedding Q4 data. The `token_handle` is the argmax/sampling
+    /// result handle from temporal — no CPU readback needed.
+    ///
+    /// Returns Some(tensor [1, 1, dim]) if GPU text embedding is available,
+    /// None if text_emb was not uploaded to GPU.
+    pub fn gpu_text_embed_lookup(&self, token_handle: &Handle) -> Option<Tensor<Wgpu, 3>> {
+        let output_handle = self.text_emb_output_handle.as_ref()?;
+        let info_handle = self.text_emb_info_handle.as_ref()?;
+        let q4_handle = self.text_emb_q4_handle.as_ref()?;
+
+        let client = WgpuRuntime::client(&self.device);
+
+        let bindings = Bindings::new()
+            .with_buffer(token_handle.clone().binding())
+            .with_buffer(q4_handle.clone().binding())
+            .with_buffer(output_handle.clone().binding())
+            .with_buffer(info_handle.clone().binding());
+
+        let kernel = SourceKernel::new(EmbedQ4Kernel, CubeDim::new_1d(256));
+        let num_workgroups = (self.dim as u32).div_ceil(256);
+
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_1d(num_workgroups),
+                bindings,
+            )
+            .expect("Text embedding Q4 lookup kernel launch failed");
+
+        let output_tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1, 1, self.dim]),
+            output_handle.clone(),
+            DType::F32,
+        );
+        Some(Tensor::from_primitive(TensorPrimitive::Float(output_tensor)))
     }
 
     /// Collect all token tensors for batch readback.

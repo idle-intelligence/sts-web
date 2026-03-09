@@ -159,6 +159,87 @@ impl MultiLinearAttention {
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
         self.out_projs[step_idx].forward(out)
     }
+
+    /// Forward with fused residual addition in the out_proj matmul.
+    pub fn forward_with_cache_fused_residual(
+        &self,
+        x: Tensor<Wgpu, 3>,
+        residual: Tensor<Wgpu, 3>,
+        step_idx: usize,
+        cache: &mut KVCache,
+    ) -> Tensor<Wgpu, 3> {
+        let [batch, seq_len, _] = x.dims();
+        let offset = cache.offset();
+
+        let qkv = self.in_projs[step_idx].forward(x);
+        let [b, s, _] = qkv.dims();
+        let kv_dim = self.n_kv_heads * self.head_dim;
+
+        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
+        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
+        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
+
+        let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+
+        let q = q.swap_dims(1, 2);
+        let k = k.swap_dims(1, 2);
+        let v = v.swap_dims(1, 2);
+
+        let (k, v) = cache.update(k, v);
+        let total_seq_len = cache.seq_len();
+
+        let (k, v) = if self.n_heads != self.n_kv_heads {
+            let repeat_factor = self.n_heads / self.n_kv_heads;
+            let [b, nkv, s, hd] = k.dims();
+            let k = k
+                .unsqueeze_dim::<5>(2)
+                .repeat_dim(2, repeat_factor)
+                .reshape([b, nkv * repeat_factor, s, hd]);
+            let v = v
+                .unsqueeze_dim::<5>(2)
+                .repeat_dim(2, repeat_factor)
+                .reshape([b, nkv * repeat_factor, s, hd]);
+            (k, v)
+        } else {
+            (k, v)
+        };
+
+        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            fused_attention(q, k, v, self.scale)
+        } else {
+            let k_t = k.swap_dims(2, 3);
+            let scores = q.matmul(k_t) * self.scale;
+
+            let scores = if seq_len > 1 {
+                let device = scores.device();
+                let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
+                for i in 0..seq_len {
+                    let actual_pos = offset + i;
+                    for j in 0..total_seq_len {
+                        if j > actual_pos {
+                            mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
+                let mask: Tensor<Wgpu, 4> = mask
+                    .reshape([seq_len, total_seq_len])
+                    .unsqueeze_dim::<3>(0)
+                    .unsqueeze_dim(0);
+                scores + mask
+            } else {
+                scores
+            };
+
+            let attn = softmax(scores, 3);
+            attn.matmul(v)
+        };
+        let out = out.swap_dims(1, 2);
+        let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        self.out_projs[step_idx].forward_with_residual(out, residual)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +270,13 @@ impl MultiLinearFeedForward {
         let combined = self.linear_ins[step_idx].forward(x);
         let activated = fused_swiglu(combined);
         self.linear_outs[step_idx].forward(activated)
+    }
+
+    /// Forward with fused residual addition in the linear_out matmul.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>, step_idx: usize) -> Tensor<Wgpu, 3> {
+        let combined = self.linear_ins[step_idx].forward(x);
+        let activated = fused_swiglu(combined);
+        self.linear_outs[step_idx].forward_with_residual(activated, residual)
     }
 }
 
@@ -227,15 +315,15 @@ impl DepthTransformerBlock {
         step_idx: usize,
         cache: &mut KVCache,
     ) -> Tensor<Wgpu, 3> {
+        // Fuse residual addition into out_proj matmul (saves 1 dispatch)
         let residual = x.clone();
         let x = self.norm1.forward(x);
-        let x = self.attention.forward_with_cache(x, step_idx, cache);
-        let x = x + residual;
+        let x = self.attention.forward_with_cache_fused_residual(x, residual, step_idx, cache);
 
+        // Fuse residual addition into linear_out matmul (saves 1 dispatch)
         let residual = x.clone();
         let x = self.norm2.forward(x);
-        let x = self.ffn.forward(x, step_idx);
-        x + residual
+        self.ffn.forward_with_residual(x, residual, step_idx)
     }
 }
 

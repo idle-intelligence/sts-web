@@ -589,6 +589,15 @@ impl Q4KLinear {
             None => out,
         }
     }
+
+    /// Forward with fused residual addition: output = x @ W^T + residual.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        let out = q4k_matmul_with_residual(x, &self.weights, residual);
+        match &self.bias {
+            Some(bias) => out + bias.clone().unsqueeze::<3>(),
+            None => out,
+        }
+    }
 }
 
 /// A dense (F32) linear layer for precision-sensitive weights.
@@ -621,6 +630,16 @@ impl Linear {
             Linear::Q4(l) => l.forward(x),
             Linear::Q4K(l) => l.forward(x),
             Linear::Dense(l) => l.forward(x),
+        }
+    }
+
+    /// Forward with fused residual addition. Only Q4K uses the fused kernel;
+    /// Q4 and Dense fall back to separate matmul + add.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        match self {
+            Linear::Q4K(l) => l.forward_with_residual(x, residual),
+            Linear::Q4(l) => l.forward(x) + residual,
+            Linear::Dense(l) => l.forward(x) + residual,
         }
     }
 }
@@ -728,9 +747,24 @@ impl KernelSource for Q4KMatmulNaiveKernel {
 /// Threads cooperatively tile along K with shared memory reduction.
 struct Q4KMatvecKernel;
 
+/// Variant of Q4KMatvecKernel that fuses residual addition into the output:
+///   output[n] = matmul_result[n] + residual[n]
+/// Eliminates a separate elementwise add dispatch per residual connection.
+struct Q4KMatvecResaddKernel;
+
 impl KernelSource for Q4KMatvecKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("wgsl/shader_q4k_matvec.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+impl KernelSource for Q4KMatvecResaddKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4k_matvec_resadd.wgsl"))
     }
 
     fn id(&self) -> KernelId {
@@ -801,6 +835,84 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
             )
             .expect("Q4_K naive matmul kernel launch failed");
     }
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, m, n]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
+/// Q4_K matmul with fused residual addition: output = input @ weights^T + residual.
+///
+/// Only uses the fused kernel for M=1 (single-token generation). For M>1 (prefill),
+/// falls back to separate matmul + add since the naive kernel doesn't support fusion.
+pub fn q4k_matmul_with_residual(
+    input: Tensor<Wgpu, 3>,
+    weights: &Q4KTensor,
+    residual: Tensor<Wgpu, 3>,
+) -> Tensor<Wgpu, 3> {
+    let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    assert_eq!(cube_input.shape.num_dims(), 3, "Input must be 3D [B, M, K]");
+    let b = cube_input.shape.dims[0];
+    let m = cube_input.shape.dims[1];
+    let k = cube_input.shape.dims[2];
+    let [n, wk] = weights.shape();
+    assert_eq!(
+        k, wk,
+        "K dimension mismatch: input has {k}, weights have {wk}"
+    );
+
+    if m != 1 {
+        // Prefill path: can't fuse, do matmul + add separately
+        let result = q4k_matmul(
+            Tensor::from_primitive(TensorPrimitive::Float(
+                CubeTensor::new_contiguous(
+                    cube_input.client.clone(),
+                    cube_input.device.clone(),
+                    burn::prelude::Shape::from(vec![b, m, k]),
+                    cube_input.handle.clone(),
+                    DType::F32,
+                ),
+            )),
+            weights,
+        );
+        return result + residual;
+    }
+
+    let cube_residual: CubeTensor<WgpuRuntime> = residual.into_primitive().tensor();
+    let cube_residual = into_contiguous(cube_residual);
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+    let blocks_per_row = k / 256;
+
+    let output_handle = client.empty(b * m * n * 4);
+
+    let info_handle = weights.get_or_create_info(b, m, k, n, blocks_per_row, &device);
+
+    let bindings = Bindings::new()
+        .with_buffer(weights.handle.clone().binding())
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding())
+        .with_buffer(cube_residual.handle.clone().binding());
+
+    let kernel = SourceKernel::new(Q4KMatvecResaddKernel, CubeDim::new_1d(256));
+    let wg_x = n.div_ceil(256) as u32;
+    let wg_y = b as u32;
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_2d(wg_x, wg_y),
+            bindings,
+        )
+        .expect("Q4_K matvec+resadd kernel launch failed");
 
     let output_tensor = CubeTensor::new_contiguous(
         client,

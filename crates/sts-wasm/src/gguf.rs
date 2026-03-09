@@ -1232,31 +1232,32 @@ impl DepthGpuBuffers {
 
         let result_handle = &self.token_handles[step];
 
-        // Penalty tokens buffer (still per-call since content varies)
-        let penalty_bytes: Vec<u8> = if past_tokens.is_empty() {
-            vec![0xFF; 4]
+        // Build penalty tokens (deduplicated)
+        let (penalty_bytes, num_penalty_tokens) = if past_tokens.is_empty() {
+            (vec![0xFF; 4], 0u32)
         } else {
             let seen: std::collections::HashSet<u32> = past_tokens.iter().copied().collect();
-            let unique: Vec<u32> = seen.into_iter().collect();
-            unique.iter().flat_map(|t| t.to_le_bytes()).collect()
+            let bytes: Vec<u8> = seen.iter().flat_map(|t| t.to_le_bytes()).collect();
+            let count = seen.len() as u32;
+            (bytes, count)
         };
-        let num_penalty_tokens = if past_tokens.is_empty() {
-            0u32
-        } else {
-            let seen: std::collections::HashSet<u32> = past_tokens.iter().copied().collect();
-            seen.len() as u32
-        };
-        let penalty_handle = client.create_from_slice(&penalty_bytes);
 
+        // Pack penalty tokens + info into a single buffer to avoid two
+        // create_from_slice calls (each triggers a buffer allocation).
+        let penalty_len = penalty_bytes.len();
         let rand_val = crate::model::pseudo_random();
-        let mut info_bytes = Vec::with_capacity(24);
-        info_bytes.extend_from_slice(&(v as u32).to_le_bytes());
-        info_bytes.extend_from_slice(&(top_k as u32).to_le_bytes());
-        info_bytes.extend_from_slice(&temperature.to_bits().to_le_bytes());
-        info_bytes.extend_from_slice(&penalty.to_bits().to_le_bytes());
-        info_bytes.extend_from_slice(&rand_val.to_bits().to_le_bytes());
-        info_bytes.extend_from_slice(&num_penalty_tokens.to_le_bytes());
-        let info_handle = client.create_from_slice(&info_bytes);
+        let mut combined = Vec::with_capacity(penalty_len + 24);
+        combined.extend_from_slice(&penalty_bytes);
+        combined.extend_from_slice(&(v as u32).to_le_bytes());
+        combined.extend_from_slice(&(top_k as u32).to_le_bytes());
+        combined.extend_from_slice(&temperature.to_bits().to_le_bytes());
+        combined.extend_from_slice(&penalty.to_bits().to_le_bytes());
+        combined.extend_from_slice(&rand_val.to_bits().to_le_bytes());
+        combined.extend_from_slice(&num_penalty_tokens.to_le_bytes());
+        let combined_handle = client.create_from_slice(&combined);
+
+        let penalty_handle = combined_handle.clone().offset_end(penalty_len as u64);
+        let info_handle = combined_handle.offset_start(penalty_len as u64);
 
         let bindings = Bindings::new()
             .with_buffer(cube_input.handle.clone().binding())

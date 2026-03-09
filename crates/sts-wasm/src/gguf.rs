@@ -1274,22 +1274,20 @@ impl DepthGpuBuffers {
             (bytes, count)
         };
 
-        // Pack penalty tokens + info into a single buffer to avoid two
-        // create_from_slice calls (each triggers a buffer allocation).
-        let penalty_len = penalty_bytes.len();
-        let rand_val = crate::model::pseudo_random();
-        let mut combined = Vec::with_capacity(penalty_len + 24);
-        combined.extend_from_slice(&penalty_bytes);
-        combined.extend_from_slice(&(v as u32).to_le_bytes());
-        combined.extend_from_slice(&(top_k as u32).to_le_bytes());
-        combined.extend_from_slice(&temperature.to_bits().to_le_bytes());
-        combined.extend_from_slice(&penalty.to_bits().to_le_bytes());
-        combined.extend_from_slice(&rand_val.to_bits().to_le_bytes());
-        combined.extend_from_slice(&num_penalty_tokens.to_le_bytes());
-        let combined_handle = client.create_from_slice(&combined);
+        // Use two separate buffers: WebGPU requires 256-byte minimum alignment
+        // for storage buffer bindings, so splitting a combined buffer with
+        // offset_start/offset_end at non-256-byte boundaries causes validation errors.
+        let penalty_handle = client.create_from_slice(&penalty_bytes);
 
-        let penalty_handle = combined_handle.clone().offset_end(penalty_len as u64);
-        let info_handle = combined_handle.offset_start(penalty_len as u64);
+        let rand_val = crate::model::pseudo_random();
+        let mut info_bytes = Vec::with_capacity(24);
+        info_bytes.extend_from_slice(&(v as u32).to_le_bytes());
+        info_bytes.extend_from_slice(&(top_k as u32).to_le_bytes());
+        info_bytes.extend_from_slice(&temperature.to_bits().to_le_bytes());
+        info_bytes.extend_from_slice(&penalty.to_bits().to_le_bytes());
+        info_bytes.extend_from_slice(&rand_val.to_bits().to_le_bytes());
+        info_bytes.extend_from_slice(&num_penalty_tokens.to_le_bytes());
+        let info_handle = client.create_from_slice(&info_bytes);
 
         let bindings = Bindings::new()
             .with_buffer(cube_input.handle.clone().binding())

@@ -526,15 +526,21 @@ impl DepthTransformer {
     ) -> Vec<u32> {
         let gpu = self.gpu_buffers.as_ref().expect("GPU buffers not initialized");
 
+        // Pre-compute all input projections before the autoregressive loop.
+        // temporal_hidden doesn't change between steps, so we can batch all
+        // matmul dispatches upfront for better GPU pipelining.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
         // Step 0: text token embedding (CPU path — text_emb is too large for GPU)
-        let projected = self.input_projs[0].forward(temporal_hidden.clone());
         let mut emb_buf = vec![0.0f32; dim];
         self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
         let emb_tensor = Tensor::<Wgpu, 3>::from_data(
             burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
             &self.device,
         );
-        let x = projected + emb_tensor;
+        let x = projected[0].clone() + emb_tensor;
 
         let mut h = x;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -556,9 +562,8 @@ impl DepthTransformer {
         }
 
         // Steps 1..num_steps: audio embedding via GPU lookup
+        #[allow(clippy::needless_range_loop)]
         for step in 1..num_steps {
-            let projected = self.input_projs[step].forward(temporal_hidden.clone());
-
             // GPU-side embedding lookup for previous step's token
             let emb_idx = step - 1;
             let emb_tensor = if emb_idx < self.audio_embs.len() {
@@ -571,7 +576,7 @@ impl DepthTransformer {
                 Tensor::<Wgpu, 3>::zeros([1, 1, dim], &self.device)
             };
 
-            let x = projected + emb_tensor;
+            let x = projected[step].clone() + emb_tensor;
 
             let mut h = x;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -613,12 +618,17 @@ impl DepthTransformer {
         num_steps: usize,
         dim: usize,
     ) -> Vec<u32> {
+        // Pre-compute all input projections before the autoregressive loop.
+        // temporal_hidden doesn't change between steps, so we can batch all
+        // matmul dispatches upfront for better GPU pipelining.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
         let mut audio_tokens = Vec::with_capacity(num_steps);
         let mut prev_token: u32 = text_token;
 
         for step in 0..num_steps {
-            let projected = self.input_projs[step].forward(temporal_hidden.clone());
-
             let mut emb_buf = vec![0.0f32; dim];
             if step == 0 {
                 self.text_emb.embed_id_add_cpu(prev_token, &mut emb_buf);
@@ -634,7 +644,7 @@ impl DepthTransformer {
                 &self.device,
             );
 
-            let x = projected + emb_tensor;
+            let x = projected[step].clone() + emb_tensor;
 
             let mut h = x;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -714,14 +724,18 @@ impl DepthTransformer {
     ) -> (Vec<u32>, Vec<DepthStepLog>) {
         let num_steps = self.config.depth_num_steps;
         let dim = self.config.depth_hidden_size;
+
+        // Pre-compute all input projections before the autoregressive loop.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
         let mut audio_tokens = Vec::with_capacity(num_steps);
         let mut step_logs = Vec::with_capacity(num_steps);
 
         let mut prev_token: u32 = text_token;
 
         for step in 0..num_steps {
-            // Project temporal hidden to depth dim
-            let projected = self.input_projs[step].forward(temporal_hidden.clone());
 
             // Add embedding of the conditioning token
             let mut emb_buf = vec![0.0f32; dim];
@@ -739,7 +753,7 @@ impl DepthTransformer {
                 &self.device,
             );
 
-            let x = projected + emb_tensor;
+            let x = projected[step].clone() + emb_tensor;
 
             // Log input (projected + embedding)
             let flat: Tensor<Wgpu, 1> = x.clone().reshape([dim]);

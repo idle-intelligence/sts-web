@@ -177,6 +177,172 @@ impl RoPE {
         );
         (q_rot, k_rot)
     }
+
+    /// Apply RoPE to Q (in-place) and write rotated K directly to KV cache.
+    ///
+    /// q, k shape: [batch, seq, heads, head_dim]
+    /// Returns: rotated Q tensor. K is written directly to cache_k_handle.
+    /// 2 GPU dispatches total (1 for Q RoPE, 1 for K RoPE+cache write).
+    pub fn apply_with_cache_write(
+        &self,
+        q: Tensor<Wgpu, 4>,
+        k: &Tensor<Wgpu, 4>,
+        offset: usize,
+        cache_k_handle: &Handle,
+        max_len: usize,
+    ) -> Tensor<Wgpu, 4> {
+        let q_rot = fused_rope_inplace(
+            q,
+            &self.cos_handle,
+            &self.sin_handle,
+            offset,
+            self.half_dim,
+        );
+        fused_rope_cache_write(
+            k,
+            &self.cos_handle,
+            &self.sin_handle,
+            cache_k_handle,
+            offset,
+            self.half_dim,
+            max_len,
+        );
+        q_rot
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused RoPE + KV Cache Write (K) and V Cache Write kernels
+// ---------------------------------------------------------------------------
+
+struct RopeCacheWriteKernelSource;
+
+impl KernelSource for RopeCacheWriteKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_rope_cache_write.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+struct CacheWriteKernelSource;
+
+impl KernelSource for CacheWriteKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_cache_write.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused RoPE rotation + KV cache write for K.
+///
+/// Reads K from [B, S, H, D] layout, applies RoPE rotation, and writes
+/// directly into the KV cache buffer in [B, H, max_len, D] layout.
+/// Replaces: fused_rope_inplace(K) + swap_dims + into_contiguous + slice_assign.
+fn fused_rope_cache_write(
+    k: &Tensor<Wgpu, 4>,
+    cos_handle: &Handle,
+    sin_handle: &Handle,
+    cache_handle: &Handle,
+    offset: usize,
+    half_dim: usize,
+    max_len: usize,
+) {
+    let cube_k: CubeTensor<WgpuRuntime> = k.clone().into_primitive().tensor();
+    let cube_k = into_contiguous(cube_k);
+
+    let b = cube_k.shape.dims[0];
+    let s = cube_k.shape.dims[1];
+    let h = cube_k.shape.dims[2];
+
+    let total_elements = b * s * h * half_dim;
+
+    let client = cube_k.client.clone();
+
+    // Info buffer: [pos_offset, B, S, H, half_D, max_len]
+    let info: [u32; 6] = [
+        offset as u32,
+        b as u32,
+        s as u32,
+        h as u32,
+        half_dim as u32,
+        max_len as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle_buf = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_k.handle.clone().binding())
+        .with_buffer(cos_handle.clone().binding())
+        .with_buffer(sin_handle.clone().binding())
+        .with_buffer(cache_handle.clone().binding())
+        .with_buffer(info_handle_buf.binding());
+
+    let kernel = SourceKernel::new(RopeCacheWriteKernelSource, CubeDim::new_1d(256));
+
+    let num_workgroups = (total_elements as u32).div_ceil(256);
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("RoPE cache write kernel launch failed");
+}
+
+/// Direct V cache write: copies V from [B, S, H, D] into cache [B, H, max_len, D].
+///
+/// Replaces: swap_dims + into_contiguous + slice_assign for V.
+pub fn gpu_cache_write_v(
+    v: &Tensor<Wgpu, 4>,
+    cache_handle: &Handle,
+    offset: usize,
+    max_len: usize,
+) {
+    let cube_v: CubeTensor<WgpuRuntime> = v.clone().into_primitive().tensor();
+    let cube_v = into_contiguous(cube_v);
+
+    let b = cube_v.shape.dims[0];
+    let s = cube_v.shape.dims[1];
+    let h = cube_v.shape.dims[2];
+    let d = cube_v.shape.dims[3];
+
+    let total_elements = b * s * h * d;
+
+    let client = cube_v.client.clone();
+
+    // Info buffer: [pos_offset, B, S, H, D, max_len]
+    let info: [u32; 6] = [
+        offset as u32,
+        b as u32,
+        s as u32,
+        h as u32,
+        d as u32,
+        max_len as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle_buf = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_v.handle.clone().binding())
+        .with_buffer(cache_handle.clone().binding())
+        .with_buffer(info_handle_buf.binding());
+
+    let kernel = SourceKernel::new(CacheWriteKernelSource, CubeDim::new_1d(256));
+
+    let num_workgroups = (total_elements as u32).div_ceil(256);
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("V cache write kernel launch failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +419,57 @@ impl KVCache {
         self.v = Some(v_buf);
 
         result
+    }
+
+    /// Ensure cache buffers are allocated and return GPU handles + write position.
+    ///
+    /// Used by the fused RoPE+cache write path: the kernel writes directly
+    /// into the cache buffer, so we need the raw GPU handle.
+    pub fn ensure_allocated(&mut self, batch: usize) -> (Handle, Handle, usize) {
+        if self.k.is_none() {
+            self.k = Some(Tensor::zeros(
+                [batch, self.n_kv_heads, self.max_len, self.head_dim],
+                &self.device,
+            ));
+            self.v = Some(Tensor::zeros(
+                [batch, self.n_kv_heads, self.max_len, self.head_dim],
+                &self.device,
+            ));
+        }
+        let k_handle = self.k.as_ref().unwrap().clone().into_primitive().tensor().handle;
+        let v_handle = self.v.as_ref().unwrap().clone().into_primitive().tensor().handle;
+        (k_handle, v_handle, self.write_pos)
+    }
+
+    /// Advance bookkeeping after fused kernel has written K/V directly.
+    ///
+    /// Call this AFTER the fused RoPE+cache write and V cache write kernels
+    /// have written data into the cache buffers. This only updates the
+    /// position counters without doing any data copy.
+    ///
+    /// `num_steps`: number of sequence positions written (usually 1 for generation).
+    pub fn advance(&mut self, num_steps: usize) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
+        for _ in 0..num_steps {
+            self.write_pos = (self.write_pos + 1) % self.max_len;
+            self.offset += 1;
+            self.len = (self.len + 1).min(self.max_len);
+        }
+
+        let k_buf = self.k.as_ref().unwrap();
+        let v_buf = self.v.as_ref().unwrap();
+        let [b, h, _, hd] = k_buf.dims();
+
+        if self.len < self.max_len {
+            let k_view = k_buf.clone().slice([0..b, 0..h, 0..self.len, 0..hd]);
+            let v_view = v_buf.clone().slice([0..b, 0..h, 0..self.len, 0..hd]);
+            (k_view, v_view)
+        } else {
+            (k_buf.clone(), v_buf.clone())
+        }
+    }
+
+    pub fn max_len(&self) -> usize {
+        self.max_len
     }
 
     pub fn offset(&self) -> usize {
@@ -746,10 +963,32 @@ impl Q4Attention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
+        // Generation mode (S=1, no GQA): use fused RoPE+cache write path.
+        // Saves 4 dispatches per layer (swap_dims+contiguous+slice_assign for K and V).
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            // Fused: RoPE(K) + write to K cache in one dispatch
+            let q = rope.apply_with_cache_write(
+                q, &k, offset, &k_cache_handle, max_len,
+            );
+            // Write V directly to V cache (no RoPE needed)
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            // Advance cache bookkeeping (no data copy)
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_proj.forward(out);
+        }
+
+        // Prefill path: use original RoPE + cache.update
         let (q, k) = rope.apply(q, k, offset);
 
-        // K, V need [B, H, S, D] layout for KV cache storage.
-        // Q does NOT need swap_dims for fused_attention (saves 1 copy dispatch).
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -773,20 +1012,13 @@ impl Q4Attention {
             (k, v)
         };
 
-        // Fused attention for single-token decode (generation mode).
-        // Q is [B, S, H, D] (no swap_dims), K/V are [B, H, S, D] from cache.
-        // fused_attention handles both layouts and non-contiguous cache slices.
-        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
-            fused_attention(q, k, v, self.scale)
-        } else {
-            // Prefill path: need Q in [B, H, S, D] for standard matmul attention
-            let q = q.swap_dims(1, 2);
-            let k_t = k.swap_dims(2, 3);
-            let scores = q.matmul(k_t) * self.scale;
-            let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
-            let attn = softmax(scores, 3);
-            attn.matmul(v)
-        };
+        // Prefill path: need Q in [B, H, S, D] for standard matmul attention
+        let q = q.swap_dims(1, 2);
+        let k_t = k.swap_dims(2, 3);
+        let scores = q.matmul(k_t) * self.scale;
+        let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
+        let attn = softmax(scores, 3);
+        let out = attn.matmul(v);
 
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
@@ -811,9 +1043,28 @@ impl Q4Attention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
+        // Generation mode (S=1, no GQA): use fused RoPE+cache write path.
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            let q = rope.apply_with_cache_write(
+                q, &k, offset, &k_cache_handle, max_len,
+            );
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_proj.forward_with_residual(out, residual);
+        }
+
+        // Prefill path
         let (q, k) = rope.apply(q, k, offset);
 
-        // K, V need swap for cache; Q skips swap_dims for fused_attention
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -836,17 +1087,13 @@ impl Q4Attention {
             (k, v)
         };
 
-        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
-            fused_attention(q, k, v, self.scale)
-        } else {
-            // Prefill path: need Q in [B, H, S, D]
-            let q = q.swap_dims(1, 2);
-            let k_t = k.swap_dims(2, 3);
-            let scores = q.matmul(k_t) * self.scale;
-            let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
-            let attn = softmax(scores, 3);
-            attn.matmul(v)
-        };
+        // Prefill path: need Q in [B, H, S, D]
+        let q = q.swap_dims(1, 2);
+        let k_t = k.swap_dims(2, 3);
+        let scores = q.matmul(k_t) * self.scale;
+        let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
+        let attn = softmax(scores, 3);
+        let out = attn.matmul(v);
 
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);

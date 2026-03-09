@@ -25,7 +25,7 @@ use crate::gguf::{
     gpu_argmax, gpu_read_token_tensors,
     DepthGpuBuffers, EmbeddingStore, Linear,
 };
-use crate::model::{fused_attention, fused_swiglu, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::model::{fused_attention, fused_swiglu, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
@@ -98,7 +98,26 @@ impl MultiLinearAttention {
 
         // No positional embedding for depth transformer (depformer_pos_emb="none" in Moshi)
 
-        // K, V need swap for cache; Q skips swap_dims for fused_attention
+        // Generation mode (S=1, no GQA): fused cache write path.
+        // Saves 4 dispatches per layer (swap_dims+contiguous+slice_assign for K and V).
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            // Write K and V directly to cache (no RoPE for depth transformer)
+            gpu_cache_write_v(&k, &k_cache_handle, offset, max_len);
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_projs[step_idx].forward(out);
+        }
+
+        // Prefill path
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -122,41 +141,35 @@ impl MultiLinearAttention {
             (k, v)
         };
 
-        // Fused attention for single-token decode (generation mode).
-        // Q is [B, S, H, D] (no swap_dims), K/V are [B, H, S, D] from cache.
-        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
-            fused_attention(q, k, v, self.scale)
-        } else {
-            // Prefill path: need Q in [B, H, S, D]
-            let q = q.swap_dims(1, 2);
-            let k_t = k.swap_dims(2, 3);
-            let scores = q.matmul(k_t) * self.scale;
+        // Prefill path: need Q in [B, H, S, D]
+        let q = q.swap_dims(1, 2);
+        let k_t = k.swap_dims(2, 3);
+        let scores = q.matmul(k_t) * self.scale;
 
-            // Causal mask for depth steps (only needed if seq_len > 1)
-            let scores = if seq_len > 1 {
-                let device = scores.device();
-                let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
-                for i in 0..seq_len {
-                    let actual_pos = offset + i;
-                    for j in 0..total_seq_len {
-                        if j > actual_pos {
-                            mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
-                        }
+        // Causal mask for depth steps (only needed if seq_len > 1)
+        let scores = if seq_len > 1 {
+            let device = scores.device();
+            let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
+            for i in 0..seq_len {
+                let actual_pos = offset + i;
+                for j in 0..total_seq_len {
+                    if j > actual_pos {
+                        mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
                     }
                 }
-                let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-                let mask: Tensor<Wgpu, 4> = mask
-                    .reshape([seq_len, total_seq_len])
-                    .unsqueeze_dim::<3>(0)
-                    .unsqueeze_dim(0);
-                scores + mask
-            } else {
-                scores
-            };
-
-            let attn = softmax(scores, 3);
-            attn.matmul(v)
+            }
+            let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
+            let mask: Tensor<Wgpu, 4> = mask
+                .reshape([seq_len, total_seq_len])
+                .unsqueeze_dim::<3>(0)
+                .unsqueeze_dim(0);
+            scores + mask
+        } else {
+            scores
         };
+
+        let attn = softmax(scores, 3);
+        let out = attn.matmul(v);
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
         self.out_projs[step_idx].forward(out)
@@ -185,7 +198,24 @@ impl MultiLinearAttention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // K, V need swap for cache; Q skips swap_dims for fused_attention
+        // Generation mode (S=1, no GQA): fused cache write path.
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            gpu_cache_write_v(&k, &k_cache_handle, offset, max_len);
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_projs[step_idx].forward_with_residual(out, residual);
+        }
+
+        // Prefill path
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -208,38 +238,34 @@ impl MultiLinearAttention {
             (k, v)
         };
 
-        let out = if seq_len == 1 && self.n_heads == self.n_kv_heads {
-            fused_attention(q, k, v, self.scale)
-        } else {
-            // Prefill path: need Q in [B, H, S, D]
-            let q = q.swap_dims(1, 2);
-            let k_t = k.swap_dims(2, 3);
-            let scores = q.matmul(k_t) * self.scale;
+        // Prefill path: need Q in [B, H, S, D]
+        let q = q.swap_dims(1, 2);
+        let k_t = k.swap_dims(2, 3);
+        let scores = q.matmul(k_t) * self.scale;
 
-            let scores = if seq_len > 1 {
-                let device = scores.device();
-                let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
-                for i in 0..seq_len {
-                    let actual_pos = offset + i;
-                    for j in 0..total_seq_len {
-                        if j > actual_pos {
-                            mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
-                        }
+        let scores = if seq_len > 1 {
+            let device = scores.device();
+            let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
+            for i in 0..seq_len {
+                let actual_pos = offset + i;
+                for j in 0..total_seq_len {
+                    if j > actual_pos {
+                        mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
                     }
                 }
-                let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
-                let mask: Tensor<Wgpu, 4> = mask
-                    .reshape([seq_len, total_seq_len])
-                    .unsqueeze_dim::<3>(0)
-                    .unsqueeze_dim(0);
-                scores + mask
-            } else {
-                scores
-            };
-
-            let attn = softmax(scores, 3);
-            attn.matmul(v)
+            }
+            let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
+            let mask: Tensor<Wgpu, 4> = mask
+                .reshape([seq_len, total_seq_len])
+                .unsqueeze_dim::<3>(0)
+                .unsqueeze_dim(0);
+            scores + mask
+        } else {
+            scores
         };
+
+        let attn = softmax(scores, 3);
+        let out = attn.matmul(v);
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
         self.out_projs[step_idx].forward_with_residual(out, residual)

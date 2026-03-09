@@ -20,7 +20,6 @@
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::Tensor;
-use cubecl::server::Handle;
 
 use crate::gguf::{
     gpu_argmax, gpu_read_token_tensor, gpu_read_token_tensors,
@@ -427,16 +426,12 @@ impl DepthTransformer {
         dt
     }
 
-    /// Upload audio + text embeddings to GPU and pre-allocate reusable buffers.
+    /// Upload audio embeddings to GPU and pre-allocate reusable buffers.
     fn init_gpu_buffers(&mut self) {
         // Upload Q4 bytes for each audio embedding to GPU
         for emb in &mut self.audio_embs {
             emb.upload_to_gpu(&self.device);
         }
-        // Upload text embedding to GPU for GPU-side lookup at depth step 0.
-        // This eliminates the CPU readback of the text token between temporal
-        // and depth, removing the ~125ms stall.
-        self.text_emb.upload_to_gpu(&self.device);
         // Collect output vocab sizes for pre-allocating argmax info handles
         let output_vocab_sizes: Vec<usize> = self.output_linears
             .iter()
@@ -448,7 +443,6 @@ impl DepthTransformer {
             self.config.depth_hidden_size,
             &self.audio_embs,
             &output_vocab_sizes,
-            Some(&self.text_emb),
             &self.device,
         ));
     }
@@ -485,11 +479,6 @@ impl DepthTransformer {
     ) -> Vec<u32> {
         let num_steps = max_steps.unwrap_or(self.config.depth_num_steps)
             .min(self.config.depth_num_steps);
-        debug_assert!(
-            num_steps <= self.config.depth_num_steps,
-            "depth generate: num_steps={num_steps} > depth_num_steps={}",
-            self.config.depth_num_steps,
-        );
         let dim = self.config.depth_hidden_size;
 
         // GPU path avoids per-step readbacks by keeping all sampling on GPU.
@@ -533,19 +522,17 @@ impl DepthTransformer {
     /// Generate with a deferred text token readback.
     ///
     /// Like `generate()`, but accepts a `Tensor<Wgpu, 1>` containing the text
-    /// token result on GPU (not yet read back to CPU), plus the raw GPU Handle
-    /// for GPU-side embedding lookup. This allows the depth transformer to do
-    /// text embedding entirely on GPU, eliminating the ~125ms readback stall
-    /// between temporal and depth.
+    /// token result on GPU (not yet read back to CPU). This allows the depth
+    /// transformer's input projection GPU work to overlap with the temporal
+    /// argmax readback, eliminating the ~71ms stall between temporal and depth.
     ///
-    /// The text token is only read back at the very end (batch readback with
-    /// audio tokens) when all GPU work is complete.
+    /// The text token tensor is awaited after input projections are submitted
+    /// to the GPU command queue.
     #[allow(clippy::too_many_arguments)]
     pub async fn generate_deferred(
         &self,
         temporal_hidden: Tensor<Wgpu, 3>,
         text_token_tensor: Tensor<Wgpu, 1>,
-        text_token_handle: Handle,
         cache: &mut LayerCaches,
         audio_temp: f32,
         audio_top_k: usize,
@@ -556,11 +543,6 @@ impl DepthTransformer {
     ) -> (Vec<u32>, u32) {
         let num_steps = max_steps.unwrap_or(self.config.depth_num_steps)
             .min(self.config.depth_num_steps);
-        debug_assert!(
-            num_steps <= self.config.depth_num_steps,
-            "depth generate_deferred: num_steps={num_steps} > depth_num_steps={}",
-            self.config.depth_num_steps,
-        );
         let dim = self.config.depth_hidden_size;
 
         let gpu_path_available = self.gpu_buffers.is_some();
@@ -569,7 +551,6 @@ impl DepthTransformer {
             self.generate_gpu_path_deferred(
                 temporal_hidden,
                 text_token_tensor,
-                text_token_handle,
                 cache,
                 audio_temp,
                 audio_top_k,
@@ -599,18 +580,15 @@ impl DepthTransformer {
         }
     }
 
-    /// GPU-optimized generation with ZERO CPU readback between temporal and depth.
+    /// GPU-optimized generation with deferred text token readback.
     ///
-    /// The text token handle from temporal argmax/sampling is used directly for
-    /// GPU-side text embedding lookup at step 0. The text token value is only
-    /// read back at the very end in a single batch with all audio tokens.
-    /// This eliminates the ~125ms stall where CPU waited for temporal GPU work.
+    /// Computes input projections first (GPU work that overlaps with temporal
+    /// argmax completion), then reads back the text token for step 0 embedding.
     #[allow(clippy::too_many_arguments)]
     async fn generate_gpu_path_deferred(
         &self,
         temporal_hidden: Tensor<Wgpu, 3>,
         text_token_tensor: Tensor<Wgpu, 1>,
-        text_token_handle: Handle,
         cache: &mut LayerCaches,
         audio_temp: f32,
         audio_top_k: usize,
@@ -621,26 +599,24 @@ impl DepthTransformer {
     ) -> (Vec<u32>, u32) {
         let gpu = self.gpu_buffers.as_ref().expect("GPU buffers not initialized");
 
-        // Pre-compute all input projections — GPU matmuls that don't need text token.
+        // Pre-compute all input projections FIRST — these are GPU matmuls that
+        // don't need the text token. While the GPU processes these, the temporal
+        // argmax result is also completing on GPU. By the time we await the text
+        // token below, the argmax readback should be near-instant.
         let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
             .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
             .collect();
 
-        // Step 0: text embedding via GPU lookup (no CPU readback needed!)
-        // The text_token_handle contains the argmax result on GPU. We use it
-        // directly for the Q4 embedding lookup kernel.
-        let emb_tensor = if let Some(t) = gpu.gpu_text_embed_lookup(&text_token_handle) {
-            t
-        } else {
-            // Fallback: GPU text embedding not available, read back to CPU
-            let text_token = gpu_read_token_tensor(text_token_tensor.clone()).await;
-            let mut emb_buf = vec![0.0f32; dim];
-            self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
-            Tensor::<Wgpu, 3>::from_data(
-                burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
-                &self.device,
-            )
-        };
+        // NOW read back the text token — GPU has had time to finish argmax
+        let text_token = gpu_read_token_tensor(text_token_tensor).await;
+
+        // Step 0: text token embedding (CPU path — text_emb is too large for GPU)
+        let mut emb_buf = vec![0.0f32; dim];
+        self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
+        let emb_tensor = Tensor::<Wgpu, 3>::from_data(
+            burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
+            &self.device,
+        );
         let x = projected[0].clone() + emb_tensor;
 
         let mut h = x;
@@ -698,11 +674,9 @@ impl DepthTransformer {
             }
         }
 
-        // ONE batch readback of ALL tokens (audio + text).
-        // By this point all GPU work is done, so readback is near-instant.
+        // ONE batch readback of all tokens
         let token_tensors = gpu.collect_token_tensors(num_steps);
         let audio_tokens = gpu_read_token_tensors(token_tensors).await;
-        let text_token = gpu_read_token_tensor(text_token_tensor).await;
         (audio_tokens, text_token)
     }
 

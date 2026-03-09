@@ -634,6 +634,98 @@ fn fused_rms_norm(
 }
 
 // ---------------------------------------------------------------------------
+// Fused QKV Split kernel — 1 dispatch instead of 2-3 clone+slice ops
+// ---------------------------------------------------------------------------
+
+struct QkvSplitKernelSource;
+
+impl KernelSource for QkvSplitKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_qkv_split.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused QKV split on GPU: splits packed [B, S, q_dim + 2*kv_dim] into
+/// separate contiguous Q [B, S, q_dim], K [B, S, kv_dim], V [B, S, kv_dim].
+///
+/// Single dispatch replaces 2-3 clone+slice operations that may trigger
+/// contiguous copy dispatches.
+pub fn fused_qkv_split(
+    qkv: Tensor<Wgpu, 3>,
+    q_dim: usize,
+    kv_dim: usize,
+) -> (Tensor<Wgpu, 3>, Tensor<Wgpu, 3>, Tensor<Wgpu, 3>) {
+    let cube_input: CubeTensor<WgpuRuntime> = qkv.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let b = cube_input.shape.dims[0];
+    let s = cube_input.shape.dims[1];
+    let num_rows = b * s;
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    let q_handle = client.empty(num_rows * q_dim * 4);
+    let k_handle = client.empty(num_rows * kv_dim * 4);
+    let v_handle = client.empty(num_rows * kv_dim * 4);
+
+    let info: [u32; 3] = [q_dim as u32, kv_dim as u32, num_rows as u32];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(q_handle.clone().binding())
+        .with_buffer(k_handle.clone().binding())
+        .with_buffer(v_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(QkvSplitKernelSource, CubeDim::new_1d(256));
+
+    let max_dim = q_dim.max(kv_dim);
+    let num_workgroups = ((max_dim * num_rows) as u32).div_ceil(256);
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("QKV split kernel launch failed");
+
+    let q_tensor = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        burn::prelude::Shape::from(vec![b, s, q_dim]),
+        q_handle,
+        DType::F32,
+    );
+    let k_tensor = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        burn::prelude::Shape::from(vec![b, s, kv_dim]),
+        k_handle,
+        DType::F32,
+    );
+    let v_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, s, kv_dim]),
+        v_handle,
+        DType::F32,
+    );
+
+    (
+        Tensor::from_primitive(TensorPrimitive::Float(q_tensor)),
+        Tensor::from_primitive(TensorPrimitive::Float(k_tensor)),
+        Tensor::from_primitive(TensorPrimitive::Float(v_tensor)),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Fused SwiGLU kernel — 1 dispatch instead of 3+ (slice, silu, mul)
 // ---------------------------------------------------------------------------
 
@@ -931,20 +1023,8 @@ impl Q4Attention {
         &self,
         qkv: Tensor<Wgpu, 3>,
     ) -> (Tensor<Wgpu, 3>, Tensor<Wgpu, 3>, Tensor<Wgpu, 3>) {
-        let [batch, seq, _] = qkv.dims();
         let kv_dim = self.n_kv_heads * self.head_dim;
-        let q = qkv
-            .clone()
-            .slice([0..batch, 0..seq, 0..self.dim]);
-        let k = qkv
-            .clone()
-            .slice([0..batch, 0..seq, self.dim..self.dim + kv_dim]);
-        let v = qkv.slice([
-            0..batch,
-            0..seq,
-            self.dim + kv_dim..self.dim + 2 * kv_dim,
-        ]);
-        (q, k, v)
+        fused_qkv_split(qkv, self.dim, kv_dim)
     }
 
     pub fn forward_with_cache(

@@ -25,7 +25,7 @@ use crate::gguf::{
     gpu_argmax, gpu_read_token_tensors,
     DepthGpuBuffers, EmbeddingStore, Linear,
 };
-use crate::model::{fused_attention, fused_swiglu, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::model::{fused_attention, fused_qkv_split, fused_swiglu, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
@@ -85,12 +85,9 @@ impl MultiLinearAttention {
         let offset = cache.offset();
 
         let qkv = self.in_projs[step_idx].forward(x);
-        let [b, s, _] = qkv.dims();
         let kv_dim = self.n_kv_heads * self.head_dim;
 
-        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
-        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
-        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
+        let (q, k, v) = fused_qkv_split(qkv, self.dim, kv_dim);
 
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
@@ -187,12 +184,9 @@ impl MultiLinearAttention {
         let offset = cache.offset();
 
         let qkv = self.in_projs[step_idx].forward(x);
-        let [b, s, _] = qkv.dims();
         let kv_dim = self.n_kv_heads * self.head_dim;
 
-        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
-        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
-        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
+        let (q, k, v) = fused_qkv_split(qkv, self.dim, kv_dim);
 
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);

@@ -28,91 +28,16 @@ use crate::gguf::{EmbeddingStore, Linear};
 use crate::StsConfig;
 
 // ---------------------------------------------------------------------------
-// RoPE -- Rotary Position Embeddings (fused GPU kernel)
+// RoPE -- Rotary Position Embeddings (Burn element-wise ops for fusion)
 // ---------------------------------------------------------------------------
 
-struct RopeKernelSource;
-
-impl KernelSource for RopeKernelSource {
-    fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("wgsl/shader_rope.wgsl"))
-    }
-
-    fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
-    }
-}
-
-/// Apply fused RoPE in-place on a [B, S, H, D] tensor.
+/// Rotary Position Embeddings with precomputed cos/sin tables as Burn tensors.
 ///
-/// Launches a single GPU dispatch instead of ~6-8 Burn operations.
-/// The tensor is modified in-place (safe since Q/K are fresh projections).
-fn fused_rope_inplace(
-    x: Tensor<Wgpu, 4>,
-    cos_handle: &Handle,
-    sin_handle: &Handle,
-    offset: usize,
-    half_dim: usize,
-) -> Tensor<Wgpu, 4> {
-    let cube_x: CubeTensor<WgpuRuntime> = x.into_primitive().tensor();
-    let cube_x = into_contiguous(cube_x);
-
-    let b = cube_x.shape.dims[0];
-    let s = cube_x.shape.dims[1];
-    let h = cube_x.shape.dims[2];
-    // d = cube_x.shape.dims[3], but we use half_dim from the RoPE tables
-
-    let total_elements = b * s * h * half_dim;
-
-    let client = cube_x.client.clone();
-    let device = cube_x.device.clone();
-
-    // Info buffer: [pos_offset, B, S, H, half_D]
-    let info: [u32; 5] = [
-        offset as u32,
-        b as u32,
-        s as u32,
-        h as u32,
-        half_dim as u32,
-    ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let info_handle = client.create_from_slice(&info_bytes);
-
-    let bindings = Bindings::new()
-        .with_buffer(cube_x.handle.clone().binding())
-        .with_buffer(cos_handle.clone().binding())
-        .with_buffer(sin_handle.clone().binding())
-        .with_buffer(info_handle.binding());
-
-    let kernel = SourceKernel::new(RopeKernelSource, CubeDim::new_1d(256));
-
-    let num_workgroups = (total_elements as u32).div_ceil(256);
-    client
-        .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
-            CubeCount::new_1d(num_workgroups),
-            bindings,
-        )
-        .expect("RoPE kernel launch failed");
-
-    // Return the same buffer as a tensor (modified in-place)
-    let output_tensor = CubeTensor::new_contiguous(
-        client,
-        device,
-        burn::prelude::Shape::from(vec![b, s, h, half_dim * 2]),
-        cube_x.handle,
-        DType::F32,
-    );
-    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
-}
-
-/// Rotary Position Embeddings with precomputed cos/sin tables on GPU.
-///
-/// Uses a fused WGSL compute shader: 1 dispatch per tensor instead of ~6-8
-/// Burn operations (reshape, slice, broadcast, mul, sub, add, cat, reshape).
+/// Uses Burn's element-wise ops (mul, sub, add, cat) so that Burn's fusion
+/// optimizer can chain these with surrounding operations.
 pub struct RoPE {
-    cos_handle: Handle,
-    sin_handle: Handle,
+    cos_table: Tensor<Wgpu, 2>, // [max_seq_len, half_dim]
+    sin_table: Tensor<Wgpu, 2>, // [max_seq_len, half_dim]
     half_dim: usize,
 }
 
@@ -137,95 +62,61 @@ impl RoPE {
         let freqs = Tensor::<Wgpu, 1>::from_floats(freqs.as_slice(), device)
             .reshape([max_seq_len, half_dim]);
 
-        let cos = freqs.clone().cos();
-        let sin = freqs.sin();
-
-        // Extract GPU handles for the fused kernel
-        let cos_handle = cos.into_primitive().tensor().handle;
-        let sin_handle = sin.into_primitive().tensor().handle;
+        let cos_table = freqs.clone().cos();
+        let sin_table = freqs.sin();
 
         RoPE {
-            cos_handle,
-            sin_handle,
+            cos_table,
+            sin_table,
             half_dim,
         }
     }
 
-    /// Apply rotary embeddings to Q and K tensors using fused GPU kernel.
+    /// Apply RoPE rotation to a single [B, S, H, D] tensor using Burn ops.
+    fn apply_rope_to_tensor(&self, x: Tensor<Wgpu, 4>, offset: usize) -> Tensor<Wgpu, 4> {
+        let [batch, seq, heads, head_dim] = x.dims();
+        let half = self.half_dim;
+
+        // Split head_dim into first half and second half
+        let x1 = x.clone().slice([0..batch, 0..seq, 0..heads, 0..half]);
+        let x2 = x.slice([0..batch, 0..seq, 0..heads, half..head_dim]);
+
+        // Get cos/sin for positions [offset..offset+seq]
+        let cos = self.cos_table.clone().slice([offset..offset + seq, 0..half]);
+        let sin = self.sin_table.clone().slice([offset..offset + seq, 0..half]);
+
+        // Reshape for broadcasting: [1, seq, 1, half]
+        let cos = cos.reshape([1, seq, 1, half]);
+        let sin = sin.reshape([1, seq, 1, half]);
+
+        // Apply rotation (Burn fuses these element-wise ops)
+        let out1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
+        let out2 = x1 * sin + x2 * cos;
+
+        // Concatenate back: [batch, seq, heads, head_dim]
+        Tensor::cat(vec![out1, out2], 3)
+    }
+
+    /// Apply rotary embeddings to Q and K tensors using Burn element-wise ops.
     ///
     /// q, k shape: [batch, seq, heads, head_dim]
-    /// 2 GPU dispatches total (1 for Q, 1 for K) instead of ~12-16 Burn ops.
+    /// Burn's fusion optimizer can chain these ops with surrounding operations.
     pub fn apply(
         &self,
         q: Tensor<Wgpu, 4>,
         k: Tensor<Wgpu, 4>,
         offset: usize,
     ) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
-        let q_rot = fused_rope_inplace(
-            q,
-            &self.cos_handle,
-            &self.sin_handle,
-            offset,
-            self.half_dim,
-        );
-        let k_rot = fused_rope_inplace(
-            k,
-            &self.cos_handle,
-            &self.sin_handle,
-            offset,
-            self.half_dim,
-        );
+        let q_rot = self.apply_rope_to_tensor(q, offset);
+        let k_rot = self.apply_rope_to_tensor(k, offset);
         (q_rot, k_rot)
     }
 
-    /// Apply RoPE to Q (in-place) and write rotated K directly to KV cache.
-    ///
-    /// q, k shape: [batch, seq, heads, head_dim]
-    /// Returns: rotated Q tensor. K is written directly to cache_k_handle.
-    /// 2 GPU dispatches total (1 for Q RoPE, 1 for K RoPE+cache write).
-    pub fn apply_with_cache_write(
-        &self,
-        q: Tensor<Wgpu, 4>,
-        k: &Tensor<Wgpu, 4>,
-        offset: usize,
-        cache_k_handle: &Handle,
-        max_len: usize,
-    ) -> Tensor<Wgpu, 4> {
-        let q_rot = fused_rope_inplace(
-            q,
-            &self.cos_handle,
-            &self.sin_handle,
-            offset,
-            self.half_dim,
-        );
-        fused_rope_cache_write(
-            k,
-            &self.cos_handle,
-            &self.sin_handle,
-            cache_k_handle,
-            offset,
-            self.half_dim,
-            max_len,
-        );
-        q_rot
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Fused RoPE + KV Cache Write (K) and V Cache Write kernels
+// V (and K) Cache Write kernel
 // ---------------------------------------------------------------------------
-
-struct RopeCacheWriteKernelSource;
-
-impl KernelSource for RopeCacheWriteKernelSource {
-    fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("wgsl/shader_rope_cache_write.wgsl"))
-    }
-
-    fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
-    }
-}
 
 struct CacheWriteKernelSource;
 
@@ -239,63 +130,7 @@ impl KernelSource for CacheWriteKernelSource {
     }
 }
 
-/// Fused RoPE rotation + KV cache write for K.
-///
-/// Reads K from [B, S, H, D] layout, applies RoPE rotation, and writes
-/// directly into the KV cache buffer in [B, H, max_len, D] layout.
-/// Replaces: fused_rope_inplace(K) + swap_dims + into_contiguous + slice_assign.
-fn fused_rope_cache_write(
-    k: &Tensor<Wgpu, 4>,
-    cos_handle: &Handle,
-    sin_handle: &Handle,
-    cache_handle: &Handle,
-    offset: usize,
-    half_dim: usize,
-    max_len: usize,
-) {
-    let cube_k: CubeTensor<WgpuRuntime> = k.clone().into_primitive().tensor();
-    let cube_k = into_contiguous(cube_k);
-
-    let b = cube_k.shape.dims[0];
-    let s = cube_k.shape.dims[1];
-    let h = cube_k.shape.dims[2];
-
-    let total_elements = b * s * h * half_dim;
-
-    let client = cube_k.client.clone();
-
-    // Info buffer: [pos_offset, B, S, H, half_D, max_len]
-    let info: [u32; 6] = [
-        offset as u32,
-        b as u32,
-        s as u32,
-        h as u32,
-        half_dim as u32,
-        max_len as u32,
-    ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let info_handle_buf = client.create_from_slice(&info_bytes);
-
-    let bindings = Bindings::new()
-        .with_buffer(cube_k.handle.clone().binding())
-        .with_buffer(cos_handle.clone().binding())
-        .with_buffer(sin_handle.clone().binding())
-        .with_buffer(cache_handle.clone().binding())
-        .with_buffer(info_handle_buf.binding());
-
-    let kernel = SourceKernel::new(RopeCacheWriteKernelSource, CubeDim::new_1d(256));
-
-    let num_workgroups = (total_elements as u32).div_ceil(256);
-    client
-        .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
-            CubeCount::new_1d(num_workgroups),
-            bindings,
-        )
-        .expect("RoPE cache write kernel launch failed");
-}
-
-/// Direct V cache write: copies V from [B, S, H, D] into cache [B, H, max_len, D].
+/// Direct cache write: copies tensor from [B, S, H, D] into cache [B, H, max_len, D].
 ///
 /// Replaces: swap_dims + into_contiguous + slice_assign for V.
 pub fn gpu_cache_write_v(
@@ -1047,17 +882,17 @@ impl Q4Attention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // Generation mode (S=1, no GQA): use fused RoPE+cache write path.
-        // Saves 4 dispatches per layer (swap_dims+contiguous+slice_assign for K and V).
+        // Generation mode (S=1, no GQA): use RoPE + direct cache write path.
+        // Saves dispatches per layer (swap_dims+contiguous+slice_assign for K and V).
         if seq_len == 1 && self.n_heads == self.n_kv_heads {
             let (k_cache_handle, v_cache_handle, _write_pos) =
                 cache.ensure_allocated(batch);
             let max_len = cache.max_len();
 
-            // Fused: RoPE(K) + write to K cache in one dispatch
-            let q = rope.apply_with_cache_write(
-                q, &k, offset, &k_cache_handle, max_len,
-            );
+            // Apply RoPE to Q and K using Burn ops (fusable)
+            let (q, k_rot) = rope.apply(q, k, offset);
+            // Write rotated K directly to K cache
+            gpu_cache_write_v(&k_rot, &k_cache_handle, offset, max_len);
             // Write V directly to V cache (no RoPE needed)
             gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
 
@@ -1070,7 +905,7 @@ impl Q4Attention {
             return self.out_proj.forward(out);
         }
 
-        // Prefill path: use original RoPE + cache.update
+        // Prefill path: use RoPE + cache.update
         let (q, k) = rope.apply(q, k, offset);
 
         let k = k.swap_dims(1, 2);
@@ -1127,15 +962,16 @@ impl Q4Attention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // Generation mode (S=1, no GQA): use fused RoPE+cache write path.
+        // Generation mode (S=1, no GQA): use RoPE + direct cache write path.
         if seq_len == 1 && self.n_heads == self.n_kv_heads {
             let (k_cache_handle, v_cache_handle, _write_pos) =
                 cache.ensure_allocated(batch);
             let max_len = cache.max_len();
 
-            let q = rope.apply_with_cache_write(
-                q, &k, offset, &k_cache_handle, max_len,
-            );
+            // Apply RoPE to Q and K using Burn ops (fusable)
+            let (q, k_rot) = rope.apply(q, k, offset);
+            // Write rotated K directly to K cache
+            gpu_cache_write_v(&k_rot, &k_cache_handle, offset, max_len);
             gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
 
             let (k_all, v_all) = cache.advance(1);

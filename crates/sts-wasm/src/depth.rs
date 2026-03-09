@@ -18,14 +18,14 @@
 //! transformations.
 
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
-use burn::tensor::activation::softmax;
+use burn::tensor::activation::{silu, softmax};
 use burn::tensor::Tensor;
 
 use crate::gguf::{
     gpu_argmax, gpu_read_token_tensor, gpu_read_token_tensors,
     DepthGpuBuffers, EmbeddingStore, Linear,
 };
-use crate::model::{fused_attention, fused_qkv_split, fused_swiglu, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::model::{fused_attention, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
@@ -87,7 +87,10 @@ impl MultiLinearAttention {
         let qkv = self.in_projs[step_idx].forward(x);
         let kv_dim = self.n_kv_heads * self.head_dim;
 
-        let (q, k, v) = fused_qkv_split(qkv, self.dim, kv_dim);
+        let [b, s, _] = qkv.dims();
+        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
+        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
+        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
 
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
@@ -186,7 +189,10 @@ impl MultiLinearAttention {
         let qkv = self.in_projs[step_idx].forward(x);
         let kv_dim = self.n_kv_heads * self.head_dim;
 
-        let (q, k, v) = fused_qkv_split(qkv, self.dim, kv_dim);
+        let [b, s, _] = qkv.dims();
+        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
+        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
+        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
 
         let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
@@ -292,14 +298,22 @@ impl MultiLinearFeedForward {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>, step_idx: usize) -> Tensor<Wgpu, 3> {
         let combined = self.linear_ins[step_idx].forward(x);
-        let activated = fused_swiglu(combined);
+        let [b, s, total_dim] = combined.dims();
+        let half = total_dim / 2;
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
         self.linear_outs[step_idx].forward(activated)
     }
 
     /// Forward with fused residual addition in the linear_out matmul.
     pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>, step_idx: usize) -> Tensor<Wgpu, 3> {
         let combined = self.linear_ins[step_idx].forward(x);
-        let activated = fused_swiglu(combined);
+        let [b, s, total_dim] = combined.dims();
+        let half = total_dim / 2;
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
         self.linear_outs[step_idx].forward_with_residual(activated, residual)
     }
 }

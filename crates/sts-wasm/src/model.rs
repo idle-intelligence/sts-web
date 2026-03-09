@@ -17,7 +17,7 @@ use burn::backend::wgpu::{
     into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
     Wgpu, WgpuDevice, WgpuRuntime,
 };
-use burn::tensor::activation::softmax;
+use burn::tensor::activation::{silu, softmax};
 use burn::tensor::{DType, Tensor, TensorPrimitive};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount, Handle};
@@ -1023,8 +1023,12 @@ impl Q4Attention {
         &self,
         qkv: Tensor<Wgpu, 3>,
     ) -> (Tensor<Wgpu, 3>, Tensor<Wgpu, 3>, Tensor<Wgpu, 3>) {
+        let [b, s, _] = qkv.dims();
         let kv_dim = self.n_kv_heads * self.head_dim;
-        fused_qkv_split(qkv, self.dim, kv_dim)
+        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
+        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
+        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
+        (q, k, v)
     }
 
     pub fn forward_with_cache(
@@ -1207,14 +1211,22 @@ impl Q4FeedForward {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         let combined = self.linear_in.forward(x);
-        let activated = fused_swiglu(combined);
+        let [b, s, total_dim] = combined.dims();
+        let half = total_dim / 2;
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
         self.linear_out.forward(activated)
     }
 
     /// Forward with fused residual addition in the linear_out matmul.
     pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         let combined = self.linear_in.forward(x);
-        let activated = fused_swiglu(combined);
+        let [b, s, total_dim] = combined.dims();
+        let half = total_dim / 2;
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
         self.linear_out.forward_with_residual(activated, residual)
     }
 }

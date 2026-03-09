@@ -481,9 +481,12 @@ impl DepthTransformer {
             .min(self.config.depth_num_steps);
         let dim = self.config.depth_hidden_size;
 
-        // GPU path avoids per-step readbacks by keeping all sampling on GPU.
-        // Both greedy (argmax) and top-k sampling are handled on the GPU path.
-        let gpu_path_available = self.gpu_buffers.is_some();
+        // GPU path is only beneficial for greedy sampling (temp <= 0).
+        // For top-k sampling, the CPU path is faster because:
+        // - Vocab is small (2048), so 8KB readback is cheap
+        // - CPU top-k is trivially fast for small vocab
+        // - GPU kernel launch overhead exceeds readback savings
+        let gpu_path_available = audio_temp <= 0.0 && self.gpu_buffers.is_some();
 
         if gpu_path_available && provided_tokens.is_none() {
             // === GPU-OPTIMIZED PATH ===
@@ -545,7 +548,7 @@ impl DepthTransformer {
             .min(self.config.depth_num_steps);
         let dim = self.config.depth_hidden_size;
 
-        let gpu_path_available = self.gpu_buffers.is_some();
+        let gpu_path_available = audio_temp <= 0.0 && self.gpu_buffers.is_some();
 
         if gpu_path_available && provided_tokens.is_none() {
             self.generate_gpu_path_deferred(

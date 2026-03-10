@@ -64,6 +64,10 @@ use crate::StsConfig;
 /// Device initialized by `initWgpuDevice()` — used by `StsEngine` instances.
 static WGPU_DEVICE: OnceLock<WgpuDevice> = OnceLock::new();
 
+/// Raw wgpu device/queue, cloned before Burn consumes them via `init_device()`.
+static RAW_WGPU_DEVICE: OnceLock<wgpu::Device> = OnceLock::new();
+static RAW_WGPU_QUEUE: OnceLock<wgpu::Queue> = OnceLock::new();
+
 fn wasm_log(msg: &str) {
     #[cfg(target_family = "wasm")]
     web_sys::console::log_1(&msg.into());
@@ -174,6 +178,10 @@ pub async fn init_wgpu_device() {
         "[wgpu] Device created: max_compute_invocations_per_workgroup={}",
         device.limits().max_compute_invocations_per_workgroup,
     ));
+
+    // Stash clones before Burn consumes them via WgpuSetup
+    RAW_WGPU_DEVICE.set(device.clone()).ok();
+    RAW_WGPU_QUEUE.set(queue.clone()).ok();
 
     let setup = WgpuSetup {
         instance,
@@ -306,7 +314,15 @@ impl StsEngine {
 
         let temporal_cache = temporal.create_cache();
         let depth_cache = depth.create_cache();
-        let stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
+        let mut stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
+
+        // Initialize custom DepthEngine (bypasses Burn/CubeCL for depth inference)
+        {
+            use crate::depth_engine::DepthEngine;
+            let depth_engine = DepthEngine::new(&depth, &self.device, &self.config);
+            stream.depth_engine = Some(depth_engine);
+            wasm_log("[sts] Custom DepthEngine initialized");
+        }
 
         self.temporal = Some(temporal);
         self.depth = Some(depth);
@@ -408,7 +424,15 @@ impl StsEngine {
 
         let temporal_cache = temporal.create_cache();
         let depth_cache = depth.create_cache();
-        let stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
+        let mut stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
+
+        // Initialize custom DepthEngine (bypasses Burn/CubeCL for depth inference)
+        {
+            use crate::depth_engine::DepthEngine;
+            let depth_engine = DepthEngine::new(&depth, &self.device, &self.config);
+            stream.depth_engine = Some(depth_engine);
+            wasm_log("[sts] Custom DepthEngine initialized (incremental)");
+        }
 
         self.temporal = Some(temporal);
         self.depth = Some(depth);
@@ -954,6 +978,16 @@ impl StsEngine {
         self.temporal.is_some() && self.depth.is_some() && self.mimi.is_some()
     }
 
+}
+
+/// Access the raw `wgpu::Device` stored before Burn consumed it.
+pub fn raw_wgpu_device() -> Option<&'static wgpu::Device> {
+    RAW_WGPU_DEVICE.get()
+}
+
+/// Access the raw `wgpu::Queue` stored before Burn consumed it.
+pub fn raw_wgpu_queue() -> Option<&'static wgpu::Queue> {
+    RAW_WGPU_QUEUE.get()
 }
 
 impl Default for StsEngine {

@@ -46,8 +46,8 @@ use crate::StsConfig;
 ///
 /// We store them pre-split as 16 separate Q4Linear instances.
 pub struct MultiLinearAttention {
-    in_projs: Vec<Linear>,   // 16 separate [3072, 1024] linears
-    out_projs: Vec<Linear>,  // 16 separate [1024, 1024] linears
+    pub(crate) in_projs: Vec<Linear>,   // 16 separate [3072, 1024] linears
+    pub(crate) out_projs: Vec<Linear>,  // 16 separate [1024, 1024] linears
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -285,8 +285,8 @@ impl MultiLinearAttention {
 /// - `gating.{0-15}.linear_in.weight`: [5632, 1024] = 2 * 2816
 /// - `gating.{0-15}.linear_out.weight`: [1024, 2816]
 pub struct MultiLinearFeedForward {
-    linear_ins: Vec<Linear>,   // 16 x [5632, 1024]
-    linear_outs: Vec<Linear>,  // 16 x [1024, 2816]
+    pub(crate) linear_ins: Vec<Linear>,   // 16 x [5632, 1024]
+    pub(crate) linear_outs: Vec<Linear>,  // 16 x [1024, 2816]
 }
 
 impl MultiLinearFeedForward {
@@ -327,10 +327,10 @@ impl MultiLinearFeedForward {
 ///
 /// The norm weights are shared across all steps (not per-step).
 pub struct DepthTransformerBlock {
-    norm1: RmsNormLayer,
-    attention: MultiLinearAttention,
-    norm2: RmsNormLayer,
-    ffn: MultiLinearFeedForward,
+    pub(crate) norm1: RmsNormLayer,
+    pub(crate) attention: MultiLinearAttention,
+    pub(crate) norm2: RmsNormLayer,
+    pub(crate) ffn: MultiLinearFeedForward,
 }
 
 impl DepthTransformerBlock {
@@ -384,15 +384,15 @@ impl DepthTransformerBlock {
 /// - linears.{0-15}: output heads [2048, 1024] (audio) or [32000, 1024] (text)
 pub struct DepthTransformer {
     /// Per-step input projections from temporal hidden to depth dim.
-    input_projs: Vec<Linear>, // 16 x [1024, 4096] — F32 or Q4
+    pub(crate) input_projs: Vec<Linear>, // 16 x [1024, 4096] — F32 or Q4
     /// Text token embedding for depth input.
-    text_emb: EmbeddingStore, // [32001, 1024]
+    pub(crate) text_emb: EmbeddingStore, // [32001, 1024]
     /// Per-codebook audio embeddings for depth input.
-    audio_embs: Vec<EmbeddingStore>, // 15 x [2049, 1024]
+    pub(crate) audio_embs: Vec<EmbeddingStore>, // 15 x [2049, 1024]
     /// Transformer layers with multi-linear weights.
-    layers: Vec<DepthTransformerBlock>,
+    pub(crate) layers: Vec<DepthTransformerBlock>,
     /// Per-step output heads.
-    output_linears: Vec<Linear>, // 16 x [vocab, 1024] — F32 or Q4
+    pub(crate) output_linears: Vec<Linear>, // 16 x [vocab, 1024] — F32 or Q4
     config: StsConfig,
     device: WgpuDevice,
     /// Pre-allocated GPU buffers for the GPU-optimized generation path.

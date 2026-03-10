@@ -370,10 +370,15 @@ async function handleStop() {
     let transcript = '';
     if (benchmarkMode) benchmarkFrames = [];
     const genStartTime = performance.now();
+    // Track cumulative metrics for per-frame deltas in benchmark mode
+    let prevTemporalMs = 0, prevDepthMs = 0, prevMimiMs = 0;
+
+    let frameStart = performance.now();
     let result = await engine.generateStepInference();
 
     while (result) {
-        const frameStart = performance.now();
+        const frameEnd = performance.now();
+        const frameTotalMs = frameEnd - frameStart;
 
         if (mimiWorkerPort) {
             // Offloaded path: send audio tokens to Mimi worker for decode.
@@ -409,16 +414,19 @@ async function handleStop() {
             text: `Generating... frame ${result.step + 1}`,
         });
 
-        // Collect per-frame timing in benchmark mode
+        // Collect per-frame timing in benchmark mode using cumulative metric deltas
         if (benchmarkMode) {
             const m = engine.getMetrics();
             benchmarkFrames.push({
                 frameIdx: result.step,
-                totalMs: performance.now() - frameStart,
-                temporalMs: m.last_temporal_ms || 0,
-                depthMs: m.last_depth_ms || 0,
-                mimiMs: m.last_mimi_ms || 0,
+                totalMs: frameTotalMs,
+                temporalMs: (m.temporal_ms || 0) - prevTemporalMs,
+                depthMs: (m.depth_ms || 0) - prevDepthMs,
+                mimiMs: (m.mimi_ms || 0) - prevMimiMs,
             });
+            prevTemporalMs = m.temporal_ms || 0;
+            prevDepthMs = m.depth_ms || 0;
+            prevMimiMs = m.mimi_ms || 0;
         }
 
         if (result.done) break;
@@ -431,6 +439,7 @@ async function handleStop() {
         await new Promise(r => setTimeout(r, 0));
 
         // Next inference step — if Mimi worker is active, GPU gets full overlap
+        frameStart = performance.now();
         result = await engine.generateStepInference();
     }
 

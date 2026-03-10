@@ -476,7 +476,7 @@ fn fused_rms_norm(
 }
 
 pub struct RmsNormLayer {
-    alpha_handle: Handle,
+    pub(crate) alpha_handle: Handle,
     eps: f32,
     dim: usize,
     /// Cached info buffer (D, eps_bits, total_rows). Keyed by total_rows.
@@ -524,6 +524,11 @@ impl RmsNormLayer {
         let total_rows = b * s;
         let info_handle = self.get_or_create_info(total_rows);
         fused_rms_norm(x, &self.alpha_handle, self.eps, &info_handle)
+    }
+
+    /// Get a reference to the underlying CubeCL handle for raw GPU access.
+    pub fn raw_alpha_handle(&self) -> &Handle {
+        &self.alpha_handle
     }
 }
 

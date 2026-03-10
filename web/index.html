@@ -608,9 +608,11 @@
                         break;
 
                     case 'audio-chunk':
-                        audioStatus.textContent = msg.done
-                            ? 'Generation complete'
-                            : `Generating... frame ${msg.step + 1}`;
+                        if (!isBenchmark) {
+                            audioStatus.textContent = msg.done
+                                ? 'Generation complete'
+                                : `Generating... frame ${msg.step + 1}`;
+                        }
                         if (msg.done && playbackNode) {
                             playbackNode.port.postMessage({ type: 'flush' });
                         }
@@ -824,11 +826,15 @@
             updateStatus('loading', `Decoding ${label}...`);
             setUIState('generating');
             try {
-                if (!playbackNode) await initAudioPlayback();
-                if (audioCtx.state === 'suspended') await audioCtx.resume();
+                // In benchmark mode, skip AudioContext entirely (not needed, and
+                // Chrome blocks it without a user gesture).
+                if (!isBenchmark) {
+                    if (!playbackNode) await initAudioPlayback();
+                    if (audioCtx.state === 'suspended') await audioCtx.resume();
+                    playbackNode.port.postMessage({ type: 'reset' });
+                }
 
-                // Reset playback buffer and decoded chunks
-                playbackNode.port.postMessage({ type: 'reset' });
+                // Reset decoded chunks and Mimi timing
                 allDecodedChunks.length = 0;
                 mimiTotalMs = 0;
                 mimiFrameCount = 0;

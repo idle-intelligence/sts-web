@@ -61,6 +61,8 @@ use cubecl::Runtime;
 
 use crate::depth::DepthTransformer;
 use crate::gguf::{gpu_argmax_buffer, gpu_sample_top_k_with_penalty};
+#[cfg(feature = "wasm")]
+use crate::gguf::gpu_read_token_tensor;
 use crate::model::{LayerCaches, TemporalTransformer};
 use crate::StsConfig;
 
@@ -210,6 +212,11 @@ pub struct StsStream {
     pub prefill_temporal_ms: f64,
     /// Accumulated depth_ms during prefill_user_audio.
     pub prefill_depth_ms: f64,
+
+    /// Custom WebGPU depth engine (WASM only). When set, bypasses Burn/CubeCL
+    /// depth path in step() and submits all 8 depth steps as one command buffer.
+    #[cfg(feature = "wasm")]
+    pub depth_engine: Option<crate::depth_engine::DepthEngine>,
 }
 
 impl StsStream {
@@ -247,6 +254,8 @@ impl StsStream {
             pending_temporal_ms: 0.0,
             prefill_temporal_ms: 0.0,
             prefill_depth_ms: 0.0,
+            #[cfg(feature = "wasm")]
+            depth_engine: None,
             config,
             temporal_cache,
             depth_cache,
@@ -627,25 +636,70 @@ impl StsStream {
         self.depth_cache.reset_keep_buffers();
 
         // Step 4: Depth transformer generates agent audio tokens (skip user predictions).
-        // Uses generate_deferred with the GPU Handle for text embedding lookup —
-        // ZERO CPU readback between temporal and depth. Text token is read back
-        // at the end in a single batch with audio tokens.
         let gen_steps = self.config.depth_gen_steps;
         let t_depth = now_ms();
-        let penalty_hist = &self.audio_token_history;
-        let (mut all_audio_tokens, text_token) = depth.generate_deferred(
-            hidden,
-            text_token_tensor,
-            text_token_handle,
-            &mut self.depth_cache,
-            self.audio_temperature,
-            self.audio_top_k,
-            None, // No provided tokens during generation
-            Some(penalty_hist),
-            self.repetition_penalty,
-            Some(gen_steps), // Only run agent audio steps, skip user predictions
-        )
-        .await;
+
+        // Custom DepthEngine path (WASM only): submits all 8 depth steps as one
+        // command buffer, bypassing Burn/CubeCL overhead (~150 dispatches → 1).
+        #[cfg(feature = "wasm")]
+        let (mut all_audio_tokens, text_token) = if let Some(engine) = self.depth_engine.as_ref() {
+            // Flush CubeCL pending work so buffers are valid for raw wgpu access.
+            let device = temporal.device();
+            let client = WgpuRuntime::client(device);
+            client.flush();
+
+            // Extract WgpuResource from the temporal hidden Tensor<Wgpu, 3>.
+            let hidden_handle = hidden.into_primitive().tensor().handle;
+            let hidden_resource = crate::gguf::handle_to_wgpu_resource(&hidden_handle, device);
+
+            // Extract WgpuResource from the text token Handle.
+            let text_resource = crate::gguf::handle_to_wgpu_resource(&text_token_handle, device);
+
+            // Reset the custom engine's KV caches for this frame.
+            engine.reset_caches();
+
+            // Run all 8 depth steps in a single command buffer.
+            let audio_tokens = engine.generate(&hidden_resource, &text_resource).await;
+
+            // Read back text token separately (the custom engine only returns audio).
+            let text_token_val = gpu_read_token_tensor(text_token_tensor).await;
+
+            (audio_tokens, text_token_val)
+        } else {
+            // Standard Burn/CubeCL depth path (WASM fallback).
+            let penalty_hist = &self.audio_token_history;
+            depth.generate_deferred(
+                hidden,
+                text_token_tensor,
+                text_token_handle,
+                &mut self.depth_cache,
+                self.audio_temperature,
+                self.audio_top_k,
+                None, // No provided tokens during generation
+                Some(penalty_hist),
+                self.repetition_penalty,
+                Some(gen_steps), // Only run agent audio steps, skip user predictions
+            )
+            .await
+        };
+        #[cfg(not(feature = "wasm"))]
+        let (mut all_audio_tokens, text_token) = {
+            // Standard Burn/CubeCL depth path (native).
+            let penalty_hist = &self.audio_token_history;
+            depth.generate_deferred(
+                hidden,
+                text_token_tensor,
+                text_token_handle,
+                &mut self.depth_cache,
+                self.audio_temperature,
+                self.audio_top_k,
+                None, // No provided tokens during generation
+                Some(penalty_hist),
+                self.repetition_penalty,
+                Some(gen_steps), // Only run agent audio steps, skip user predictions
+            )
+            .await
+        };
         let depth_ms = now_ms() - t_depth;
 
         // Update text token history (was deferred from step 2)

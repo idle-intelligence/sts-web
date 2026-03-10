@@ -2,36 +2,39 @@
 /**
  * Browser benchmark for STS inference.
  *
- * Launches Chrome with WebGPU, navigates to ?benchmark, waits for
+ * Launches Chromium with WebGPU, navigates to ?benchmark, waits for
  * window.__benchmarkResults, and prints the results JSON.
  *
- * Usage: node bench/browser-bench.mjs [--url https://localhost:8443]
+ * Usage: node bench/browser-bench.mjs [--url http://localhost:8443] [--browser /path/to/chrome]
  */
 
 import { chromium } from 'playwright';
 
 const url = process.argv.find((_, i, a) => a[i - 1] === '--url') ?? 'http://localhost:8443';
+const browserPath = process.argv.find((_, i, a) => a[i - 1] === '--browser');
 
-const browser = await chromium.launch({
+const launchOptions = {
     headless: false,
-    channel: 'chrome',
     args: [
-        '--use-gl=egl',
+        '--enable-unsafe-webgpu',
+        '--enable-features=WebGPU',
         '--ignore-gpu-blocklist',
-        '--enable-features=Vulkan',
         '--ignore-certificate-errors',
     ],
-});
+};
+if (browserPath) launchOptions.executablePath = browserPath;
+
+const browser = await chromium.launch(launchOptions);
 
 const context = await browser.newContext({
     ignoreHTTPSErrors: true,
 });
 const page = await context.newPage();
+page.setDefaultTimeout(300_000);
 
 page.on('console', msg => {
     const text = msg.text();
-    if (text.includes('[worker') || text.includes('[sts]') || text.includes('[benchmark'))
-        console.log(text);
+    console.log(`  [browser] ${text}`);
 });
 
 page.on('pageerror', err => {
@@ -39,12 +42,13 @@ page.on('pageerror', err => {
 });
 
 console.log(`Navigating to ${url}/?benchmark ...`);
-await page.goto(`${url}/?benchmark`);
+await page.goto(`${url}/?benchmark`, { timeout: 60_000 });
 
 // Wait up to 5 minutes for model load + inference to complete
 console.log('Waiting for benchmark to complete (up to 5 min)...');
 const results = await page.waitForFunction(
     () => window.__benchmarkResults,
+    null,
     { timeout: 300_000 }
 );
 

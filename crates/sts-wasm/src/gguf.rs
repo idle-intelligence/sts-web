@@ -13,7 +13,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use burn::backend::wgpu::{
     into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
-    WgpuDevice, WgpuRuntime,
+    WgpuDevice, WgpuResource, WgpuRuntime,
 };
 use burn::backend::Wgpu;
 use burn::tensor::{DType, Tensor, TensorData, TensorPrimitive};
@@ -495,7 +495,7 @@ impl Q4Tensor {
 
 /// A linear layer with Q4_0 quantized weights.
 pub struct Q4Linear {
-    weights: Q4Tensor,
+    pub(crate) weights: Q4Tensor,
     bias: Option<Tensor<Wgpu, 1>>,
 }
 
@@ -594,7 +594,7 @@ impl Q4KTensor {
 
 /// A linear layer with Q4_K quantized weights.
 pub struct Q4KLinear {
-    weights: Q4KTensor,
+    pub(crate) weights: Q4KTensor,
     bias: Option<Tensor<Wgpu, 1>>,
 }
 
@@ -1965,5 +1965,29 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let shape = reverse_gguf_dims(info.shape());
         let bytes = self.reader.tensor_data(name)?;
         Ok((bytes, [shape[0], shape[1]]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw wgpu buffer extraction utilities
+// ---------------------------------------------------------------------------
+
+/// Extract the underlying `WgpuResource` (wgpu buffer + offset + size) from a CubeCL `Handle`.
+///
+/// This flushes any pending GPU work on the handle's stream and returns the
+/// raw GPU buffer reference. Useful for passing buffers to custom WebGPU
+/// pipelines outside of CubeCL/Burn.
+pub fn handle_to_wgpu_resource(handle: &Handle, device: &WgpuDevice) -> WgpuResource {
+    let client = WgpuRuntime::client(device);
+    let binding = handle.clone().binding();
+    let binding_resource = client.get_resource(binding);
+    let res = binding_resource.resource();
+    WgpuResource::new(res.buffer.clone(), res.offset, res.size)
+}
+
+impl Q4KTensor {
+    /// Get a reference to the underlying CubeCL handle for raw GPU access.
+    pub fn raw_handle(&self) -> &Handle {
+        &self.handle
     }
 }

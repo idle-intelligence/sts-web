@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 echo "Starting dev server..."
-bun web/serve.mjs &
+node web/serve.mjs &
 SERVER_PID=$!
 
 # Give the server a moment to start

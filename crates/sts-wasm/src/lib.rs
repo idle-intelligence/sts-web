@@ -28,6 +28,9 @@ pub mod tokenizer;
 pub mod loader;
 
 #[cfg(feature = "wasm")]
+pub mod depth_engine;
+
+#[cfg(feature = "wasm")]
 pub mod web;
 
 /// Model configuration for the STS 7B speech-to-speech model.

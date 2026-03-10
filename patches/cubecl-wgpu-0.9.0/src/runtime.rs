@@ -112,7 +112,7 @@ impl Default for RuntimeOptions {
         #[cfg(test)]
         const DEFAULT_MAX_TASKS: usize = 1;
         #[cfg(all(not(test), target_family = "wasm"))]
-        const DEFAULT_MAX_TASKS: usize = 256;
+        const DEFAULT_MAX_TASKS: usize = 32;
         #[cfg(all(not(test), not(target_family = "wasm")))]
         const DEFAULT_MAX_TASKS: usize = 32;
 

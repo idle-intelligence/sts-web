@@ -52,6 +52,10 @@ let recordingStart = 0;
 let prefillFrames = 0;
 let listening = false;
 
+// Benchmark mode: per-frame timing collection
+let benchmarkMode = false;
+let benchmarkFrames = [];
+
 // Port to stream audio directly to AudioWorklet (legacy, used when no Mimi worker)
 let playbackPort = null;
 
@@ -80,6 +84,7 @@ async function drainQueue() {
             switch (type) {
                 case 'load':
                     logState('Loading model...');
+                    if (data.benchmark) benchmarkMode = true;
                     await handleLoad(data.config || {});
                     break;
                 case 'start-listening':
@@ -363,9 +368,13 @@ async function handleStop() {
     engine.generateStart();
 
     let transcript = '';
+    if (benchmarkMode) benchmarkFrames = [];
+    const genStartTime = performance.now();
     let result = await engine.generateStepInference();
 
     while (result) {
+        const frameStart = performance.now();
+
         if (mimiWorkerPort) {
             // Offloaded path: send audio tokens to Mimi worker for decode.
             // Don't wait — GPU is already computing the next temporal step.
@@ -400,6 +409,18 @@ async function handleStop() {
             text: `Generating... frame ${result.step + 1}`,
         });
 
+        // Collect per-frame timing in benchmark mode
+        if (benchmarkMode) {
+            const m = engine.getMetrics();
+            benchmarkFrames.push({
+                frameIdx: result.step,
+                totalMs: performance.now() - frameStart,
+                temporalMs: m.last_temporal_ms || 0,
+                depthMs: m.last_depth_ms || 0,
+                mimiMs: m.last_mimi_ms || 0,
+            });
+        }
+
         if (result.done) break;
 
         // Yield to the event loop so MessagePort messages (to Mimi worker)
@@ -413,8 +434,34 @@ async function handleStop() {
         result = await engine.generateStepInference();
     }
 
+    const totalGenMs = performance.now() - genStartTime;
     logState(`Generation complete: "${transcript.substring(0, 80)}${transcript.length > 80 ? '...' : ''}"`);
     sendMetrics(performance.now());
+
+    // In benchmark mode, post detailed results
+    if (benchmarkMode) {
+        const m = engine.getMetrics();
+        const frameCount = benchmarkFrames.length;
+        const avgFrameMs = frameCount > 0 ? totalGenMs / frameCount : 0;
+        const avgTemporalMs = frameCount > 0 ? benchmarkFrames.reduce((s, f) => s + f.temporalMs, 0) / frameCount : 0;
+        const avgDepthMs = frameCount > 0 ? benchmarkFrames.reduce((s, f) => s + f.depthMs, 0) / frameCount : 0;
+        const avgMimiMs = frameCount > 0 ? benchmarkFrames.reduce((s, f) => s + f.mimiMs, 0) / frameCount : 0;
+        const audioDuration = totalSamples / 24000;
+        self.postMessage({
+            type: 'benchmark-complete',
+            results: {
+                frames: benchmarkFrames,
+                avgFrameMs,
+                temporalMs: avgTemporalMs,
+                depthMs: avgDepthMs,
+                mimiMs: avgMimiMs,
+                framesPerSec: frameCount > 0 ? (frameCount / (totalGenMs / 1000)) : 0,
+                rtf: audioDuration > 0 ? (totalGenMs / 1000) / audioDuration : 0,
+                totalGenMs,
+                frameCount,
+            },
+        });
+    }
 
     self.postMessage({ type: 'transcript', text: '', final: true });
 

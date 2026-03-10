@@ -364,6 +364,8 @@
         const metricDepthMs = document.getElementById('metricDepthMs');
         const metricMimiMs = document.getElementById('metricMimiMs');
 
+        const isBenchmark = new URLSearchParams(location.search).has('benchmark');
+
         let worker = null;
         let mimiWorker = null;
         let audioCtx = null;
@@ -721,16 +723,16 @@
             initMimiWorker();
 
             const cached = await isModelCached();
-            if (cached) {
+            if (cached || isBenchmark) {
                 updateStatus('loading', 'Loading model from cache (~5 GB)...');
-                worker.postMessage({ type: 'load' });
+                worker.postMessage({ type: 'load', benchmark: isBenchmark });
             } else {
                 updateStatus('', 'Model not loaded (~5.1 GB download)');
                 downloadBtn.textContent = 'Download Model';
                 downloadBtn.style.display = '';
                 downloadBtn.addEventListener('click', () => {
                     downloadBtn.disabled = true;
-                    worker.postMessage({ type: 'load' });
+                    worker.postMessage({ type: 'load', benchmark: isBenchmark });
                 });
             }
         }
@@ -870,6 +872,48 @@
             if (!resp.ok) { updateStatus('error', 'Failed to fetch example WAV'); return; }
             await feedAudioFile(await resp.arrayBuffer(), 'joke.wav');
         });
+
+        // --- Benchmark mode ---
+        // When ?benchmark is in the URL, auto-drive the full pipeline
+        // and expose results on window.__benchmarkResults for Playwright.
+
+        if (isBenchmark) {
+            // Listen for benchmark-complete from worker
+            const origOnMessage = worker.onmessage;
+            worker.onmessage = (e) => {
+                origOnMessage(e);
+                const msg = e.data;
+                if (msg.type === 'benchmark-complete') {
+                    window.__benchmarkResults = msg.results;
+                    // Display results visually
+                    let pre = document.getElementById('benchmarkResults');
+                    if (!pre) {
+                        pre = document.createElement('pre');
+                        pre.id = 'benchmarkResults';
+                        pre.style.cssText = 'padding:16px;border:1px solid #ddd;font-size:12px;overflow:auto;max-height:400px;margin-top:12px;';
+                        document.querySelector('footer').before(pre);
+                    }
+                    pre.textContent = JSON.stringify(msg.results, null, 2);
+                }
+                if (msg.type === 'status' && msg.ready) {
+                    // Model loaded — feed test audio and generate
+                    benchmarkAutoRun();
+                }
+            };
+        }
+
+        async function benchmarkAutoRun() {
+            console.log('[benchmark] Model ready, feeding test audio...');
+            try {
+                const resp = await fetch('./joke.wav');
+                if (!resp.ok) throw new Error('Failed to fetch joke.wav: ' + resp.status);
+                const arrayBuf = await resp.arrayBuffer();
+                await feedAudioFile(arrayBuf, 'benchmark-joke.wav');
+            } catch (err) {
+                console.error('[benchmark] Auto-run failed:', err);
+                window.__benchmarkResults = { error: err.message };
+            }
+        }
 
         function buildWavBlob(samples) {
             const numSamples = samples.length;

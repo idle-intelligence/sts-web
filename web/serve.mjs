@@ -92,5 +92,5 @@ const server = createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
     console.log(`\nSTS dev server running:`);
     console.log(`  Local:   http://localhost:${PORT}`);
-    console.log(`  Model:   /hf/personaplex-7b-v1-q4_k-webgpu/ (local)\n`);
+    console.log(`  Model:   /hf/personaplex-24L-q4_k-webgpu/ (local)\n`);
 });

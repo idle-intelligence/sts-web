@@ -791,11 +791,14 @@
                         const audioDurationSec = mimiFrameCount > 0
                             ? (mimiFrameCount * 0.08).toFixed(1)
                             : '?';
+                        const genSec = generationStartTime > 0
+                            ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
+                            : '?';
                         const turnHistoryEl = document.getElementById('turnHistory');
                         const turnHistorySectionEl = document.getElementById('turnHistorySection');
                         const entry = document.createElement('div');
                         entry.className = 'turn-entry';
-                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${audioDurationSec}s</span>`;
+                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${genSec}s gen · ${audioDurationSec}s audio</span>`;
                         const blobUrl = lastTurnBlobUrl || audioPlayer._blobUrl;
                         if (blobUrl) {
                             const player = document.createElement('audio');

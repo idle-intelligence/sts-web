@@ -264,8 +264,22 @@
         }
         .voice-grid {
             display: flex;
-            flex-wrap: wrap;
+            flex-direction: column;
             gap: 4px;
+        }
+        .voice-row {
+            display: flex;
+            flex-wrap: nowrap;
+            align-items: center;
+            gap: 4px;
+        }
+        .voice-row-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 10px;
+            font-weight: 500;
+            color: var(--faint);
+            width: 12px;
+            flex-shrink: 0;
         }
         .voice-btn {
             font-family: 'IBM Plex Mono', monospace;
@@ -359,24 +373,30 @@
             <button class="voice-btn active" data-voice="" disabled id="voiceNoneBtn">None</button>
             <p class="hw-note" style="margin: 6px 0 10px;">No voice prompt — speaker identity sampled from prior distribution</p>
             <div class="voice-grid" id="voiceGrid">
-                <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
-                <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
-                <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
-                <button class="voice-btn" data-voice="NATF3" disabled>NATF3</button>
-                <button class="voice-btn" data-voice="NATM0" disabled>NATM0</button>
-                <button class="voice-btn" data-voice="NATM1" disabled>NATM1</button>
-                <button class="voice-btn" data-voice="NATM2" disabled>NATM2</button>
-                <button class="voice-btn" data-voice="NATM3" disabled>NATM3</button>
-                <button class="voice-btn" data-voice="VARF0" disabled>VARF0</button>
-                <button class="voice-btn" data-voice="VARF1" disabled>VARF1</button>
-                <button class="voice-btn" data-voice="VARF2" disabled>VARF2</button>
-                <button class="voice-btn" data-voice="VARF3" disabled>VARF3</button>
-                <button class="voice-btn" data-voice="VARF4" disabled>VARF4</button>
-                <button class="voice-btn" data-voice="VARM0" disabled>VARM0</button>
-                <button class="voice-btn" data-voice="VARM1" disabled>VARM1</button>
-                <button class="voice-btn" data-voice="VARM2" disabled>VARM2</button>
-                <button class="voice-btn" data-voice="VARM3" disabled>VARM3</button>
-                <button class="voice-btn" data-voice="VARM4" disabled>VARM4</button>
+                <div class="voice-row">
+                    <span class="voice-row-label">M</span>
+                    <button class="voice-btn" data-voice="NATM0" disabled>NATM0</button>
+                    <button class="voice-btn" data-voice="NATM1" disabled>NATM1</button>
+                    <button class="voice-btn" data-voice="NATM2" disabled>NATM2</button>
+                    <button class="voice-btn" data-voice="NATM3" disabled>NATM3</button>
+                    <button class="voice-btn" data-voice="VARM0" disabled>VARM0</button>
+                    <button class="voice-btn" data-voice="VARM1" disabled>VARM1</button>
+                    <button class="voice-btn" data-voice="VARM2" disabled>VARM2</button>
+                    <button class="voice-btn" data-voice="VARM3" disabled>VARM3</button>
+                    <button class="voice-btn" data-voice="VARM4" disabled>VARM4</button>
+                </div>
+                <div class="voice-row">
+                    <span class="voice-row-label">F</span>
+                    <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
+                    <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
+                    <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
+                    <button class="voice-btn" data-voice="NATF3" disabled>NATF3</button>
+                    <button class="voice-btn" data-voice="VARF0" disabled>VARF0</button>
+                    <button class="voice-btn" data-voice="VARF1" disabled>VARF1</button>
+                    <button class="voice-btn" data-voice="VARF2" disabled>VARF2</button>
+                    <button class="voice-btn" data-voice="VARF3" disabled>VARF3</button>
+                    <button class="voice-btn" data-voice="VARF4" disabled>VARF4</button>
+                </div>
             </div>
         </div>
         <div class="actions">

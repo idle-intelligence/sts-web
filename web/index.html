@@ -230,48 +230,50 @@
             margin-top: 8px;
         }
 
-        .voice-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .voice-section {
             margin-bottom: 16px;
         }
-        .voice-label {
+        .voice-section-label {
             font-family: 'IBM Plex Mono', monospace;
             font-size: 12px;
             font-weight: 500;
             letter-spacing: 0.04em;
             color: var(--faint);
-            flex-shrink: 0;
+            margin-bottom: 8px;
         }
-        select#voiceSelect {
+        .voice-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .voice-btn {
             font-family: 'IBM Plex Mono', monospace;
-            font-size: 13px;
-            padding: 7px 10px;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 4px 9px;
             border: 1px solid var(--border);
             background: transparent;
-            color: var(--text);
-            border-radius: 0;
+            color: var(--muted);
+            border-radius: 999px;
             cursor: pointer;
-            appearance: none;
-            -webkit-appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23999'/%3E%3C/svg%3E");
-            background-repeat: no-repeat;
-            background-position: right 10px center;
-            padding-right: 28px;
-            transition: border-color 0.15s;
+            transition: border-color 0.15s, background 0.15s, color 0.15s;
+            letter-spacing: 0.02em;
         }
-        select#voiceSelect:hover:not(:disabled) {
+        .voice-btn:hover:not(:disabled) {
+            border-color: var(--text);
+            color: var(--text);
+        }
+        .voice-btn.active {
+            background: var(--text);
+            color: var(--bg);
             border-color: var(--text);
         }
-        select#voiceSelect:disabled {
+        .voice-btn.loading {
+            border-style: dashed;
+        }
+        .voice-btn:disabled {
             opacity: 0.3;
             cursor: not-allowed;
-        }
-        #voiceStatus {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 12px;
-            color: var(--faint);
         }
         .wip-note {
             font-size: 13px;
@@ -331,38 +333,29 @@
 
     <section>
         <h2>conversation</h2>
-        <div class="voice-row">
-            <span class="voice-label">VOICE</span>
-            <select id="voiceSelect" disabled>
-                <option value="">Random</option>
-                <optgroup label="Natural Female">
-                    <option value="NATF0">NATF0</option>
-                    <option value="NATF1">NATF1</option>
-                    <option value="NATF2">NATF2</option>
-                    <option value="NATF3">NATF3</option>
-                </optgroup>
-                <optgroup label="Natural Male">
-                    <option value="NATM0">NATM0</option>
-                    <option value="NATM1">NATM1</option>
-                    <option value="NATM2">NATM2</option>
-                    <option value="NATM3">NATM3</option>
-                </optgroup>
-                <optgroup label="Variable Female">
-                    <option value="VARF0">VARF0</option>
-                    <option value="VARF1">VARF1</option>
-                    <option value="VARF2">VARF2</option>
-                    <option value="VARF3">VARF3</option>
-                    <option value="VARF4">VARF4</option>
-                </optgroup>
-                <optgroup label="Variable Male">
-                    <option value="VARM0">VARM0</option>
-                    <option value="VARM1">VARM1</option>
-                    <option value="VARM2">VARM2</option>
-                    <option value="VARM3">VARM3</option>
-                    <option value="VARM4">VARM4</option>
-                </optgroup>
-            </select>
-            <span id="voiceStatus"></span>
+        <div class="voice-section">
+            <div class="voice-section-label">VOICE</div>
+            <div class="voice-grid" id="voiceGrid">
+                <button class="voice-btn active" data-voice="" disabled>Random</button>
+                <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
+                <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
+                <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
+                <button class="voice-btn" data-voice="NATF3" disabled>NATF3</button>
+                <button class="voice-btn" data-voice="NATM0" disabled>NATM0</button>
+                <button class="voice-btn" data-voice="NATM1" disabled>NATM1</button>
+                <button class="voice-btn" data-voice="NATM2" disabled>NATM2</button>
+                <button class="voice-btn" data-voice="NATM3" disabled>NATM3</button>
+                <button class="voice-btn" data-voice="VARF0" disabled>VARF0</button>
+                <button class="voice-btn" data-voice="VARF1" disabled>VARF1</button>
+                <button class="voice-btn" data-voice="VARF2" disabled>VARF2</button>
+                <button class="voice-btn" data-voice="VARF3" disabled>VARF3</button>
+                <button class="voice-btn" data-voice="VARF4" disabled>VARF4</button>
+                <button class="voice-btn" data-voice="VARM0" disabled>VARM0</button>
+                <button class="voice-btn" data-voice="VARM1" disabled>VARM1</button>
+                <button class="voice-btn" data-voice="VARM2" disabled>VARM2</button>
+                <button class="voice-btn" data-voice="VARM3" disabled>VARM3</button>
+                <button class="voice-btn" data-voice="VARM4" disabled>VARM4</button>
+            </div>
         </div>
         <div class="actions">
             <button id="myTurnBtn" class="primary" disabled>My Turn</button>
@@ -443,8 +436,9 @@
         const exampleBtn = document.getElementById('exampleBtn');
         const audioPlayer = document.getElementById('audioPlayer');
         const audioStatus = document.getElementById('audioStatus');
-        const voiceSelect = document.getElementById('voiceSelect');
-        const voiceStatus = document.getElementById('voiceStatus');
+        const voiceGrid = document.getElementById('voiceGrid');
+        const voiceBtns = Array.from(voiceGrid.querySelectorAll('.voice-btn'));
+        let activeVoiceBtn = voiceBtns[0]; // "Random" starts active
         const metricsCard = document.getElementById('metricsCard');
         const metricFrameMs = document.getElementById('metricFrameMs');
         const metricFps = document.getElementById('metricFps');
@@ -485,7 +479,7 @@
                     yourTurnBtn.disabled = true;
                     fileBtn.disabled = false;
                     exampleBtn.disabled = false;
-                    voiceSelect.disabled = false;
+                    voiceBtns.forEach(b => b.disabled = false);
                     break;
                 case 'listening':
                     myTurnBtn.style.display = 'none';
@@ -494,7 +488,7 @@
                     newConvoBtn.style.display = '';
                     fileBtn.disabled = true;
                     exampleBtn.disabled = true;
-                    voiceSelect.disabled = true;
+                    voiceBtns.forEach(b => b.disabled = true);
                     break;
                 case 'generating':
                 case 'speaking':
@@ -502,7 +496,7 @@
                     yourTurnBtn.style.display = 'none';
                     fileBtn.disabled = true;
                     exampleBtn.disabled = true;
-                    voiceSelect.disabled = true;
+                    voiceBtns.forEach(b => b.disabled = true);
                     break;
             }
         }
@@ -670,7 +664,7 @@
                                 myTurnBtn.disabled = false;
                                 fileBtn.disabled = false;
                                 exampleBtn.disabled = false;
-                                voiceSelect.disabled = false;
+                                voiceBtns.forEach(b => b.disabled = false);
                             }
                             progressBar.classList.remove('visible');
                             progressInfo.textContent = '';
@@ -758,13 +752,18 @@
                         break;
 
                     case 'voice-loaded':
-                        voiceStatus.textContent = msg.name ? `loaded: ${msg.name}` : '';
-                        voiceSelect.disabled = false;
+                        voiceBtns.forEach(b => {
+                            b.disabled = false;
+                            b.classList.remove('loading');
+                        });
                         break;
 
                     case 'voice-error':
-                        voiceStatus.textContent = `error: ${msg.message}`;
-                        voiceSelect.disabled = false;
+                        console.error('[voice]', msg.message);
+                        voiceBtns.forEach(b => {
+                            b.disabled = false;
+                            b.classList.remove('loading');
+                        });
                         break;
 
                     case 'error':
@@ -923,15 +922,16 @@
 
         // --- Voice preset ---
 
-        voiceSelect.addEventListener('change', () => {
-            const name = voiceSelect.value;
-            if (!name) {
-                voiceStatus.textContent = '';
-                worker.postMessage({ type: 'load-voice-preset', name: null });
-                return;
-            }
-            voiceStatus.textContent = 'loading...';
-            voiceSelect.disabled = true;
+        voiceGrid.addEventListener('click', (e) => {
+            const btn = e.target.closest('.voice-btn');
+            if (!btn || btn.disabled) return;
+
+            activeVoiceBtn.classList.remove('active');
+            btn.classList.add('active', 'loading');
+            activeVoiceBtn = btn;
+
+            const name = btn.dataset.voice || null;
+            voiceBtns.forEach(b => b.disabled = true);
             worker.postMessage({ type: 'load-voice-preset', name });
         });
 

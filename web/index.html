@@ -273,14 +273,6 @@
             align-items: center;
             gap: 4px;
         }
-        .voice-row-label {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 10px;
-            font-weight: 500;
-            color: var(--faint);
-            width: 12px;
-            flex-shrink: 0;
-        }
         .voice-btn {
             font-family: 'IBM Plex Mono', monospace;
             font-size: 11px;
@@ -374,7 +366,6 @@
             <p class="hw-note" style="margin: 6px 0 10px;">No voice prompt — speaker identity sampled from prior distribution</p>
             <div class="voice-grid" id="voiceGrid">
                 <div class="voice-row">
-                    <span class="voice-row-label">M</span>
                     <button class="voice-btn" data-voice="NATM0" disabled>NATM0</button>
                     <button class="voice-btn" data-voice="NATM1" disabled>NATM1</button>
                     <button class="voice-btn" data-voice="NATM2" disabled>NATM2</button>
@@ -386,7 +377,6 @@
                     <button class="voice-btn" data-voice="VARM4" disabled>VARM4</button>
                 </div>
                 <div class="voice-row">
-                    <span class="voice-row-label">F</span>
                     <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
                     <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
                     <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
@@ -798,18 +788,19 @@
                         setUIState('idle');
                         // Record turn history entry
                         turnCount++;
-                        const durationSec = generationStartTime
-                            ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
+                        const audioDurationSec = mimiFrameCount > 0
+                            ? (mimiFrameCount * 0.08).toFixed(1)
                             : '?';
                         const turnHistoryEl = document.getElementById('turnHistory');
                         const turnHistorySectionEl = document.getElementById('turnHistorySection');
                         const entry = document.createElement('div');
                         entry.className = 'turn-entry';
-                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${durationSec}s</span>`;
-                        if (lastTurnBlobUrl) {
+                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${audioDurationSec}s</span>`;
+                        const blobUrl = lastTurnBlobUrl || audioPlayer._blobUrl;
+                        if (blobUrl) {
                             const player = document.createElement('audio');
                             player.controls = true;
-                            player.src = lastTurnBlobUrl;
+                            player.src = blobUrl;
                             entry.appendChild(player);
                             lastTurnBlobUrl = null;
                         }

@@ -756,14 +756,16 @@
                             b.disabled = false;
                             b.classList.remove('loading');
                         });
+                        updateStatus('ready', 'Ready');
                         break;
 
                     case 'voice-error':
-                        console.error('[voice]', msg.message);
+                        console.error('[voice]', msg.error);
                         voiceBtns.forEach(b => {
                             b.disabled = false;
                             b.classList.remove('loading');
                         });
+                        updateStatus('ready', 'Ready');
                         break;
 
                     case 'error':

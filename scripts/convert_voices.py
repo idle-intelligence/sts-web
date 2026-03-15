@@ -3,7 +3,7 @@ Convert PersonaPlex .pt voice preset files to sts-web web format.
 
 Each .pt contains:
   embeddings: [num_frames, 1, 1, hidden_dim] bfloat16
-  cache:      [1, cache_frames, num_streams]  int64
+  cache:      [1, num_streams, num_positions]  int64
 
 Output per voice:
   {name}.embeddings.bin  -- raw f32le bytes, shape [num_frames, hidden_dim] flattened
@@ -46,7 +46,7 @@ def convert(src: Path, dst_dir: Path) -> None:
         raise ValueError(f"{src.name}: expected dict with 'embeddings' and 'cache' keys, got {list(data.keys()) if isinstance(data, dict) else type(data)}")
 
     emb = data["embeddings"]   # [num_frames, 1, 1, hidden_dim] bfloat16
-    cache = data["cache"]      # [1, cache_frames, num_streams]  int64
+    cache = data["cache"]      # [1, num_streams, num_positions]  int64
 
     # Squeeze extra dims: [num_frames, hidden_dim]
     emb = emb.squeeze()        # removes all size-1 dims
@@ -59,12 +59,11 @@ def convert(src: Path, dst_dir: Path) -> None:
     emb_f32 = emb.to(torch.float32)
     emb_bytes = struct.pack(f"<{emb_f32.numel()}f", *emb_f32.flatten().tolist())
 
-    # Cache: [1, cache_frames, num_streams] -> [num_streams, cache_frames]
-    cache = cache.squeeze(0)   # [cache_frames, num_streams]
-    cache_transposed = cache.T  # [num_streams, cache_frames]
-    num_streams, cache_frames = cache_transposed.shape
+    # Cache: [1, num_streams, num_positions] -> [num_streams, num_positions]
+    cache = cache.squeeze(0)   # [num_streams, num_positions]
+    num_streams, num_positions = cache.shape
 
-    cache_lists = cache_transposed.tolist()  # list of lists, already int
+    cache_lists = cache.tolist()  # list of lists, already int
 
     name = src.stem
     bin_path = dst_dir / f"{name}.embeddings.bin"
@@ -80,7 +79,7 @@ def convert(src: Path, dst_dir: Path) -> None:
     json_path.write_text(json.dumps(cache_obj, separators=(",", ":")))
 
     print(f"  {name}: embeddings [{num_frames} × {hidden_dim}] → {bin_path.name} ({len(emb_bytes)} bytes)")
-    print(f"  {name}: cache [{num_streams} streams × {cache_frames} frames] → {json_path.name}")
+    print(f"  {name}: cache [{num_streams} streams × {num_positions} positions] → {json_path.name}")
 
 
 def main() -> None:

@@ -191,6 +191,8 @@
         #turnHistory { margin-top: 8px; }
         .turn-entry {
             display: flex;
+            flex-wrap: wrap;
+            align-items: center;
             gap: 16px;
             font-family: 'IBM Plex Mono', monospace;
             font-size: 13px;
@@ -201,6 +203,11 @@
         .turn-entry:last-child { border-bottom: none; }
         .turn-label { color: var(--text); }
         .turn-duration { color: var(--faint); }
+        .turn-entry audio {
+            height: 28px;
+            flex: 1 1 200px;
+            min-width: 0;
+        }
 
         #metricsCard { display: none; }
         .metrics-grid {
@@ -484,6 +491,7 @@
         const allDecodedChunks = []; // Collect decoded audio from Mimi worker for WAV export
         let mimiTotalMs = 0;       // Accumulated Mimi decode time from Mimi worker
         let mimiFrameCount = 0;    // Number of Mimi decode frames
+        let lastTurnBlobUrl = null; // WAV blob URL for the completed turn (attached to history entry)
 
         // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
         let uiState = 'idle';
@@ -655,6 +663,7 @@
                             audioPlayer.src = audioPlayer._blobUrl;
                             audioPlayer.style.display = 'block';
                             audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
+                            lastTurnBlobUrl = audioPlayer._blobUrl;
                         }
                         break;
                     }
@@ -744,6 +753,7 @@
                         audioPlayer.src = audioPlayer._blobUrl;
                         audioPlayer.style.display = 'block';
                         audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
+                        lastTurnBlobUrl = audioPlayer._blobUrl;
                         break;
                     }
 
@@ -776,6 +786,13 @@
                         const entry = document.createElement('div');
                         entry.className = 'turn-entry';
                         entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${durationSec}s</span>`;
+                        if (lastTurnBlobUrl) {
+                            const player = document.createElement('audio');
+                            player.controls = true;
+                            player.src = lastTurnBlobUrl;
+                            entry.appendChild(player);
+                            lastTurnBlobUrl = null;
+                        }
                         turnHistoryEl.appendChild(entry);
                         turnHistorySectionEl.style.display = '';
                         break;

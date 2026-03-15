@@ -188,6 +188,20 @@
             color: var(--text);
         }
 
+        #turnHistory { margin-top: 8px; }
+        .turn-entry {
+            display: flex;
+            gap: 16px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--muted);
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .turn-entry:last-child { border-bottom: none; }
+        .turn-label { color: var(--text); }
+        .turn-duration { color: var(--faint); }
+
         #metricsCard { display: none; }
         .metrics-grid {
             display: grid;
@@ -376,6 +390,11 @@
         <p id="audioStatus" class="info"></p>
     </section>
 
+    <section id="turnHistorySection" style="display:none">
+        <h2>turns</h2>
+        <div id="turnHistory"></div>
+    </section>
+
     <section>
         <h2>files <span class="sub">· test mode</span></h2>
         <div class="actions">
@@ -466,6 +485,8 @@
 
         // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
         let uiState = 'idle';
+        let turnCount = 0;
+        let generationStartTime = 0;
 
         function setUIState(state) {
             uiState = state;
@@ -491,6 +512,8 @@
                     voiceBtns.forEach(b => b.disabled = true);
                     break;
                 case 'generating':
+                    generationStartTime = performance.now();
+                    /* falls through */
                 case 'speaking':
                     myTurnBtn.style.display = 'none';
                     yourTurnBtn.style.display = 'none';
@@ -738,10 +761,23 @@
                         break;
                     }
 
-                    case 'turn-complete':
+                    case 'turn-complete': {
                         updateStatus('ready', 'Ready');
                         setUIState('idle');
+                        // Record turn history entry
+                        turnCount++;
+                        const durationSec = generationStartTime
+                            ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
+                            : '?';
+                        const turnHistoryEl = document.getElementById('turnHistory');
+                        const turnHistorySectionEl = document.getElementById('turnHistorySection');
+                        const entry = document.createElement('div');
+                        entry.className = 'turn-entry';
+                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${durationSec}s</span>`;
+                        turnHistoryEl.appendChild(entry);
+                        turnHistorySectionEl.style.display = '';
                         break;
+                    }
 
                     case 'metrics':
                         // Override Mimi timing with data from the Mimi worker

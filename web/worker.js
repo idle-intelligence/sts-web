@@ -404,6 +404,15 @@ async function handleStop() {
             done: result.done,
         });
 
+        if (result.audio_tokens) {
+            const silenceTokens = [948, 243, 1178, 546, 1736, 1030, 1978, 2008];
+            const audio = Array.from(result.audio_tokens);
+            const matches = audio.filter((t, i) => t === silenceTokens[i]).length;
+            if (matches >= 1) {
+                console.log(`[silence-check] Frame ${result.step}: ${matches}/8 match, audio=[${audio}]`);
+            }
+        }
+
         if (result.text) {
             transcript += result.text;
             self.postMessage({ type: 'transcript', text: result.text, final: false });

@@ -229,6 +229,14 @@
             color: var(--faint);
             margin-top: 8px;
         }
+        .wip-note {
+            font-size: 13px;
+            color: var(--yellow);
+            border: 1px solid var(--yellow);
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 24px;
+        }
 
         footer {
             border-top: 1px solid var(--border);
@@ -258,6 +266,8 @@
             <a href="https://github.com/idle-intelligence/sts-web">github.com/idle-intelligence/sts-web</a>
         </p>
     </header>
+
+    <p class="wip-note">⚠ Work in progress — this model runs slower than realtime without a powerful GPU. Expect delays during audio generation.</p>
 
     <section>
         <h2>status</h2>
@@ -568,7 +578,7 @@
         function initWorker() {
             worker = new Worker('./worker.js', { type: 'module' });
 
-            worker.onmessage = (e) => {
+            worker.onmessage = async (e) => {
                 const msg = e.data;
                 switch (msg.type) {
                     case 'status':
@@ -609,9 +619,14 @@
 
                     case 'audio-chunk':
                         if (!isBenchmark) {
-                            audioStatus.textContent = msg.done
-                                ? 'Generation complete'
-                                : `Generating... frame ${msg.step + 1}`;
+                            if (msg.done) {
+                                audioStatus.textContent = 'Generation complete';
+                            } else {
+                                const playing = msg.step >= 24;
+                                audioStatus.textContent = playing
+                                    ? `Playing (frame ${msg.step + 1})`
+                                    : `Buffering audio... (frame ${msg.step + 1}/25)`;
+                            }
                         }
                         if (msg.done && playbackNode) {
                             playbackNode.port.postMessage({ type: 'flush' });
@@ -773,6 +788,7 @@
             worker.postMessage({ type: 'stop' });
             setUIState('generating');
             updateStatus('active', 'Generating response...');
+            audioStatus.textContent = 'Buffering audio...';
 
             // Clear decoded audio chunks and Mimi timing for new generation
             allDecodedChunks.length = 0;

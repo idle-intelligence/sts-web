@@ -246,7 +246,7 @@ impl StsStream {
             repetition_penalty: 1.2,
             penalty_window: 30,
             consecutive_silence_frames: 0,
-            silence_early_stop_frames: 8, // ~0.6s of silence triggers stop
+            silence_early_stop_frames: 8, // ~0.64s of silence triggers stop
             consecutive_text_pad_frames: 0,
             text_pad_stop_frames: 6, // ~0.5s of text padding after real text → stop
             has_generated_text: false,
@@ -807,17 +807,13 @@ impl StsStream {
 
     /// Check if the last model output is silence (all 8 codebooks match silence tokens).
     pub fn is_silence(&self) -> bool {
-        self.last_model_audio_tokens
-            .iter()
-            .zip(self.config.silence_tokens.iter())
-            .all(|(&got, &expected)| got == expected)
+        self.last_model_audio_tokens.len() >= 2
+            && self.last_model_audio_tokens[1] == self.config.silence_tokens[1]
     }
 
     /// Check if generation should stop due to sustained silence or text completion.
     pub fn should_stop(&self) -> bool {
         self.consecutive_silence_frames >= self.silence_early_stop_frames
-            || (self.has_generated_text
-                && self.consecutive_text_pad_frames >= self.text_pad_stop_frames)
     }
 
     /// Get the number of consecutive silence frames so far.

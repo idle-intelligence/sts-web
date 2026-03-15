@@ -349,8 +349,9 @@
         <h2>conversation</h2>
         <div class="voice-section">
             <div class="voice-section-label">VOICE</div>
+            <button class="voice-btn active" data-voice="" disabled id="voiceNoneBtn">None</button>
+            <p class="hw-note" style="margin: 6px 0 10px;">No voice conditioning — model chooses freely</p>
             <div class="voice-grid" id="voiceGrid">
-                <button class="voice-btn active" data-voice="" disabled>None</button>
                 <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
                 <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
                 <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
@@ -456,8 +457,9 @@
         const audioPlayer = document.getElementById('audioPlayer');
         const audioStatus = document.getElementById('audioStatus');
         const voiceGrid = document.getElementById('voiceGrid');
-        const voiceBtns = Array.from(voiceGrid.querySelectorAll('.voice-btn'));
-        let activeVoiceBtn = voiceBtns[0]; // "Random" starts active
+        const voiceNoneBtn = document.getElementById('voiceNoneBtn');
+        const voiceBtns = [voiceNoneBtn, ...Array.from(voiceGrid.querySelectorAll('.voice-btn'))];
+        let activeVoiceBtn = voiceNoneBtn;
         const metricsCard = document.getElementById('metricsCard');
         const metricFrameMs = document.getElementById('metricFrameMs');
         const metricFps = document.getElementById('metricFps');
@@ -960,7 +962,7 @@
 
         // --- Voice preset ---
 
-        voiceGrid.addEventListener('click', (e) => {
+        function handleVoiceClick(e) {
             const btn = e.target.closest('.voice-btn');
             if (!btn || btn.disabled) return;
 
@@ -971,7 +973,9 @@
             const name = btn.dataset.voice || null;
             voiceBtns.forEach(b => b.disabled = true);
             worker.postMessage({ type: 'load-voice-preset', name });
-        });
+        }
+        voiceGrid.addEventListener('click', handleVoiceClick);
+        voiceNoneBtn.addEventListener('click', handleVoiceClick);
 
         // --- File handlers (test mode) ---
 

@@ -408,7 +408,7 @@ async function handleStop() {
             const silenceTokens = [948, 243, 1178, 546, 1736, 1030, 1978, 2008];
             const audio = Array.from(result.audio_tokens);
             const matches = audio.filter((t, i) => t === silenceTokens[i]).length;
-            if (matches >= 1) {
+            if (matches >= 3) {
                 console.log(`[silence-check] Frame ${result.step}: ${matches}/8 match, audio=[${audio}]`);
             }
         }
@@ -422,6 +422,9 @@ async function handleStop() {
             type: 'status',
             text: `Generating... frame ${result.step + 1}`,
         });
+
+        // Send live metrics every frame so the UI updates from frame 0
+        sendMetrics(performance.now());
 
         // Collect per-frame timing in benchmark mode using cumulative metric deltas
         if (benchmarkMode) {

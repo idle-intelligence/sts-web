@@ -14,6 +14,7 @@
  *     { type: 'audio-port', port: MessagePort }            -- direct port from mic AudioWorklet
  *     { type: 'playback-port', port: MessagePort }         -- port to stream PCM to AudioWorklet (fallback)
  *     { type: 'mimi-worker-port', port: MessagePort }      -- port to Mimi worker for offloaded decode
+ *     { type: 'load-voice-preset', name: string }          -- load voice preset ('random' = no preset)
  *
  *   Worker -> Main:
  *     { type: 'status', text, ready?, progress? }          -- loading/ready/generating status
@@ -22,6 +23,8 @@
  *     { type: 'transcript', text, final? }                 -- streaming text tokens (inner monologue)
  *     { type: 'metrics', framesPerSec, avgFrameMs, ... }   -- performance metrics after generation
  *     { type: 'error', message }                           -- unrecoverable error
+ *     { type: 'voice-loaded', name }                       -- voice preset loaded successfully
+ *     { type: 'voice-error', name, error }                 -- voice preset load failed
  *
  * ## Expected Call Sequence
  *
@@ -112,6 +115,9 @@ async function drainQueue() {
                     prefillFrames = 0;
                     totalSamples = 0;
                     handleNewConversation();
+                    break;
+                case 'load-voice-preset':
+                    await handleLoadVoicePreset(data.name);
                     break;
                 default:
                     console.warn('[worker] Unknown message type:', type);
@@ -496,6 +502,33 @@ async function handleStop() {
     stopped = false;
     logState('Turn complete, ready for next turn');
     self.postMessage({ type: 'turn-complete' });
+}
+
+// ---------------------------------------------------------------------------
+// Voice preset loader
+// ---------------------------------------------------------------------------
+
+async function handleLoadVoicePreset(name) {
+    if (name === 'random') {
+        self.postMessage({ type: 'voice-loaded', name: 'random' });
+        return;
+    }
+
+    try {
+        const embeddingsUrl = `${HF_BASE}/voices/${name}.embeddings.bin`;
+        const cacheJsonUrl = `${HF_BASE}/voices/${name}.cache.json`;
+
+        const [embeddingsBuffer, cacheJsonBuffer] = await Promise.all([
+            cachedFetch(embeddingsUrl, `Loading voice ${name} embeddings`),
+            cachedFetch(cacheJsonUrl, `Loading voice ${name} cache`),
+        ]);
+
+        const cacheJson = new TextDecoder().decode(cacheJsonBuffer);
+        engine.loadVoicePreset(new Uint8Array(embeddingsBuffer), cacheJson);
+        self.postMessage({ type: 'voice-loaded', name });
+    } catch (err) {
+        self.postMessage({ type: 'voice-error', name, error: err.message || String(err) });
+    }
 }
 
 // ---------------------------------------------------------------------------

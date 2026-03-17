@@ -339,7 +339,7 @@
         </p>
     </header>
 
-    <p class="wip-note">⚠ Work in progress — this model runs slower than realtime without a powerful GPU. Expect delays during audio generation.</p>
+    <p class="wip-note">⚠ Work in progress — the pruned model has degraded conversational ability. Runs slower than realtime without a powerful GPU.</p>
 
     <section>
         <h2>status</h2>
@@ -676,15 +676,13 @@
                             audioPlayer.style.display = 'block';
                             audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
                             const blobUrl = audioPlayer._blobUrl;
-                            if (pendingTurnGenSec !== null) {
-                                // turn-complete already arrived — create the entry now
-                                addTurnHistoryEntry(pendingTurnNumber, pendingTurnGenSec, blobUrl);
-                                pendingTurnGenSec = null;
-                                pendingTurnNumber = null;
-                            } else {
-                                // turn-complete hasn't arrived yet — buffer for it
-                                pendingTurnBlobUrl = blobUrl;
-                            }
+                            // Create turn entry — use saved gen time or compute now
+                            const genSec = pendingTurnGenSec
+                                || (generationStartTime > 0 ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?');
+                            const turnNum = pendingTurnNumber || (turnCount + 1);
+                            addTurnHistoryEntry(turnNum, genSec, blobUrl);
+                            pendingTurnGenSec = null;
+                            pendingTurnNumber = null;
                         }
                         break;
                     }
@@ -794,13 +792,12 @@
                         audioPlayer.style.display = 'block';
                         audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
                         const acBlobUrl = audioPlayer._blobUrl;
-                        if (pendingTurnGenSec !== null) {
-                            addTurnHistoryEntry(pendingTurnNumber, pendingTurnGenSec, acBlobUrl);
-                            pendingTurnGenSec = null;
-                            pendingTurnNumber = null;
-                        } else {
-                            pendingTurnBlobUrl = acBlobUrl;
-                        }
+                        const acGenSec = pendingTurnGenSec
+                            || (generationStartTime > 0 ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?');
+                        const acTurnNum = pendingTurnNumber || (turnCount + 1);
+                        addTurnHistoryEntry(acTurnNum, acGenSec, acBlobUrl);
+                        pendingTurnGenSec = null;
+                        pendingTurnNumber = null;
                         break;
                     }
 
@@ -824,18 +821,12 @@
                         updateStatus('ready', 'Ready');
                         setUIState('idle');
                         turnCount++;
-                        const genSec = generationStartTime > 0
+                        // Gen time is captured now; the turn entry is created
+                        // from the decoded-done handler when the audio blob is ready.
+                        pendingTurnGenSec = generationStartTime > 0
                             ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
                             : '?';
-                        if (pendingTurnBlobUrl !== null) {
-                            // decoded done already arrived — create the entry now
-                            addTurnHistoryEntry(turnCount, genSec, pendingTurnBlobUrl);
-                            pendingTurnBlobUrl = null;
-                        } else {
-                            // wait for decoded done to arrive with the blob
-                            pendingTurnGenSec = genSec;
-                            pendingTurnNumber = turnCount;
-                        }
+                        pendingTurnNumber = turnCount;
                         break;
                     }
 

@@ -675,12 +675,12 @@
                             audioPlayer.src = audioPlayer._blobUrl;
                             audioPlayer.style.display = 'block';
                             audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
-                            const blobUrl = audioPlayer._blobUrl;
-                            // Create turn entry — use saved gen time or compute now
+                            // Create a SEPARATE blob URL for the history (the main player's gets revoked next turn)
+                            const historyBlobUrl = URL.createObjectURL(wavBlob);
                             const genSec = pendingTurnGenSec
                                 || (generationStartTime > 0 ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?');
                             const turnNum = pendingTurnNumber || (turnCount + 1);
-                            addTurnHistoryEntry(turnNum, genSec, blobUrl);
+                            addTurnHistoryEntry(turnNum, genSec, historyBlobUrl);
                             pendingTurnGenSec = null;
                             pendingTurnNumber = null;
                         }
@@ -791,11 +791,11 @@
                         audioPlayer.src = audioPlayer._blobUrl;
                         audioPlayer.style.display = 'block';
                         audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
-                        const acBlobUrl = audioPlayer._blobUrl;
+                        const acHistoryBlobUrl = URL.createObjectURL(wavBlob);
                         const acGenSec = pendingTurnGenSec
                             || (generationStartTime > 0 ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?');
                         const acTurnNum = pendingTurnNumber || (turnCount + 1);
-                        addTurnHistoryEntry(acTurnNum, acGenSec, acBlobUrl);
+                        addTurnHistoryEntry(acTurnNum, acGenSec, acHistoryBlobUrl);
                         pendingTurnGenSec = null;
                         pendingTurnNumber = null;
                         break;

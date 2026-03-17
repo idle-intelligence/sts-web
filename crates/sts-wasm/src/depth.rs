@@ -20,11 +20,15 @@
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::Tensor;
+use cubecl::server::Handle;
 
-use crate::gguf::{EmbeddingStore, Linear};
-use crate::model::{sample_greedy, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
+use crate::gguf::{
+    gpu_argmax, gpu_read_token_tensor, gpu_read_token_tensors,
+    DepthGpuBuffers, EmbeddingStore, Linear,
+};
+use crate::model::{fused_attention, gpu_cache_write_v, sample_top_k_with_penalty, KVCache, LayerCaches, RmsNormLayer};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::model::sample_top_k;
+use crate::model::{sample_greedy, sample_top_k};
 use crate::StsConfig;
 
 // ---------------------------------------------------------------------------
@@ -42,8 +46,8 @@ use crate::StsConfig;
 ///
 /// We store them pre-split as 16 separate Q4Linear instances.
 pub struct MultiLinearAttention {
-    in_projs: Vec<Linear>,   // 16 separate [3072, 1024] linears
-    out_projs: Vec<Linear>,  // 16 separate [1024, 1024] linears
+    pub(crate) in_projs: Vec<Linear>,   // 16 separate [3072, 1024] linears
+    pub(crate) out_projs: Vec<Linear>,  // 16 separate [1024, 1024] linears
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -82,9 +86,9 @@ impl MultiLinearAttention {
         let offset = cache.offset();
 
         let qkv = self.in_projs[step_idx].forward(x);
-        let [b, s, _] = qkv.dims();
         let kv_dim = self.n_kv_heads * self.head_dim;
 
+        let [b, s, _] = qkv.dims();
         let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
         let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
         let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
@@ -94,9 +98,27 @@ impl MultiLinearAttention {
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // No positional embedding for depth transformer (depformer_pos_emb="none" in Moshi)
-        // Q and K are used directly without RoPE.
 
-        let q = q.swap_dims(1, 2);
+        // Generation mode (S=1, no GQA): fused cache write path.
+        // Saves 4 dispatches per layer (swap_dims+contiguous+slice_assign for K and V).
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            // Write K and V directly to cache (no RoPE for depth transformer)
+            gpu_cache_write_v(&k, &k_cache_handle, offset, max_len);
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_projs[step_idx].forward(out);
+        }
+
+        // Prefill path
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -120,11 +142,12 @@ impl MultiLinearAttention {
             (k, v)
         };
 
+        // Prefill path: need Q in [B, H, S, D]
+        let q = q.swap_dims(1, 2);
         let k_t = k.swap_dims(2, 3);
         let scores = q.matmul(k_t) * self.scale;
 
-        // Causal mask for depth steps (only needed if seq_len > 1, which
-        // shouldn't happen in step-by-step inference, but handle it)
+        // Causal mask for depth steps (only needed if seq_len > 1)
         let scores = if seq_len > 1 {
             let device = scores.device();
             let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
@@ -152,6 +175,102 @@ impl MultiLinearAttention {
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
         self.out_projs[step_idx].forward(out)
     }
+
+    /// Forward with fused residual addition in the out_proj matmul.
+    pub fn forward_with_cache_fused_residual(
+        &self,
+        x: Tensor<Wgpu, 3>,
+        residual: Tensor<Wgpu, 3>,
+        step_idx: usize,
+        cache: &mut KVCache,
+    ) -> Tensor<Wgpu, 3> {
+        let [batch, seq_len, _] = x.dims();
+        let offset = cache.offset();
+
+        let qkv = self.in_projs[step_idx].forward(x);
+        let kv_dim = self.n_kv_heads * self.head_dim;
+
+        let [b, s, _] = qkv.dims();
+        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
+        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
+        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
+
+        let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+
+        // Generation mode (S=1, no GQA): fused cache write path.
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            gpu_cache_write_v(&k, &k_cache_handle, offset, max_len);
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_projs[step_idx].forward_with_residual(out, residual);
+        }
+
+        // Prefill path
+        let k = k.swap_dims(1, 2);
+        let v = v.swap_dims(1, 2);
+
+        let (k, v) = cache.update(k, v);
+        let total_seq_len = cache.seq_len();
+
+        let (k, v) = if self.n_heads != self.n_kv_heads {
+            let repeat_factor = self.n_heads / self.n_kv_heads;
+            let [b, nkv, s, hd] = k.dims();
+            let k = k
+                .unsqueeze_dim::<5>(2)
+                .repeat_dim(2, repeat_factor)
+                .reshape([b, nkv * repeat_factor, s, hd]);
+            let v = v
+                .unsqueeze_dim::<5>(2)
+                .repeat_dim(2, repeat_factor)
+                .reshape([b, nkv * repeat_factor, s, hd]);
+            (k, v)
+        } else {
+            (k, v)
+        };
+
+        // Prefill path: need Q in [B, H, S, D]
+        let q = q.swap_dims(1, 2);
+        let k_t = k.swap_dims(2, 3);
+        let scores = q.matmul(k_t) * self.scale;
+
+        let scores = if seq_len > 1 {
+            let device = scores.device();
+            let mut mask_data = vec![0.0f32; seq_len * total_seq_len];
+            for i in 0..seq_len {
+                let actual_pos = offset + i;
+                for j in 0..total_seq_len {
+                    if j > actual_pos {
+                        mask_data[i * total_seq_len + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let mask: Tensor<Wgpu, 1> = Tensor::from_floats(mask_data.as_slice(), &device);
+            let mask: Tensor<Wgpu, 4> = mask
+                .reshape([seq_len, total_seq_len])
+                .unsqueeze_dim::<3>(0)
+                .unsqueeze_dim(0);
+            scores + mask
+        } else {
+            scores
+        };
+
+        let attn = softmax(scores, 3);
+        let out = attn.matmul(v);
+        let out = out.swap_dims(1, 2);
+        let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        self.out_projs[step_idx].forward_with_residual(out, residual)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,8 +285,8 @@ impl MultiLinearAttention {
 /// - `gating.{0-15}.linear_in.weight`: [5632, 1024] = 2 * 2816
 /// - `gating.{0-15}.linear_out.weight`: [1024, 2816]
 pub struct MultiLinearFeedForward {
-    linear_ins: Vec<Linear>,   // 16 x [5632, 1024]
-    linear_outs: Vec<Linear>,  // 16 x [1024, 2816]
+    pub(crate) linear_ins: Vec<Linear>,   // 16 x [5632, 1024]
+    pub(crate) linear_outs: Vec<Linear>,  // 16 x [1024, 2816]
 }
 
 impl MultiLinearFeedForward {
@@ -180,11 +299,23 @@ impl MultiLinearFeedForward {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>, step_idx: usize) -> Tensor<Wgpu, 3> {
         let combined = self.linear_ins[step_idx].forward(x);
-        let [batch, seq, total_dim] = combined.dims();
+        let [b, s, total_dim] = combined.dims();
         let half = total_dim / 2;
-        let gate = combined.clone().slice([0..batch, 0..seq, 0..half]);
-        let value = combined.slice([0..batch, 0..seq, half..total_dim]);
-        self.linear_outs[step_idx].forward(silu(gate) * value)
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
+        self.linear_outs[step_idx].forward(activated)
+    }
+
+    /// Forward with fused residual addition in the linear_out matmul.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>, step_idx: usize) -> Tensor<Wgpu, 3> {
+        let combined = self.linear_ins[step_idx].forward(x);
+        let [b, s, total_dim] = combined.dims();
+        let half = total_dim / 2;
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
+        self.linear_outs[step_idx].forward_with_residual(activated, residual)
     }
 }
 
@@ -196,10 +327,10 @@ impl MultiLinearFeedForward {
 ///
 /// The norm weights are shared across all steps (not per-step).
 pub struct DepthTransformerBlock {
-    norm1: RmsNormLayer,
-    attention: MultiLinearAttention,
-    norm2: RmsNormLayer,
-    ffn: MultiLinearFeedForward,
+    pub(crate) norm1: RmsNormLayer,
+    pub(crate) attention: MultiLinearAttention,
+    pub(crate) norm2: RmsNormLayer,
+    pub(crate) ffn: MultiLinearFeedForward,
 }
 
 impl DepthTransformerBlock {
@@ -223,15 +354,15 @@ impl DepthTransformerBlock {
         step_idx: usize,
         cache: &mut KVCache,
     ) -> Tensor<Wgpu, 3> {
+        // Fuse residual addition into out_proj matmul (saves 1 dispatch)
         let residual = x.clone();
         let x = self.norm1.forward(x);
-        let x = self.attention.forward_with_cache(x, step_idx, cache);
-        let x = x + residual;
+        let x = self.attention.forward_with_cache_fused_residual(x, residual, step_idx, cache);
 
+        // Fuse residual addition into linear_out matmul (saves 1 dispatch)
         let residual = x.clone();
         let x = self.norm2.forward(x);
-        let x = self.ffn.forward(x, step_idx);
-        x + residual
+        self.ffn.forward_with_residual(x, residual, step_idx)
     }
 }
 
@@ -253,17 +384,19 @@ impl DepthTransformerBlock {
 /// - linears.{0-15}: output heads [2048, 1024] (audio) or [32000, 1024] (text)
 pub struct DepthTransformer {
     /// Per-step input projections from temporal hidden to depth dim.
-    input_projs: Vec<Linear>, // 16 x [1024, 4096] — F32 or Q4
+    pub(crate) input_projs: Vec<Linear>, // 16 x [1024, 4096] — F32 or Q4
     /// Text token embedding for depth input.
-    text_emb: EmbeddingStore, // [32001, 1024]
+    pub(crate) text_emb: EmbeddingStore, // [32001, 1024]
     /// Per-codebook audio embeddings for depth input.
-    audio_embs: Vec<EmbeddingStore>, // 15 x [2049, 1024]
+    pub(crate) audio_embs: Vec<EmbeddingStore>, // 15 x [2049, 1024]
     /// Transformer layers with multi-linear weights.
-    layers: Vec<DepthTransformerBlock>,
+    pub(crate) layers: Vec<DepthTransformerBlock>,
     /// Per-step output heads.
-    output_linears: Vec<Linear>, // 16 x [vocab, 1024] — F32 or Q4
+    pub(crate) output_linears: Vec<Linear>, // 16 x [vocab, 1024] — F32 or Q4
     config: StsConfig,
     device: WgpuDevice,
+    /// Pre-allocated GPU buffers for the GPU-optimized generation path.
+    gpu_buffers: Option<DepthGpuBuffers>,
 }
 
 impl DepthTransformer {
@@ -277,7 +410,7 @@ impl DepthTransformer {
         config: StsConfig,
         device: WgpuDevice,
     ) -> Self {
-        Self {
+        let mut dt = Self {
             input_projs,
             text_emb,
             audio_embs,
@@ -285,7 +418,39 @@ impl DepthTransformer {
             output_linears,
             config,
             device,
+            gpu_buffers: None,
+        };
+        // Upload audio embeddings to GPU and pre-allocate buffers for
+        // GPU-side embedding lookups and sampling (eliminates per-step
+        // buffer allocation overhead).
+        dt.init_gpu_buffers();
+        dt
+    }
+
+    /// Upload audio + text embeddings to GPU and pre-allocate reusable buffers.
+    fn init_gpu_buffers(&mut self) {
+        // Upload Q4 bytes for each audio embedding to GPU
+        for emb in &mut self.audio_embs {
+            emb.upload_to_gpu(&self.device);
         }
+        // Upload text embedding to GPU for GPU-side lookup at depth step 0.
+        // This eliminates the CPU readback of the text token between temporal
+        // and depth, removing the ~125ms stall.
+        self.text_emb.upload_to_gpu(&self.device);
+        // Collect output vocab sizes for pre-allocating argmax info handles
+        let output_vocab_sizes: Vec<usize> = self.output_linears
+            .iter()
+            .map(|l| l.output_dim())
+            .collect();
+        // Pre-allocate sampling + embedding output buffers
+        self.gpu_buffers = Some(DepthGpuBuffers::new(
+            self.config.depth_num_steps,
+            self.config.depth_hidden_size,
+            &self.audio_embs,
+            &output_vocab_sizes,
+            Some(&self.text_emb),
+            &self.device,
+        ));
     }
 
     /// Generate all 16 audio codebook tokens from a temporal hidden state.
@@ -301,6 +466,10 @@ impl DepthTransformer {
     /// Autoregressive chain:
     /// - Step 0: input = proj(hidden) + text_emb(text_token) → audio_token_0
     /// - Step k>0: input = proj(hidden) + audio_embs[k-1](audio_token_{k-1}) → audio_token_k
+    ///
+    /// GPU-optimized: sampling and embedding lookups happen on GPU to avoid
+    /// per-step GPU→CPU readbacks. All 16 tokens are read back in one batch
+    /// at the end.
     #[allow(clippy::too_many_arguments)]
     pub async fn generate(
         &self,
@@ -312,27 +481,358 @@ impl DepthTransformer {
         provided_tokens: Option<&[i32]>,
         penalty_history: Option<&[Vec<u32>]>,
         audio_penalty: f32,
+        max_steps: Option<usize>,
     ) -> Vec<u32> {
-        let num_steps = self.config.depth_num_steps;
-        let mut audio_tokens = Vec::with_capacity(num_steps);
+        let num_steps = max_steps.unwrap_or(self.config.depth_num_steps)
+            .min(self.config.depth_num_steps);
         let dim = self.config.depth_hidden_size;
-        // Track the conditioning token for each step.
-        // Step 0 uses text_token; subsequent steps use either the sampled
-        // token or a provided (ground-truth) token from the previous step.
+
+        // GPU path avoids per-step readbacks by keeping all sampling on GPU.
+        // Both greedy (argmax) and top-k sampling are handled on the GPU path.
+        // On native, the CPU path is faster because GPU buffer allocation for
+        // penalty tokens and sampling params adds ~27ms overhead (8 steps × ~3.4ms).
+        // The GPU path only benefits WASM where CPU readback stalls are expensive.
+        #[cfg(target_arch = "wasm32")]
+        let gpu_path_available = self.gpu_buffers.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_path_available = false;
+
+        if gpu_path_available && provided_tokens.is_none() {
+            // === GPU-OPTIMIZED PATH ===
+            // All sampling + embedding lookups on GPU, one batch readback at end.
+            self.generate_gpu_path(
+                temporal_hidden,
+                text_token,
+                cache,
+                audio_temp,
+                audio_top_k,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await
+        } else {
+            // === CPU FALLBACK PATH ===
+            // Used when GPU embeddings not uploaded or provided_tokens override needed.
+            self.generate_cpu_path(
+                temporal_hidden,
+                text_token,
+                cache,
+                audio_temp,
+                audio_top_k,
+                provided_tokens,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await
+        }
+    }
+
+    /// Generate with a deferred text token readback.
+    ///
+    /// Like `generate()`, but accepts a `Tensor<Wgpu, 1>` containing the text
+    /// token result on GPU (not yet read back to CPU), plus the raw GPU Handle
+    /// for GPU-side embedding lookup. This allows the depth transformer to do
+    /// text embedding entirely on GPU, eliminating the ~125ms readback stall
+    /// between temporal and depth.
+    ///
+    /// The text token is only read back at the very end (batch readback with
+    /// audio tokens) when all GPU work is complete.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_deferred(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token_tensor: Tensor<Wgpu, 1>,
+        text_token_handle: Handle,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        provided_tokens: Option<&[i32]>,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        max_steps: Option<usize>,
+    ) -> (Vec<u32>, u32) {
+        let num_steps = max_steps.unwrap_or(self.config.depth_num_steps)
+            .min(self.config.depth_num_steps);
+        let dim = self.config.depth_hidden_size;
+
+        // On native, skip GPU path — CPU readback is cheap and avoids
+        // ~27ms overhead from per-step GPU buffer allocations.
+        #[cfg(target_arch = "wasm32")]
+        let gpu_path_available = self.gpu_buffers.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu_path_available = false;
+
+        if gpu_path_available && provided_tokens.is_none() {
+            self.generate_gpu_path_deferred(
+                temporal_hidden,
+                text_token_tensor,
+                text_token_handle,
+                cache,
+                audio_temp,
+                audio_top_k,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await
+        } else {
+            // CPU fallback: need text token upfront, so await immediately
+            let text_token = gpu_read_token_tensor(text_token_tensor).await;
+            let tokens = self.generate_cpu_path(
+                temporal_hidden,
+                text_token,
+                cache,
+                audio_temp,
+                audio_top_k,
+                provided_tokens,
+                penalty_history,
+                audio_penalty,
+                num_steps,
+                dim,
+            )
+            .await;
+            (tokens, text_token)
+        }
+    }
+
+    /// GPU-optimized generation with ZERO CPU readback between temporal and depth.
+    ///
+    /// The text token handle from temporal argmax/sampling is used directly for
+    /// GPU-side text embedding lookup at step 0. The text token value is only
+    /// read back at the very end in a single batch with all audio tokens.
+    /// This eliminates the ~125ms stall where CPU waited for temporal GPU work.
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_gpu_path_deferred(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token_tensor: Tensor<Wgpu, 1>,
+        text_token_handle: Handle,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        num_steps: usize,
+        dim: usize,
+    ) -> (Vec<u32>, u32) {
+        let gpu = self.gpu_buffers.as_ref().expect("GPU buffers not initialized");
+
+        // Pre-compute all input projections — GPU matmuls that don't need text token.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
+        // Step 0: text embedding via GPU lookup (no CPU readback needed!)
+        // The text_token_handle contains the argmax result on GPU. We use it
+        // directly for the Q4 embedding lookup kernel.
+        let emb_tensor = if let Some(t) = gpu.gpu_text_embed_lookup(&text_token_handle) {
+            t
+        } else {
+            // Fallback: GPU text embedding not available, read back to CPU
+            let text_token = gpu_read_token_tensor(text_token_tensor.clone()).await;
+            let mut emb_buf = vec![0.0f32; dim];
+            self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
+            Tensor::<Wgpu, 3>::from_data(
+                burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
+                &self.device,
+            )
+        };
+        let x = projected[0].clone() + emb_tensor;
+
+        let mut h = x;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(c) = cache.get_mut(layer_idx) {
+                h = layer.forward_with_cache(h, 0, c);
+            }
+        }
+
+        let logits = self.output_linears[0].forward(h);
+
+        if audio_temp <= 0.0 {
+            gpu.gpu_argmax_into(0, logits);
+        } else {
+            let history = penalty_history
+                .and_then(|h| h.first())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            gpu.gpu_sample_top_k_into(0, logits, audio_top_k, audio_temp, history, audio_penalty);
+        }
+
+        // Steps 1..num_steps: audio embedding via GPU lookup
+        #[allow(clippy::needless_range_loop)]
+        for step in 1..num_steps {
+            let emb_idx = step - 1;
+            let emb_tensor = if emb_idx < self.audio_embs.len() {
+                let q4_handle = self.audio_embs[emb_idx]
+                    .gpu_lookup_params()
+                    .0;
+                let token_handle = &gpu.token_handles[step - 1];
+                gpu.gpu_embed_lookup_into(step, emb_idx, token_handle, q4_handle)
+            } else {
+                Tensor::<Wgpu, 3>::zeros([1, 1, dim], &self.device)
+            };
+
+            let x = projected[step].clone() + emb_tensor;
+
+            let mut h = x;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(c) = cache.get_mut(layer_idx) {
+                    h = layer.forward_with_cache(h, step, c);
+                }
+            }
+
+            let logits = self.output_linears[step].forward(h);
+
+            if audio_temp <= 0.0 {
+                gpu.gpu_argmax_into(step, logits);
+            } else {
+                let history = penalty_history
+                    .and_then(|h| h.get(step))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                gpu.gpu_sample_top_k_into(step, logits, audio_top_k, audio_temp, history, audio_penalty);
+            }
+        }
+
+        // ONE batch readback of ALL tokens (audio + text).
+        // By this point all GPU work is done, so readback is near-instant.
+        let token_tensors = gpu.collect_token_tensors(num_steps);
+        let audio_tokens = gpu_read_token_tensors(token_tensors).await;
+        let text_token = gpu_read_token_tensor(text_token_tensor).await;
+        (audio_tokens, text_token)
+    }
+
+    /// GPU-optimized generation: no per-step readbacks.
+    ///
+    /// Uses pre-allocated GPU buffers for sampling and embedding lookup.
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_gpu_path(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token: u32,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        num_steps: usize,
+        dim: usize,
+    ) -> Vec<u32> {
+        let gpu = self.gpu_buffers.as_ref().expect("GPU buffers not initialized");
+
+        // Pre-compute all input projections before the autoregressive loop.
+        // temporal_hidden doesn't change between steps, so we can batch all
+        // matmul dispatches upfront for better GPU pipelining.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
+        // Step 0: text token embedding (CPU path — text_emb is too large for GPU)
+        let mut emb_buf = vec![0.0f32; dim];
+        self.text_emb.embed_id_add_cpu(text_token, &mut emb_buf);
+        let emb_tensor = Tensor::<Wgpu, 3>::from_data(
+            burn::tensor::TensorData::new(emb_buf, [1, 1, dim]),
+            &self.device,
+        );
+        let x = projected[0].clone() + emb_tensor;
+
+        let mut h = x;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(c) = cache.get_mut(layer_idx) {
+                h = layer.forward_with_cache(h, 0, c);
+            }
+        }
+
+        let logits = self.output_linears[0].forward(h);
+
+        if audio_temp <= 0.0 {
+            gpu.gpu_argmax_into(0, logits);
+        } else {
+            let history = penalty_history
+                .and_then(|h| h.first())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            gpu.gpu_sample_top_k_into(0, logits, audio_top_k, audio_temp, history, audio_penalty);
+        }
+
+        // Steps 1..num_steps: audio embedding via GPU lookup
+        #[allow(clippy::needless_range_loop)]
+        for step in 1..num_steps {
+            // GPU-side embedding lookup for previous step's token
+            let emb_idx = step - 1;
+            let emb_tensor = if emb_idx < self.audio_embs.len() {
+                let q4_handle = self.audio_embs[emb_idx]
+                    .gpu_lookup_params()
+                    .0;
+                let token_handle = &gpu.token_handles[step - 1];
+                gpu.gpu_embed_lookup_into(step, emb_idx, token_handle, q4_handle)
+            } else {
+                Tensor::<Wgpu, 3>::zeros([1, 1, dim], &self.device)
+            };
+
+            let x = projected[step].clone() + emb_tensor;
+
+            let mut h = x;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(c) = cache.get_mut(layer_idx) {
+                    h = layer.forward_with_cache(h, step, c);
+                }
+            }
+
+            let logits = self.output_linears[step].forward(h);
+
+            if audio_temp <= 0.0 {
+                gpu.gpu_argmax_into(step, logits);
+            } else {
+                let history = penalty_history
+                    .and_then(|h| h.get(step))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                gpu.gpu_sample_top_k_into(step, logits, audio_top_k, audio_temp, history, audio_penalty);
+            }
+        }
+
+        // ONE batch readback of all tokens
+        let token_tensors = gpu.collect_token_tensors(num_steps);
+        gpu_read_token_tensors(token_tensors).await
+    }
+
+    /// CPU fallback generation: per-step readbacks (used with provided_tokens).
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_cpu_path(
+        &self,
+        temporal_hidden: Tensor<Wgpu, 3>,
+        text_token: u32,
+        cache: &mut LayerCaches,
+        audio_temp: f32,
+        audio_top_k: usize,
+        provided_tokens: Option<&[i32]>,
+        penalty_history: Option<&[Vec<u32>]>,
+        audio_penalty: f32,
+        num_steps: usize,
+        dim: usize,
+    ) -> Vec<u32> {
+        // Pre-compute all input projections before the autoregressive loop.
+        // temporal_hidden doesn't change between steps, so we can batch all
+        // matmul dispatches upfront for better GPU pipelining.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
+        let mut audio_tokens = Vec::with_capacity(num_steps);
         let mut prev_token: u32 = text_token;
 
         for step in 0..num_steps {
-            // Project temporal hidden to depth dim
-            let projected = self.input_projs[step].forward(temporal_hidden.clone());
-
-            // Add embedding of the conditioning token
             let mut emb_buf = vec![0.0f32; dim];
             if step == 0 {
-                // Step 0: conditioned on the text token from temporal
                 self.text_emb.embed_id_add_cpu(prev_token, &mut emb_buf);
             } else {
-                // Steps 1-15: conditioned on the previous step's token
-                let emb_idx = step - 1; // audio_embs[0] for step 1, etc.
+                let emb_idx = step - 1;
                 if emb_idx < self.audio_embs.len() {
                     self.audio_embs[emb_idx].embed_id_add_cpu(prev_token, &mut emb_buf);
                 }
@@ -343,10 +843,8 @@ impl DepthTransformer {
                 &self.device,
             );
 
-            let x = projected + emb_tensor;
+            let x = projected[step].clone() + emb_tensor;
 
-            // Run through depth transformer layers with step-specific weights
-            // Note: depth transformer has no positional embedding (depformer_pos_emb="none")
             let mut h = x;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if let Some(c) = cache.get_mut(layer_idx) {
@@ -357,7 +855,7 @@ impl DepthTransformer {
             let logits = self.output_linears[step].forward(h);
 
             let token = if audio_temp <= 0.0 {
-                sample_greedy(logits).await
+                gpu_argmax(logits).await
             } else {
                 let history = penalty_history
                     .and_then(|h| h.get(step))
@@ -375,9 +873,6 @@ impl DepthTransformer {
 
             audio_tokens.push(token);
 
-            // Determine conditioning token for the next step:
-            // use the provided (ground-truth) token if available, otherwise
-            // use the token we just sampled.
             prev_token = if let Some(provided) = provided_tokens {
                 if step < provided.len() && provided[step] >= 0 {
                     provided[step] as u32
@@ -428,14 +923,18 @@ impl DepthTransformer {
     ) -> (Vec<u32>, Vec<DepthStepLog>) {
         let num_steps = self.config.depth_num_steps;
         let dim = self.config.depth_hidden_size;
+
+        // Pre-compute all input projections before the autoregressive loop.
+        let projected: Vec<Tensor<Wgpu, 3>> = (0..num_steps)
+            .map(|step| self.input_projs[step].forward(temporal_hidden.clone()))
+            .collect();
+
         let mut audio_tokens = Vec::with_capacity(num_steps);
         let mut step_logs = Vec::with_capacity(num_steps);
 
         let mut prev_token: u32 = text_token;
 
         for step in 0..num_steps {
-            // Project temporal hidden to depth dim
-            let projected = self.input_projs[step].forward(temporal_hidden.clone());
 
             // Add embedding of the conditioning token
             let mut emb_buf = vec![0.0f32; dim];
@@ -453,7 +952,7 @@ impl DepthTransformer {
                 &self.device,
             );
 
-            let x = projected + emb_tensor;
+            let x = projected[step].clone() + emb_tensor;
 
             // Log input (projected + embedding)
             let flat: Tensor<Wgpu, 1> = x.clone().reshape([dim]);

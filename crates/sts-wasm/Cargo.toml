@@ -43,6 +43,9 @@ byteorder = { workspace = true }
 # Audio
 hound = { workspace = true }
 
+# Async channel for GPU readback (same as cubecl uses)
+async-channel = "2"
+
 # Mimi audio codec (Candle-based, runs on CPU)
 mimi-rs = { path = "../../../mimi-rs" }
 candle-core = "0.9"
@@ -67,4 +70,9 @@ wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
 approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
 pollster = "0.4"
+
+[[bench]]
+name = "inference"
+harness = false

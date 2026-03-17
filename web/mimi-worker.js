@@ -43,6 +43,7 @@ let mimiWasm = null;
 let mimiEngine = null;
 let playbackPort = null;
 let inferencePort = null;
+let wasmInitPromise = null;
 
 function logState(msg) {
     const t = ((performance.now()) / 1000).toFixed(2);
@@ -121,14 +122,18 @@ self.onmessage = async (e) => {
                 const wasmBgUrl = wasmJsUrl.replace(/\.js$/, '_bg.wasm');
                 logState(`Loading Mimi WASM from ${wasmJsUrl}`);
                 self.postMessage({ type: 'status', text: 'Loading Mimi WASM module...' });
-                mimiWasm = await import(wasmJsUrl);
-                await mimiWasm.default({ module_or_path: wasmBgUrl });
+                wasmInitPromise = (async () => {
+                    mimiWasm = await import(wasmJsUrl);
+                    await mimiWasm.default({ module_or_path: wasmBgUrl });
+                })();
+                await wasmInitPromise;
                 logState('Mimi WASM module loaded');
                 self.postMessage({ type: 'status', text: 'Mimi WASM module loaded' });
                 break;
             }
 
             case 'load-model': {
+                if (wasmInitPromise) await wasmInitPromise;
                 if (!mimiWasm) {
                     throw new Error('Mimi WASM module not loaded. Send "load" first.');
                 }

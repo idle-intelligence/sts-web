@@ -38,6 +38,7 @@ const server = createServer((req, res) => {
     // CORS headers (needed for WASM + WebGPU in cross-origin workers)
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
     res.setHeader("Cross-Origin-Embedder-Policy", "credentialless");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
 
     let filePath;
     if (pathname === "/" || pathname === "/index.html") {
@@ -91,5 +92,5 @@ const server = createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
     console.log(`\nSTS dev server running:`);
     console.log(`  Local:   http://localhost:${PORT}`);
-    console.log(`  Model:   /hf/personaplex-7b-v1-q4_k-webgpu/ (local)\n`);
+    console.log(`  Model:   /hf/personaplex-24L-q4_k-webgpu/ (local)\n`);
 });

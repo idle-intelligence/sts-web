@@ -60,7 +60,10 @@ use burn::tensor::Tensor;
 use cubecl::Runtime;
 
 use crate::depth::DepthTransformer;
-use crate::model::{sample_greedy, sample_top_k_with_penalty, LayerCaches, TemporalTransformer};
+use crate::gguf::{gpu_argmax_buffer, gpu_sample_top_k_with_penalty};
+#[cfg(feature = "wasm")]
+use crate::gguf::gpu_read_token_tensor;
+use crate::model::{LayerCaches, TemporalTransformer};
 use crate::StsConfig;
 
 /// Cross-platform millisecond timer.
@@ -209,6 +212,11 @@ pub struct StsStream {
     pub prefill_temporal_ms: f64,
     /// Accumulated depth_ms during prefill_user_audio.
     pub prefill_depth_ms: f64,
+
+    /// Custom WebGPU depth engine (WASM only). When set, bypasses Burn/CubeCL
+    /// depth path in step() and submits all 8 depth steps as one command buffer.
+    #[cfg(feature = "wasm")]
+    pub depth_engine: Option<crate::depth_engine::DepthEngine>,
 }
 
 impl StsStream {
@@ -238,7 +246,7 @@ impl StsStream {
             repetition_penalty: 1.2,
             penalty_window: 30,
             consecutive_silence_frames: 0,
-            silence_early_stop_frames: 8, // ~0.6s of silence triggers stop
+            silence_early_stop_frames: 8, // ~0.64s of silence triggers stop
             consecutive_text_pad_frames: 0,
             text_pad_stop_frames: 6, // ~0.5s of text padding after real text → stop
             has_generated_text: false,
@@ -246,6 +254,8 @@ impl StsStream {
             pending_temporal_ms: 0.0,
             prefill_temporal_ms: 0.0,
             prefill_depth_ms: 0.0,
+            #[cfg(feature = "wasm")]
+            depth_engine: None,
             config,
             temporal_cache,
             depth_cache,
@@ -548,6 +558,7 @@ impl StsStream {
                 Some(&provided),
                 None, // No penalty during prefill
                 1.0,
+                None, // Full 16 steps during prefill
             )
             .await;
             self.prefill_depth_ms += now_ms() - t_depth;
@@ -598,9 +609,12 @@ impl StsStream {
             (result.0, result.1, now_ms() - t0)
         };
 
-        // Step 2: Sample text token with repetition penalty
-        let text_token = if self.text_temperature <= 0.0 {
-            sample_greedy(text_logits).await
+        // Step 2: Submit text token sampling to GPU (DON'T await yet).
+        // The argmax/sampling kernel is enqueued on GPU. We keep both the Handle
+        // (for GPU-side text embedding in depth step 0) and the Tensor (for
+        // batch readback at the end). No CPU readback happens here.
+        let (text_token_handle, text_token_tensor) = if self.text_temperature <= 0.0 {
+            gpu_argmax_buffer(text_logits)
         } else {
             let text_history: Vec<u32> = self
                 .text_token_history
@@ -609,38 +623,108 @@ impl StsStream {
                 .take(self.penalty_window)
                 .copied()
                 .collect();
-            sample_top_k_with_penalty(
+            gpu_sample_top_k_with_penalty(
                 text_logits,
                 self.text_top_k,
                 self.text_temperature,
                 &text_history,
                 self.repetition_penalty,
             )
+        };
+
+        // Step 3: Reset depth cache for this time step
+        self.depth_cache.reset_keep_buffers();
+
+        // Step 4: Depth transformer generates agent audio tokens (skip user predictions).
+        let gen_steps = self.config.depth_gen_steps;
+        let t_depth = now_ms();
+
+        // Custom DepthEngine path (WASM only): submits all 8 depth steps as one
+        // command buffer, bypassing Burn/CubeCL overhead (~150 dispatches → 1).
+        #[cfg(feature = "wasm")]
+        let (mut all_audio_tokens, text_token) = if let Some(engine) = self.depth_engine.as_ref() {
+            // Flush CubeCL pending work so buffers are valid for raw wgpu access.
+            let device = temporal.device();
+            let client = WgpuRuntime::client(device);
+            client.flush();
+
+            // Extract WgpuResource from the temporal hidden Tensor<Wgpu, 3>.
+            let hidden_handle = hidden.into_primitive().tensor().handle;
+            let hidden_resource = crate::gguf::handle_to_wgpu_resource(&hidden_handle, device);
+
+            // Extract WgpuResource from the text token Handle.
+            let text_resource = crate::gguf::handle_to_wgpu_resource(&text_token_handle, device);
+
+            // Reset the custom engine's KV caches for this frame.
+            engine.reset_caches();
+
+            // Run all 8 depth steps in a single command buffer.
+            let audio_tokens = engine.generate(&hidden_resource, &text_resource).await;
+
+            // Read back text token separately (the custom engine only returns audio).
+            let text_token_val = gpu_read_token_tensor(text_token_tensor).await;
+
+            (audio_tokens, text_token_val)
+        } else {
+            // Standard Burn/CubeCL depth path (WASM fallback).
+            let penalty_hist = &self.audio_token_history;
+            depth.generate_deferred(
+                hidden,
+                text_token_tensor,
+                text_token_handle,
+                &mut self.depth_cache,
+                self.audio_temperature,
+                self.audio_top_k,
+                None, // No provided tokens during generation
+                Some(penalty_hist),
+                self.repetition_penalty,
+                Some(gen_steps), // Only run agent audio steps, skip user predictions
+            )
             .await
         };
+        #[cfg(not(feature = "wasm"))]
+        let (mut all_audio_tokens, text_token) = {
+            // Standard Burn/CubeCL depth path (native).
+            let penalty_hist = &self.audio_token_history;
+            depth.generate_deferred(
+                hidden,
+                text_token_tensor,
+                text_token_handle,
+                &mut self.depth_cache,
+                self.audio_temperature,
+                self.audio_top_k,
+                None, // No provided tokens during generation
+                Some(penalty_hist),
+                self.repetition_penalty,
+                Some(gen_steps), // Only run agent audio steps, skip user predictions
+            )
+            .await
+        };
+        let depth_ms = now_ms() - t_depth;
+
+        // Update text token history (was deferred from step 2)
         self.text_token_history.push(text_token);
         if self.text_token_history.len() > self.penalty_window {
             self.text_token_history.drain(..self.text_token_history.len() - self.penalty_window);
         }
 
-        // Step 3: Reset depth cache for this time step
-        self.depth_cache.reset_keep_buffers();
-
-        // Step 4: Depth transformer generates 16 audio tokens
-        let t_depth = now_ms();
-        let penalty_hist = &self.audio_token_history;
-        let all_audio_tokens = depth.generate(
-            hidden,
-            text_token,
-            &mut self.depth_cache,
-            self.audio_temperature,
-            self.audio_top_k,
-            None, // No provided tokens during generation
-            Some(penalty_hist),
-            self.repetition_penalty,
-        )
-        .await;
-        let depth_ms = now_ms() - t_depth;
+        // Fill remaining positions (user audio predictions) with sine tokens.
+        // These are unused for Mimi decode but needed in the token cache for
+        // conditioning the next temporal step.
+        let full_steps = self.config.depth_num_steps;
+        if all_audio_tokens.len() < full_steps {
+            for i in all_audio_tokens.len()..full_steps {
+                // Steps 0-7 are agent audio, steps 8-15 are user audio.
+                // User codebook index = i - nq (maps to sine_tokens[0..7]).
+                let user_cb = i - nq;
+                let sine_tok = if user_cb < self.config.sine_tokens.len() {
+                    self.config.sine_tokens[user_cb]
+                } else {
+                    self.config.sine_tokens[0] // fallback
+                };
+                all_audio_tokens.push(sine_tok);
+            }
+        }
 
         // Split depformer output into agent (0-7) and user (8-15)
         let agent_end = nq.min(all_audio_tokens.len());
@@ -723,17 +807,13 @@ impl StsStream {
 
     /// Check if the last model output is silence (all 8 codebooks match silence tokens).
     pub fn is_silence(&self) -> bool {
-        self.last_model_audio_tokens
-            .iter()
-            .zip(self.config.silence_tokens.iter())
-            .all(|(&got, &expected)| got == expected)
+        self.last_model_audio_tokens.len() >= 2
+            && self.last_model_audio_tokens[1] == self.config.silence_tokens[1]
     }
 
     /// Check if generation should stop due to sustained silence or text completion.
     pub fn should_stop(&self) -> bool {
         self.consecutive_silence_frames >= self.silence_early_stop_frames
-            || (self.has_generated_text
-                && self.consecutive_text_pad_frames >= self.text_pad_stop_frames)
     }
 
     /// Get the number of consecutive silence frames so far.

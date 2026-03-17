@@ -14,6 +14,7 @@
  *     { type: 'audio-port', port: MessagePort }            -- direct port from mic AudioWorklet
  *     { type: 'playback-port', port: MessagePort }         -- port to stream PCM to AudioWorklet (fallback)
  *     { type: 'mimi-worker-port', port: MessagePort }      -- port to Mimi worker for offloaded decode
+ *     { type: 'load-voice-preset', name: string }          -- load voice preset ('random' = no preset)
  *
  *   Worker -> Main:
  *     { type: 'status', text, ready?, progress? }          -- loading/ready/generating status
@@ -22,6 +23,8 @@
  *     { type: 'transcript', text, final? }                 -- streaming text tokens (inner monologue)
  *     { type: 'metrics', framesPerSec, avgFrameMs, ... }   -- performance metrics after generation
  *     { type: 'error', message }                           -- unrecoverable error
+ *     { type: 'voice-loaded', name }                       -- voice preset loaded successfully
+ *     { type: 'voice-error', name, error }                 -- voice preset load failed
  *
  * ## Expected Call Sequence
  *
@@ -43,7 +46,7 @@
  *   mimiWorkerPort -- MessagePort to Mimi worker for offloaded decode
  */
 
-const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
+const HF_BASE = '/hf/personaplex-24L-q4_k-webgpu';
 
 let engine = null;
 let stsWasm = null;
@@ -51,6 +54,10 @@ let totalSamples = 0;
 let recordingStart = 0;
 let prefillFrames = 0;
 let listening = false;
+
+// Benchmark mode: per-frame timing collection
+let benchmarkMode = false;
+let benchmarkFrames = [];
 
 // Port to stream audio directly to AudioWorklet (legacy, used when no Mimi worker)
 let playbackPort = null;
@@ -80,6 +87,7 @@ async function drainQueue() {
             switch (type) {
                 case 'load':
                     logState('Loading model...');
+                    if (data.benchmark) benchmarkMode = true;
                     await handleLoad(data.config || {});
                     break;
                 case 'start-listening':
@@ -107,6 +115,9 @@ async function drainQueue() {
                     prefillFrames = 0;
                     totalSamples = 0;
                     handleNewConversation();
+                    break;
+                case 'load-voice-preset':
+                    await handleLoadVoicePreset(data.name);
                     break;
                 default:
                     console.warn('[worker] Unknown message type:', type);
@@ -243,8 +254,8 @@ async function handleLoad(config) {
     // 4. Download and process model shards.
     const shardUrls = config.shardList && config.shardList.length > 0
         ? config.shardList
-        : Array.from({ length: 9 }, (_, i) =>
-            `${HF_BASE}/personaplex-7b-v1-q4_k.gguf.shard-0${i}`
+        : Array.from({ length: 8 }, (_, i) =>
+            `${HF_BASE}/shards/personaplex-24L-q4_k.gguf.shard-0${i}`
         );
 
     const allCached = await isCached(shardUrls[0]);
@@ -363,9 +374,18 @@ async function handleStop() {
     engine.generateStart();
 
     let transcript = '';
+    if (benchmarkMode) benchmarkFrames = [];
+    const genStartTime = performance.now();
+    // Track cumulative metrics for per-frame deltas in benchmark mode
+    let prevTemporalMs = 0, prevDepthMs = 0, prevMimiMs = 0;
+
+    let frameStart = performance.now();
     let result = await engine.generateStepInference();
 
     while (result) {
+        const frameEnd = performance.now();
+        const frameTotalMs = frameEnd - frameStart;
+
         if (mimiWorkerPort) {
             // Offloaded path: send audio tokens to Mimi worker for decode.
             // Don't wait — GPU is already computing the next temporal step.
@@ -390,6 +410,15 @@ async function handleStop() {
             done: result.done,
         });
 
+        if (result.audio_tokens) {
+            const silenceTokens = [948, 243, 1178, 546, 1736, 1030, 1978, 2008];
+            const audio = Array.from(result.audio_tokens);
+            const matches = audio.filter((t, i) => t === silenceTokens[i]).length;
+            if (matches >= 3) {
+                console.log(`[silence-check] Frame ${result.step}: ${matches}/8 match, audio=[${audio}]`);
+            }
+        }
+
         if (result.text) {
             transcript += result.text;
             self.postMessage({ type: 'transcript', text: result.text, final: false });
@@ -400,14 +429,66 @@ async function handleStop() {
             text: `Generating... frame ${result.step + 1}`,
         });
 
+        // Send live metrics every frame so the UI updates from frame 0
+        sendMetrics(performance.now());
+
+        // Collect per-frame timing in benchmark mode using cumulative metric deltas
+        if (benchmarkMode) {
+            const m = engine.getMetrics();
+            benchmarkFrames.push({
+                frameIdx: result.step,
+                totalMs: frameTotalMs,
+                temporalMs: (m.temporal_ms || 0) - prevTemporalMs,
+                depthMs: (m.depth_ms || 0) - prevDepthMs,
+                mimiMs: (m.mimi_ms || 0) - prevMimiMs,
+            });
+            prevTemporalMs = m.temporal_ms || 0;
+            prevDepthMs = m.depth_ms || 0;
+            prevMimiMs = m.mimi_ms || 0;
+        }
+
         if (result.done) break;
 
+        // Yield to the event loop so MessagePort messages (to Mimi worker)
+        // actually flush cross-thread. Without this, the WASM Promise from
+        // generateStepInference() resolves as a microtask, and the loop
+        // resumes immediately — MessagePort postMessage calls queue up but
+        // never get dispatched until the entire loop finishes.
+        await new Promise(r => setTimeout(r, 0));
+
         // Next inference step — if Mimi worker is active, GPU gets full overlap
+        frameStart = performance.now();
         result = await engine.generateStepInference();
     }
 
+    const totalGenMs = performance.now() - genStartTime;
     logState(`Generation complete: "${transcript.substring(0, 80)}${transcript.length > 80 ? '...' : ''}"`);
     sendMetrics(performance.now());
+
+    // In benchmark mode, post detailed results
+    if (benchmarkMode) {
+        const m = engine.getMetrics();
+        const frameCount = benchmarkFrames.length;
+        const avgFrameMs = frameCount > 0 ? totalGenMs / frameCount : 0;
+        const avgTemporalMs = frameCount > 0 ? benchmarkFrames.reduce((s, f) => s + f.temporalMs, 0) / frameCount : 0;
+        const avgDepthMs = frameCount > 0 ? benchmarkFrames.reduce((s, f) => s + f.depthMs, 0) / frameCount : 0;
+        const avgMimiMs = frameCount > 0 ? benchmarkFrames.reduce((s, f) => s + f.mimiMs, 0) / frameCount : 0;
+        const audioDuration = totalSamples / 24000;
+        self.postMessage({
+            type: 'benchmark-complete',
+            results: {
+                frames: benchmarkFrames,
+                avgFrameMs,
+                temporalMs: avgTemporalMs,
+                depthMs: avgDepthMs,
+                mimiMs: avgMimiMs,
+                framesPerSec: frameCount > 0 ? (frameCount / (totalGenMs / 1000)) : 0,
+                rtf: audioDuration > 0 ? (totalGenMs / 1000) / audioDuration : 0,
+                totalGenMs,
+                frameCount,
+            },
+        });
+    }
 
     self.postMessage({ type: 'transcript', text: '', final: true });
 
@@ -421,6 +502,33 @@ async function handleStop() {
     stopped = false;
     logState('Turn complete, ready for next turn');
     self.postMessage({ type: 'turn-complete' });
+}
+
+// ---------------------------------------------------------------------------
+// Voice preset loader
+// ---------------------------------------------------------------------------
+
+async function handleLoadVoicePreset(name) {
+    if (name === 'random') {
+        self.postMessage({ type: 'voice-loaded', name: 'random' });
+        return;
+    }
+
+    try {
+        const embeddingsUrl = `${HF_BASE}/voices/${name}.embeddings.bin`;
+        const cacheJsonUrl = `${HF_BASE}/voices/${name}.cache.json`;
+
+        const [embeddingsBuffer, cacheJsonBuffer] = await Promise.all([
+            cachedFetch(embeddingsUrl, `Loading voice ${name} embeddings`),
+            cachedFetch(cacheJsonUrl, `Loading voice ${name} cache`),
+        ]);
+
+        const cacheJson = new TextDecoder().decode(cacheJsonBuffer);
+        engine.loadVoicePreset(new Uint8Array(embeddingsBuffer), cacheJson);
+        self.postMessage({ type: 'voice-loaded', name });
+    } catch (err) {
+        self.postMessage({ type: 'voice-error', name, error: err.message || String(err) });
+    }
 }
 
 // ---------------------------------------------------------------------------

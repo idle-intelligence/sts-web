@@ -13,7 +13,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use burn::backend::wgpu::{
     into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
-    WgpuDevice, WgpuRuntime,
+    WgpuDevice, WgpuResource, WgpuRuntime,
 };
 use burn::backend::Wgpu;
 use burn::tensor::{DType, Tensor, TensorData, TensorPrimitive};
@@ -21,8 +21,30 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use cubecl::prelude::KernelId;
 use cubecl::server::{Bindings, CubeCount, Handle};
 use cubecl::{CubeTask, Runtime};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ---------------------------------------------------------------------------
+// Subgroup feature detection
+// ---------------------------------------------------------------------------
+
+/// Set to `true` if the GPU supports subgroup operations (e.g. subgroupAdd).
+/// Defaults to false — Naga (wgpu's shader compiler) doesn't yet support
+/// `enable subgroups;` in WGSL, so this must be explicitly enabled at runtime
+/// only when the browser/runtime confirms support.
+static HAS_SUBGROUPS: AtomicBool = AtomicBool::new(false);
+
+/// Call during device init to enable subgroup-optimized kernels.
+pub fn set_subgroup_support(supported: bool) {
+    HAS_SUBGROUPS.store(supported, Ordering::Relaxed);
+}
+
+/// Check if subgroup-optimized kernels should be used.
+pub fn has_subgroup_support() -> bool {
+    HAS_SUBGROUPS.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -400,6 +422,9 @@ pub struct Q4Tensor {
     pub(crate) handle: Handle,
     shape: [usize; 2],
     num_blocks: usize,
+    /// Cached info buffer for matmul dispatch, keyed by (B, M).
+    /// During generation B=1, M=1 so this is a stable cache hit.
+    info_cache: RefCell<Option<([usize; 2], Handle)>>,
 }
 
 impl Q4Tensor {
@@ -434,6 +459,7 @@ impl Q4Tensor {
             handle,
             shape,
             num_blocks,
+            info_cache: RefCell::new(None),
         })
     }
 
@@ -444,6 +470,23 @@ impl Q4Tensor {
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
     }
+
+    /// Get or create a cached info buffer for the given (B, M) dimensions.
+    fn get_or_create_info(&self, b: usize, m: usize, k: usize, n: usize, blocks_per_row: usize, device: &WgpuDevice) -> Handle {
+        let key = [b, m];
+        let mut cache = self.info_cache.borrow_mut();
+        if let Some((cached_key, ref handle)) = *cache {
+            if cached_key == key {
+                return handle.clone();
+            }
+        }
+        let client = WgpuRuntime::client(device);
+        let info: [u32; 5] = [b as u32, m as u32, k as u32, n as u32, blocks_per_row as u32];
+        let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let handle = client.create_from_slice(&info_bytes);
+        *cache = Some((key, handle.clone()));
+        handle
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +495,7 @@ impl Q4Tensor {
 
 /// A linear layer with Q4_0 quantized weights.
 pub struct Q4Linear {
-    weights: Q4Tensor,
+    pub(crate) weights: Q4Tensor,
     bias: Option<Tensor<Wgpu, 1>>,
 }
 
@@ -479,6 +522,8 @@ pub struct Q4KTensor {
     pub(crate) handle: Handle,
     shape: [usize; 2],
     num_blocks: usize,
+    /// Cached info buffer for matmul dispatch, keyed by (B, M).
+    info_cache: RefCell<Option<([usize; 2], Handle)>>,
 }
 
 impl Q4KTensor {
@@ -513,6 +558,7 @@ impl Q4KTensor {
             handle,
             shape,
             num_blocks,
+            info_cache: RefCell::new(None),
         })
     }
 
@@ -523,6 +569,23 @@ impl Q4KTensor {
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
     }
+
+    /// Get or create a cached info buffer for the given (B, M) dimensions.
+    fn get_or_create_info(&self, b: usize, m: usize, k: usize, n: usize, blocks_per_row: usize, device: &WgpuDevice) -> Handle {
+        let key = [b, m];
+        let mut cache = self.info_cache.borrow_mut();
+        if let Some((cached_key, ref handle)) = *cache {
+            if cached_key == key {
+                return handle.clone();
+            }
+        }
+        let client = WgpuRuntime::client(device);
+        let info: [u32; 5] = [b as u32, m as u32, k as u32, n as u32, blocks_per_row as u32];
+        let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let handle = client.create_from_slice(&info_bytes);
+        *cache = Some((key, handle.clone()));
+        handle
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +594,7 @@ impl Q4KTensor {
 
 /// A linear layer with Q4_K quantized weights.
 pub struct Q4KLinear {
-    weights: Q4KTensor,
+    pub(crate) weights: Q4KTensor,
     bias: Option<Tensor<Wgpu, 1>>,
 }
 
@@ -542,6 +605,15 @@ impl Q4KLinear {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         let out = q4k_matmul(x, &self.weights);
+        match &self.bias {
+            Some(bias) => out + bias.clone().unsqueeze::<3>(),
+            None => out,
+        }
+    }
+
+    /// Forward with fused residual addition: output = x @ W^T + residual.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        let out = q4k_matmul_with_residual(x, &self.weights, residual);
         match &self.bias {
             Some(bias) => out + bias.clone().unsqueeze::<3>(),
             None => out,
@@ -579,6 +651,25 @@ impl Linear {
             Linear::Q4(l) => l.forward(x),
             Linear::Q4K(l) => l.forward(x),
             Linear::Dense(l) => l.forward(x),
+        }
+    }
+
+    /// Forward with fused residual addition. Only Q4K uses the fused kernel;
+    /// Q4 and Dense fall back to separate matmul + add.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        match self {
+            Linear::Q4K(l) => l.forward_with_residual(x, residual),
+            Linear::Q4(l) => l.forward(x) + residual,
+            Linear::Dense(l) => l.forward(x) + residual,
+        }
+    }
+
+    /// Returns the output (N) dimension of this linear layer.
+    pub fn output_dim(&self) -> usize {
+        match self {
+            Linear::Q4(l) => l.weights.shape()[0],
+            Linear::Q4K(l) => l.weights.shape()[0],
+            Linear::Dense(l) => l.weight_t.dims()[1],
         }
     }
 }
@@ -625,15 +716,7 @@ pub fn q4_matmul(input: Tensor<Wgpu, 3>, weights: &Q4Tensor) -> Tensor<Wgpu, 3> 
 
     let output_handle = client.empty(b * m * n * 4);
 
-    let info: [u32; 5] = [
-        b as u32,
-        m as u32,
-        k as u32,
-        n as u32,
-        blocks_per_row as u32,
-    ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let info_handle = client.create_from_slice(&info_bytes);
+    let info_handle = weights.get_or_create_info(b, m, k, n, blocks_per_row, &device);
 
     let bindings = Bindings::new()
         .with_buffer(weights.handle.clone().binding())
@@ -689,7 +772,41 @@ impl KernelSource for Q4KMatmulNaiveKernel {
     }
 }
 
+/// Cooperative Q4_K matvec kernel for M=1 (single-token generation).
+/// Uses 256 threads per workgroup, one workgroup per output element.
+/// Threads cooperatively tile along K with shared memory reduction.
+struct Q4KMatvecKernel;
+
+impl KernelSource for Q4KMatvecKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4k_matvec.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Subgroup-optimized Q4_K matvec kernel for M=1.
+/// Each subgroup (32 threads on Apple Silicon) cooperatively computes one output row,
+/// splitting K across threads and reducing with subgroupAdd().
+/// Falls back to Q4KMatvecKernel when subgroups are unavailable.
+struct Q4KMatvecSubgroupKernel;
+
+impl KernelSource for Q4KMatvecSubgroupKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_q4k_matvec_subgroup.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
 /// Fused Q4_K dequant+matmul on GPU.
+/// For M=1 (single-token generation), dispatches the cooperative matvec kernel.
+/// Uses subgroup-optimized variant when available.
+/// For M>1 (prefill), uses the naive one-thread-per-output kernel.
 pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3> {
     let cube_input: CubeTensor<WgpuRuntime> = input.into_primitive().tensor();
     let cube_input = into_contiguous(cube_input);
@@ -710,15 +827,7 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
 
     let output_handle = client.empty(b * m * n * 4);
 
-    let info: [u32; 5] = [
-        b as u32,
-        m as u32,
-        k as u32,
-        n as u32,
-        blocks_per_row as u32,
-    ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let info_handle = client.create_from_slice(&info_bytes);
+    let info_handle = weights.get_or_create_info(b, m, k, n, blocks_per_row, &device);
 
     let bindings = Bindings::new()
         .with_buffer(weights.handle.clone().binding())
@@ -726,22 +835,54 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
         .with_buffer(output_handle.clone().binding())
         .with_buffer(info_handle.binding());
 
-    let kernel = SourceKernel::new(
-        Q4KMatmulNaiveKernel {
-            workgroup_size_x: NAIVE_WG_X,
-            workgroup_size_y: NAIVE_WG_Y,
-        },
-        CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
-    );
-    let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
-    let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
-    client
-        .launch(
-            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
-            CubeCount::new_2d(wg_x, wg_y),
-            bindings,
-        )
-        .expect("Q4_K naive matmul kernel launch failed");
+    if m == 1 {
+        if has_subgroup_support() {
+            // Subgroup-optimized: each subgroup (32 threads) computes one output row.
+            // 256 threads / 32 = 8 rows per workgroup.
+            const SUBGROUP_SIZE: usize = 32;
+            let rows_per_wg = 256 / SUBGROUP_SIZE;
+            let kernel = SourceKernel::new(Q4KMatvecSubgroupKernel, CubeDim::new_1d(256));
+            let wg_x = n.div_ceil(rows_per_wg) as u32;
+            let wg_y = b as u32;
+            client
+                .launch(
+                    Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                    CubeCount::new_2d(wg_x, wg_y),
+                    bindings,
+                )
+                .expect("Q4_K subgroup matvec kernel launch failed");
+        } else {
+            // Fallback: shared-memory input caching, one thread per output element.
+            let kernel = SourceKernel::new(Q4KMatvecKernel, CubeDim::new_1d(256));
+            let wg_x = n.div_ceil(256) as u32;
+            let wg_y = b as u32;
+            client
+                .launch(
+                    Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                    CubeCount::new_2d(wg_x, wg_y),
+                    bindings,
+                )
+                .expect("Q4_K matvec kernel launch failed");
+        }
+    } else {
+        // Naive kernel: one thread per output element
+        let kernel = SourceKernel::new(
+            Q4KMatmulNaiveKernel {
+                workgroup_size_x: NAIVE_WG_X,
+                workgroup_size_y: NAIVE_WG_Y,
+            },
+            CubeDim::new_2d(NAIVE_WG_X, NAIVE_WG_Y),
+        );
+        let wg_x = n.div_ceil(NAIVE_WG_X as usize) as u32;
+        let wg_y = (b * m).div_ceil(NAIVE_WG_Y as usize) as u32;
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_2d(wg_x, wg_y),
+                bindings,
+            )
+            .expect("Q4_K naive matmul kernel launch failed");
+    }
 
     let output_tensor = CubeTensor::new_contiguous(
         client,
@@ -753,15 +894,710 @@ pub fn q4k_matmul(input: Tensor<Wgpu, 3>, weights: &Q4KTensor) -> Tensor<Wgpu, 3
     Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
 }
 
+/// Matmul + residual addition: output = matmul(input, weights) + residual.
+/// Delegates to q4k_matmul and lets Burn's fusion optimizer handle the add.
+pub fn q4k_matmul_with_residual(
+    input: Tensor<Wgpu, 3>,
+    weights: &Q4KTensor,
+    residual: Tensor<Wgpu, 3>,
+) -> Tensor<Wgpu, 3> {
+    q4k_matmul(input, weights) + residual
+}
+
+// ---------------------------------------------------------------------------
+// GPU argmax kernel dispatch
+// ---------------------------------------------------------------------------
+
+struct ArgmaxKernel;
+
+impl KernelSource for ArgmaxKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_argmax.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// GPU-side argmax: returns the index of the maximum value in a logits tensor.
+///
+/// Launches a single-workgroup (256 threads) compute shader that performs a
+/// parallel reduction, then reads back just 4 bytes (one u32) instead of the
+/// entire logits tensor (e.g. 2048 x 4 = 8KB for audio vocab).
+///
+/// `logits`: [1, 1, V] tensor (e.g. V=2048 for audio, V=32000 for text)
+/// Returns the argmax index as u32.
+pub async fn gpu_argmax(logits: Tensor<Wgpu, 3>) -> u32 {
+    let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let v = cube_input.shape.dims[cube_input.shape.num_dims() - 1];
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    // Output: single u32
+    let result_handle = client.empty(4);
+
+    // Info: just the vocab size
+    let info_bytes: Vec<u8> = (v as u32).to_le_bytes().to_vec();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(result_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(
+        ArgmaxKernel,
+        CubeDim::new_1d(256),
+    );
+
+    // Single workgroup — all reduction happens in shared memory
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(1),
+            bindings,
+        )
+        .expect("Argmax kernel launch failed");
+
+    // Read back just 4 bytes (one u32 index).
+    // We wrap the handle as an f32 tensor (same 4 bytes) and reinterpret
+    // the bits as u32 after readback, since Burn's Wgpu backend works with
+    // float primitives.
+    let result_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![1]),
+        result_handle,
+        DType::F32,
+    );
+    let result: Tensor<Wgpu, 1> =
+        Tensor::from_primitive(TensorPrimitive::Float(result_tensor));
+    let data: Vec<f32> = result
+        .into_data_async()
+        .await
+        .expect("GPU readback failed")
+        .to_vec()
+        .expect("argmax result to_vec failed");
+    // Reinterpret f32 bits as u32 (the shader wrote a u32 index)
+    data[0].to_bits()
+}
+
+/// GPU-side argmax that keeps the result on GPU (no readback).
+///
+/// Returns a Handle containing a single u32 index on the GPU,
+/// plus a 1-element Tensor wrapping it for batch readback later.
+/// The Handle can be passed to `gpu_embedding_lookup_q4()` for
+/// GPU-side embedding lookup without CPU roundtrip.
+pub fn gpu_argmax_buffer(logits: Tensor<Wgpu, 3>) -> (Handle, Tensor<Wgpu, 1>) {
+    let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let v = cube_input.shape.dims[cube_input.shape.num_dims() - 1];
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    // Output: single u32 (stored as f32 bits)
+    let result_handle = client.empty(4);
+
+    // Info: vocab size
+    let info_bytes: Vec<u8> = (v as u32).to_le_bytes().to_vec();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(result_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(ArgmaxKernel, CubeDim::new_1d(256));
+
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(1),
+            bindings,
+        )
+        .expect("Argmax kernel launch failed");
+
+    // Wrap the handle in a Tensor for readback later
+    let result_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![1]),
+        result_handle.clone(),
+        DType::F32,
+    );
+    let tensor: Tensor<Wgpu, 1> =
+        Tensor::from_primitive(TensorPrimitive::Float(result_tensor));
+
+    (result_handle, tensor)
+}
+
+// ---------------------------------------------------------------------------
+// GPU top-k sampling kernel dispatch
+// ---------------------------------------------------------------------------
+
+struct SampleTopKKernel;
+
+impl KernelSource for SampleTopKKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_sample_topk.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// GPU-side top-k sampling with repetition penalty.
+///
+/// Performs temperature scaling, repetition penalty, top-k selection, softmax,
+/// and categorical sampling entirely on GPU. Returns a Handle containing a
+/// single u32 token ID, plus a Tensor for batch readback.
+///
+/// This avoids reading back the full logits tensor (~8KB for vocab=2048)
+/// to CPU and instead returns just 4 bytes.
+pub fn gpu_sample_top_k_with_penalty(
+    logits: Tensor<Wgpu, 3>,
+    top_k: usize,
+    temperature: f32,
+    past_tokens: &[u32],
+    penalty: f32,
+) -> (Handle, Tensor<Wgpu, 1>) {
+    let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let v = cube_input.shape.dims[cube_input.shape.num_dims() - 1];
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    // Output: single u32
+    let result_handle = client.empty(4);
+
+    // Penalty tokens buffer (pass token IDs to penalize)
+    let penalty_bytes: Vec<u8> = if past_tokens.is_empty() {
+        // Need at least 4 bytes for the binding
+        vec![0xFF; 4]
+    } else {
+        // Deduplicate penalty tokens
+        let seen: std::collections::HashSet<u32> = past_tokens.iter().copied().collect();
+        let unique: Vec<u32> = seen.into_iter().collect();
+        unique.iter().flat_map(|t| t.to_le_bytes()).collect()
+    };
+    let num_penalty_tokens = if past_tokens.is_empty() {
+        0u32
+    } else {
+        let seen: std::collections::HashSet<u32> = past_tokens.iter().copied().collect();
+        seen.len() as u32
+    };
+    let penalty_handle = client.create_from_slice(&penalty_bytes);
+
+    // Info: [V, K, temperature_bits, penalty_bits, random_bits, num_penalty_tokens]
+    let rand_val = crate::model::pseudo_random();
+    let mut info_bytes = Vec::with_capacity(24);
+    info_bytes.extend_from_slice(&(v as u32).to_le_bytes());
+    info_bytes.extend_from_slice(&(top_k as u32).to_le_bytes());
+    info_bytes.extend_from_slice(&temperature.to_bits().to_le_bytes());
+    info_bytes.extend_from_slice(&penalty.to_bits().to_le_bytes());
+    info_bytes.extend_from_slice(&rand_val.to_bits().to_le_bytes());
+    info_bytes.extend_from_slice(&num_penalty_tokens.to_le_bytes());
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    // The logits buffer is read_write (penalty + temperature applied in-place)
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(penalty_handle.binding())
+        .with_buffer(result_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(SampleTopKKernel, CubeDim::new_1d(256));
+
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(1),
+            bindings,
+        )
+        .expect("Top-K sampling kernel launch failed");
+
+    // Wrap handle in tensor for readback
+    let result_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![1]),
+        result_handle.clone(),
+        DType::F32,
+    );
+    let tensor: Tensor<Wgpu, 1> =
+        Tensor::from_primitive(TensorPrimitive::Float(result_tensor));
+
+    (result_handle, tensor)
+}
+
+/// Read a single GPU token tensor back to CPU.
+///
+/// The tensor is a 1-element f32 tensor whose bits encode a u32 token ID.
+pub async fn gpu_read_token_tensor(t: Tensor<Wgpu, 1>) -> u32 {
+    let data: Vec<f32> = t
+        .into_data_async()
+        .await
+        .expect("GPU readback failed")
+        .to_vec()
+        .expect("token readback to_vec failed");
+    data[0].to_bits()
+}
+
+/// Batch-read multiple GPU token tensors back to CPU.
+///
+/// Each tensor is a 1-element f32 tensor whose bits encode a u32 token ID.
+/// Returns the token IDs in order.
+pub async fn gpu_read_token_tensors(tensors: Vec<Tensor<Wgpu, 1>>) -> Vec<u32> {
+    if tensors.is_empty() {
+        return Vec::new();
+    }
+    // Concatenate all 1-element tensors into a single [N] tensor on GPU,
+    // then do one readback instead of N separate ones.
+    let stacked = Tensor::cat(tensors, 0);
+    let data: Vec<f32> = stacked
+        .into_data_async()
+        .await
+        .expect("GPU readback failed")
+        .to_vec()
+        .expect("token readback to_vec failed");
+    data.iter().map(|v| v.to_bits()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// DepthGpuBuffers — pre-allocated GPU buffers for depth transformer
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated GPU buffers for the depth transformer's GPU-optimized path.
+///
+/// Eliminates per-step buffer allocation overhead by reusing handles across
+/// frames. Created once when the depth transformer is initialized.
+pub struct DepthGpuBuffers {
+    /// Per-step token result handles (16 × 4 bytes each).
+    pub token_handles: Vec<Handle>,
+    /// Per-step embedding output handles (16 × dim × 4 bytes each).
+    /// Only steps 1-15 need embedding output; step 0 uses text embedding.
+    pub embed_output_handles: Vec<Handle>,
+    /// Info buffer for embedding lookup (constant: [dim, bytes_per_row, vocab_size]).
+    /// One per audio embedding table (15 total).
+    pub embed_info_handles: Vec<Handle>,
+    /// Pre-allocated argmax info handles per step (avoids create_from_slice in hot loop).
+    /// Each contains a single u32 = vocab_size for that step's output head.
+    argmax_info_handles: Vec<Handle>,
+    /// Pre-allocated output handle for step 0 text embedding GPU lookup.
+    text_emb_output_handle: Option<Handle>,
+    /// Info handle for text embedding GPU lookup: [dim, bytes_per_row, vocab_size].
+    text_emb_info_handle: Option<Handle>,
+    /// GPU handle to the text embedding Q4 data (if uploaded).
+    text_emb_q4_handle: Option<Handle>,
+    /// Embedding dimension.
+    pub dim: usize,
+    /// Device for creating tensors from handles.
+    device: WgpuDevice,
+}
+
+impl DepthGpuBuffers {
+    /// Create pre-allocated GPU buffers for depth generation.
+    ///
+    /// `output_vocab_sizes`: per-step output vocab size (e.g. 32000 for text, 2048 for audio).
+    /// Used to pre-allocate argmax info handles, avoiding `create_from_slice` in the hot loop.
+    /// `text_emb`: optional text embedding store — if provided and uploaded to GPU,
+    /// enables fully GPU-side text embedding at step 0 (no CPU readback needed).
+    pub fn new(
+        num_steps: usize,
+        dim: usize,
+        audio_embs: &[EmbeddingStore],
+        output_vocab_sizes: &[usize],
+        text_emb: Option<&EmbeddingStore>,
+        device: &WgpuDevice,
+    ) -> Self {
+        let client = WgpuRuntime::client(device);
+
+        // Pre-allocate token result buffers (one per step)
+        let token_handles: Vec<Handle> = (0..num_steps)
+            .map(|_| client.empty(4))
+            .collect();
+
+        // Pre-allocate embedding output buffers (one per audio step, steps 1..num_steps)
+        let embed_output_handles: Vec<Handle> = (0..num_steps.saturating_sub(1))
+            .map(|_| client.empty(dim * 4))
+            .collect();
+
+        // Pre-create info buffers for each audio embedding table
+        let embed_info_handles: Vec<Handle> = audio_embs
+            .iter()
+            .map(|emb| {
+                let blocks_per_row = emb.dim() / 32;
+                let bytes_per_row = blocks_per_row * 18;
+                let mut info_bytes = Vec::with_capacity(12);
+                info_bytes.extend_from_slice(&(emb.dim() as u32).to_le_bytes());
+                info_bytes.extend_from_slice(&(bytes_per_row as u32).to_le_bytes());
+                info_bytes.extend_from_slice(&(emb.vocab_size() as u32).to_le_bytes());
+                client.create_from_slice(&info_bytes)
+            })
+            .collect();
+
+        // Pre-create argmax info handles per step (each contains vocab_size as u32).
+        // This avoids calling create_from_slice inside the depth autoregressive loop,
+        // which would force a command buffer flush per step (~4.5ms overhead each).
+        let argmax_info_handles: Vec<Handle> = output_vocab_sizes
+            .iter()
+            .map(|&vocab_size| {
+                let info_bytes: Vec<u8> = (vocab_size as u32).to_le_bytes().to_vec();
+                client.create_from_slice(&info_bytes)
+            })
+            .collect();
+
+        // Pre-allocate text embedding GPU lookup buffers (step 0).
+        // This allows step 0 to use GPU embedding lookup with the argmax handle,
+        // eliminating the CPU readback stall between temporal and depth.
+        let (text_emb_output_handle, text_emb_info_handle, text_emb_q4_handle) =
+            if let Some(emb) = text_emb {
+                if let Some((q4_handle, _dim, vocab_size, bytes_per_row, _dev)) = emb.gpu_lookup_params_opt() {
+                    let output_handle = client.empty(dim * 4);
+                    let mut info_bytes = Vec::with_capacity(12);
+                    info_bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+                    info_bytes.extend_from_slice(&(bytes_per_row as u32).to_le_bytes());
+                    info_bytes.extend_from_slice(&(vocab_size as u32).to_le_bytes());
+                    let info_handle = client.create_from_slice(&info_bytes);
+                    (Some(output_handle), Some(info_handle), Some(q4_handle.clone()))
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
+
+        Self {
+            token_handles,
+            embed_output_handles,
+            embed_info_handles,
+            argmax_info_handles,
+            text_emb_output_handle,
+            text_emb_info_handle,
+            text_emb_q4_handle,
+            dim,
+            device: device.clone(),
+        }
+    }
+
+    /// Get a pre-allocated token handle for step `step`, plus a Tensor wrapping it.
+    pub fn token_handle_and_tensor(&self, step: usize) -> (&Handle, Tensor<Wgpu, 1>) {
+        let handle = &self.token_handles[step];
+        let client = WgpuRuntime::client(&self.device);
+        let tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1]),
+            handle.clone(),
+            DType::F32,
+        );
+        (handle, Tensor::from_primitive(TensorPrimitive::Float(tensor)))
+    }
+
+    /// Launch GPU top-k sampling into a pre-allocated token handle.
+    pub fn gpu_sample_top_k_into(
+        &self,
+        step: usize,
+        logits: Tensor<Wgpu, 3>,
+        top_k: usize,
+        temperature: f32,
+        past_tokens: &[u32],
+        penalty: f32,
+    ) -> Tensor<Wgpu, 1> {
+        let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
+        let cube_input = into_contiguous(cube_input);
+        let v = cube_input.shape.dims[cube_input.shape.num_dims() - 1];
+        let client = cube_input.client.clone();
+
+        let result_handle = &self.token_handles[step];
+
+        // Penalty tokens buffer (still per-call since content varies)
+        let penalty_bytes: Vec<u8> = if past_tokens.is_empty() {
+            vec![0xFF; 4]
+        } else {
+            let seen: std::collections::HashSet<u32> = past_tokens.iter().copied().collect();
+            let unique: Vec<u32> = seen.into_iter().collect();
+            unique.iter().flat_map(|t| t.to_le_bytes()).collect()
+        };
+        let num_penalty_tokens = if past_tokens.is_empty() {
+            0u32
+        } else {
+            let seen: std::collections::HashSet<u32> = past_tokens.iter().copied().collect();
+            seen.len() as u32
+        };
+        let penalty_handle = client.create_from_slice(&penalty_bytes);
+
+        let rand_val = crate::model::pseudo_random();
+        let mut info_bytes = Vec::with_capacity(24);
+        info_bytes.extend_from_slice(&(v as u32).to_le_bytes());
+        info_bytes.extend_from_slice(&(top_k as u32).to_le_bytes());
+        info_bytes.extend_from_slice(&temperature.to_bits().to_le_bytes());
+        info_bytes.extend_from_slice(&penalty.to_bits().to_le_bytes());
+        info_bytes.extend_from_slice(&rand_val.to_bits().to_le_bytes());
+        info_bytes.extend_from_slice(&num_penalty_tokens.to_le_bytes());
+        let info_handle = client.create_from_slice(&info_bytes);
+
+        let bindings = Bindings::new()
+            .with_buffer(cube_input.handle.clone().binding())
+            .with_buffer(penalty_handle.binding())
+            .with_buffer(result_handle.clone().binding())
+            .with_buffer(info_handle.binding());
+
+        let kernel = SourceKernel::new(SampleTopKKernel, CubeDim::new_1d(256));
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_1d(1),
+                bindings,
+            )
+            .expect("Top-K sampling kernel launch failed");
+
+        let result_tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1]),
+            result_handle.clone(),
+            DType::F32,
+        );
+        Tensor::from_primitive(TensorPrimitive::Float(result_tensor))
+    }
+
+    /// Launch GPU argmax into a pre-allocated token handle.
+    ///
+    /// Uses a pre-allocated info handle (created during init) to avoid
+    /// `create_from_slice` in the hot loop, which would force a command
+    /// buffer flush per step.
+    pub fn gpu_argmax_into(
+        &self,
+        step: usize,
+        logits: Tensor<Wgpu, 3>,
+    ) -> Tensor<Wgpu, 1> {
+        let cube_input: CubeTensor<WgpuRuntime> = logits.into_primitive().tensor();
+        let cube_input = into_contiguous(cube_input);
+        let client = cube_input.client.clone();
+
+        let result_handle = &self.token_handles[step];
+        let info_handle = &self.argmax_info_handles[step];
+
+        let bindings = Bindings::new()
+            .with_buffer(cube_input.handle.clone().binding())
+            .with_buffer(result_handle.clone().binding())
+            .with_buffer(info_handle.clone().binding());
+
+        let kernel = SourceKernel::new(ArgmaxKernel, CubeDim::new_1d(256));
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_1d(1),
+                bindings,
+            )
+            .expect("Argmax kernel launch failed");
+
+        let result_tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1]),
+            result_handle.clone(),
+            DType::F32,
+        );
+        Tensor::from_primitive(TensorPrimitive::Float(result_tensor))
+    }
+
+    /// Launch GPU Q4 embedding lookup using pre-allocated output buffer.
+    ///
+    /// `step`: depth step (1-15), used to index into pre-allocated buffers.
+    /// `emb_idx`: audio embedding index (step - 1).
+    pub fn gpu_embed_lookup_into(
+        &self,
+        step: usize,
+        emb_idx: usize,
+        token_handle: &Handle,
+        q4_gpu_handle: &Handle,
+    ) -> Tensor<Wgpu, 3> {
+        let client = WgpuRuntime::client(&self.device);
+
+        let output_handle = &self.embed_output_handles[step - 1]; // step 1 → index 0
+        let info_handle = &self.embed_info_handles[emb_idx];
+
+        let bindings = Bindings::new()
+            .with_buffer(token_handle.clone().binding())
+            .with_buffer(q4_gpu_handle.clone().binding())
+            .with_buffer(output_handle.clone().binding())
+            .with_buffer(info_handle.clone().binding());
+
+        let kernel = SourceKernel::new(EmbedQ4Kernel, CubeDim::new_1d(256));
+        let num_workgroups = (self.dim as u32).div_ceil(256);
+
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_1d(num_workgroups),
+                bindings,
+            )
+            .expect("Q4 embedding lookup kernel launch failed");
+
+        let output_tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1, 1, self.dim]),
+            output_handle.clone(),
+            DType::F32,
+        );
+        Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+    }
+
+    /// GPU-side text embedding lookup for step 0 using a token handle.
+    ///
+    /// Uses the pre-allocated text embedding output buffer and the uploaded
+    /// text embedding Q4 data. The `token_handle` is the argmax/sampling
+    /// result handle from temporal — no CPU readback needed.
+    ///
+    /// Returns Some(tensor [1, 1, dim]) if GPU text embedding is available,
+    /// None if text_emb was not uploaded to GPU.
+    pub fn gpu_text_embed_lookup(&self, token_handle: &Handle) -> Option<Tensor<Wgpu, 3>> {
+        let output_handle = self.text_emb_output_handle.as_ref()?;
+        let info_handle = self.text_emb_info_handle.as_ref()?;
+        let q4_handle = self.text_emb_q4_handle.as_ref()?;
+
+        let client = WgpuRuntime::client(&self.device);
+
+        let bindings = Bindings::new()
+            .with_buffer(token_handle.clone().binding())
+            .with_buffer(q4_handle.clone().binding())
+            .with_buffer(output_handle.clone().binding())
+            .with_buffer(info_handle.clone().binding());
+
+        let kernel = SourceKernel::new(EmbedQ4Kernel, CubeDim::new_1d(256));
+        let num_workgroups = (self.dim as u32).div_ceil(256);
+
+        client
+            .launch(
+                Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+                CubeCount::new_1d(num_workgroups),
+                bindings,
+            )
+            .expect("Text embedding Q4 lookup kernel launch failed");
+
+        let output_tensor = CubeTensor::new_contiguous(
+            client,
+            self.device.clone(),
+            burn::prelude::Shape::from(vec![1, 1, self.dim]),
+            output_handle.clone(),
+            DType::F32,
+        );
+        Some(Tensor::from_primitive(TensorPrimitive::Float(output_tensor)))
+    }
+
+    /// Collect all token tensors for batch readback.
+    pub fn collect_token_tensors(&self, num_steps: usize) -> Vec<Tensor<Wgpu, 1>> {
+        (0..num_steps)
+            .map(|step| {
+                let (_, tensor) = self.token_handle_and_tensor(step);
+                tensor
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU Q4_0 embedding lookup
+// ---------------------------------------------------------------------------
+
+struct EmbedQ4Kernel;
+
+impl KernelSource for EmbedQ4Kernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_embed_q4.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// GPU-side Q4_0 embedding lookup: dequantizes a single row on GPU.
+///
+/// `token_handle`: Handle containing a single u32 token ID (from gpu_argmax_buffer)
+/// `q4_gpu_handle`: Handle containing the Q4_0 embedding table bytes on GPU
+/// `dim`: embedding dimension
+/// `vocab_size`: number of rows in the embedding table
+/// `bytes_per_row`: (dim/32) * 18
+/// `device`: WgpuDevice (used to obtain compute client)
+///
+/// Returns a Tensor<Wgpu, 3> of shape [1, 1, dim] with the dequantized embedding.
+pub fn gpu_embedding_lookup_q4(
+    token_handle: &Handle,
+    q4_gpu_handle: &Handle,
+    dim: usize,
+    vocab_size: usize,
+    bytes_per_row: usize,
+    device: &WgpuDevice,
+) -> Tensor<Wgpu, 3> {
+    let client = WgpuRuntime::client(device);
+
+    // Output buffer: dim f32 values
+    let output_handle = client.empty(dim * 4);
+
+    // Info: [dim, bytes_per_row, vocab_size]
+    let mut info_bytes = Vec::with_capacity(12);
+    info_bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+    info_bytes.extend_from_slice(&(bytes_per_row as u32).to_le_bytes());
+    info_bytes.extend_from_slice(&(vocab_size as u32).to_le_bytes());
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(token_handle.clone().binding())
+        .with_buffer(q4_gpu_handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(EmbedQ4Kernel, CubeDim::new_1d(256));
+
+    let num_workgroups = (dim as u32).div_ceil(256);
+
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("Q4 embedding lookup kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device.clone(),
+        burn::prelude::Shape::from(vec![1, 1, dim]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
 // ---------------------------------------------------------------------------
 // EmbeddingStore — Q4 embeddings for token lookups
 // ---------------------------------------------------------------------------
 
 /// Q4 embedding table stored as CPU bytes for efficient row lookups.
+///
+/// Optionally holds a GPU handle to the same Q4 data for GPU-side embedding
+/// lookups (used by the depth transformer to avoid GPU→CPU readback per step).
 pub struct EmbeddingStore {
     cpu_bytes: Vec<u8>,
     vocab_size: usize,
     dim: usize,
+    /// GPU handle to the Q4 bytes (uploaded lazily via `upload_to_gpu()`).
+    gpu_handle: Option<Handle>,
+    /// Device used to create the GPU handle.
+    gpu_device: Option<WgpuDevice>,
 }
 
 impl EmbeddingStore {
@@ -770,6 +1606,8 @@ impl EmbeddingStore {
             cpu_bytes,
             vocab_size,
             dim,
+            gpu_handle: None,
+            gpu_device: None,
         }
     }
 
@@ -779,6 +1617,38 @@ impl EmbeddingStore {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Upload Q4 bytes to GPU for GPU-side embedding lookups.
+    pub fn upload_to_gpu(&mut self, device: &WgpuDevice) {
+        if self.gpu_handle.is_some() {
+            return; // Already uploaded
+        }
+        let client = WgpuRuntime::client(device);
+        let handle = client.create_from_slice(&self.cpu_bytes);
+        self.gpu_handle = Some(handle);
+        self.gpu_device = Some(device.clone());
+    }
+
+    /// Get the GPU handle and metadata needed for `gpu_embedding_lookup_q4()`.
+    ///
+    /// Returns `(handle, dim, vocab_size, bytes_per_row, device)`.
+    /// Panics if `upload_to_gpu()` has not been called.
+    pub fn gpu_lookup_params(&self) -> (&Handle, usize, usize, usize, &WgpuDevice) {
+        let handle = self.gpu_handle.as_ref().expect("EmbeddingStore not uploaded to GPU");
+        let device = self.gpu_device.as_ref().expect("EmbeddingStore not uploaded to GPU");
+        let blocks_per_row = self.dim / 32;
+        let bytes_per_row = blocks_per_row * 18;
+        (handle, self.dim, self.vocab_size, bytes_per_row, device)
+    }
+
+    /// Non-panicking version: returns None if GPU data is not uploaded.
+    pub fn gpu_lookup_params_opt(&self) -> Option<(&Handle, usize, usize, usize, &WgpuDevice)> {
+        let handle = self.gpu_handle.as_ref()?;
+        let device = self.gpu_device.as_ref()?;
+        let blocks_per_row = self.dim / 32;
+        let bytes_per_row = blocks_per_row * 18;
+        Some((handle, self.dim, self.vocab_size, bytes_per_row, device))
     }
 
     /// Dequantize a single row into an existing CPU buffer (for accumulation).
@@ -1095,5 +1965,29 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let shape = reverse_gguf_dims(info.shape());
         let bytes = self.reader.tensor_data(name)?;
         Ok((bytes, [shape[0], shape[1]]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw wgpu buffer extraction utilities
+// ---------------------------------------------------------------------------
+
+/// Extract the underlying `WgpuResource` (wgpu buffer + offset + size) from a CubeCL `Handle`.
+///
+/// This flushes any pending GPU work on the handle's stream and returns the
+/// raw GPU buffer reference. Useful for passing buffers to custom WebGPU
+/// pipelines outside of CubeCL/Burn.
+pub fn handle_to_wgpu_resource(handle: &Handle, device: &WgpuDevice) -> WgpuResource {
+    let client = WgpuRuntime::client(device);
+    let binding = handle.clone().binding();
+    let binding_resource = client.get_resource(binding);
+    let res = binding_resource.resource();
+    WgpuResource::new(res.buffer.clone(), res.offset, res.size)
+}
+
+impl Q4KTensor {
+    /// Get a reference to the underlying CubeCL handle for raw GPU access.
+    pub fn raw_handle(&self) -> &Handle {
+        &self.handle
     }
 }

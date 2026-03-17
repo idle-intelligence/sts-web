@@ -449,7 +449,7 @@ fn load_depth_layer<R: Read + Seek>(
 /// be freed. Embedding bytes stay on CPU for row-lookup at inference time.
 enum ProcessedTensor {
     /// A quantized or dense linear layer already on GPU.
-    Linear(Linear),
+    Linear(Box<Linear>),
     /// An RMS-norm weight tensor on GPU.
     Norm(RmsNormLayer),
     /// Raw embedding bytes on CPU with shape [vocab, dim].
@@ -623,7 +623,7 @@ impl IncrementalModelLoader {
 
         // Everything else is a linear weight — upload to GPU
         let linear = self.load_linear_from_bytes(info, bytes)?;
-        Ok(vec![(name.clone(), ProcessedTensor::Linear(linear))])
+        Ok(vec![(name.clone(), ProcessedTensor::Linear(Box::new(linear)))])
     }
 
     /// Split a packed depth attention tensor into `num_steps` sub-Linear entries.
@@ -659,7 +659,7 @@ impl IncrementalModelLoader {
                 &self.device,
             )?;
             let split_name = format!("{name}.split.{s}");
-            results.push((split_name, ProcessedTensor::Linear(step_linear)));
+            results.push((split_name, ProcessedTensor::Linear(Box::new(step_linear))));
         }
 
         Ok(results)
@@ -732,7 +732,7 @@ impl IncrementalModelLoader {
     /// Take a processed tensor out of the accumulator, or error.
     fn take_linear(&mut self, name: &str) -> Result<Linear> {
         match self.processed.remove(name) {
-            Some(ProcessedTensor::Linear(l)) => Ok(l),
+            Some(ProcessedTensor::Linear(l)) => Ok(*l),
             Some(_) => bail!("Expected Linear for '{name}', got different type"),
             None => bail!("Tensor '{name}' not found in processed tensors"),
         }

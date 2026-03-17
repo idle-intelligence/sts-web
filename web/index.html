@@ -188,6 +188,27 @@
             color: var(--text);
         }
 
+        #turnHistory { margin-top: 8px; }
+        .turn-entry {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 16px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--muted);
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .turn-entry:last-child { border-bottom: none; }
+        .turn-label { color: var(--text); }
+        .turn-duration { color: var(--faint); }
+        .turn-entry audio {
+            height: 28px;
+            flex: 1 1 200px;
+            min-width: 0;
+        }
+
         #metricsCard { display: none; }
         .metrics-grid {
             display: grid;
@@ -230,6 +251,66 @@
             margin-top: 8px;
         }
 
+        .voice-section {
+            margin-bottom: 16px;
+        }
+        .voice-section-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            color: var(--faint);
+            margin-bottom: 8px;
+        }
+        .voice-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .voice-row {
+            display: flex;
+            flex-wrap: nowrap;
+            align-items: center;
+            gap: 4px;
+        }
+        .voice-btn {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 4px 9px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--muted);
+            border-radius: 999px;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s, color 0.15s;
+            letter-spacing: 0.02em;
+        }
+        .voice-btn:hover:not(:disabled) {
+            border-color: var(--text);
+            color: var(--text);
+        }
+        .voice-btn.active {
+            background: var(--text);
+            color: var(--bg);
+            border-color: var(--text);
+        }
+        .voice-btn.loading {
+            border-style: dashed;
+        }
+        .voice-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        .wip-note {
+            font-size: 13px;
+            color: var(--yellow);
+            border: 1px solid var(--yellow);
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 24px;
+        }
+
         footer {
             border-top: 1px solid var(--border);
             padding-top: 24px;
@@ -259,6 +340,8 @@
         </p>
     </header>
 
+    <p class="wip-note">⚠ Work in progress — this model runs slower than realtime without a powerful GPU. Expect delays during audio generation.</p>
+
     <section>
         <h2>status</h2>
         <div class="status">
@@ -277,6 +360,35 @@
 
     <section>
         <h2>conversation</h2>
+        <div class="voice-section">
+            <div class="voice-section-label">VOICE</div>
+            <button class="voice-btn active" data-voice="" disabled id="voiceNoneBtn">None</button>
+            <p class="hw-note" style="margin: 6px 0 10px;">No voice prompt — speaker identity sampled from prior distribution</p>
+            <div class="voice-grid" id="voiceGrid">
+                <div class="voice-row">
+                    <button class="voice-btn" data-voice="NATM0" disabled>NATM0</button>
+                    <button class="voice-btn" data-voice="NATM1" disabled>NATM1</button>
+                    <button class="voice-btn" data-voice="NATM2" disabled>NATM2</button>
+                    <button class="voice-btn" data-voice="NATM3" disabled>NATM3</button>
+                    <button class="voice-btn" data-voice="VARM0" disabled>VARM0</button>
+                    <button class="voice-btn" data-voice="VARM1" disabled>VARM1</button>
+                    <button class="voice-btn" data-voice="VARM2" disabled>VARM2</button>
+                    <button class="voice-btn" data-voice="VARM3" disabled>VARM3</button>
+                    <button class="voice-btn" data-voice="VARM4" disabled>VARM4</button>
+                </div>
+                <div class="voice-row">
+                    <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
+                    <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
+                    <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
+                    <button class="voice-btn" data-voice="NATF3" disabled>NATF3</button>
+                    <button class="voice-btn" data-voice="VARF0" disabled>VARF0</button>
+                    <button class="voice-btn" data-voice="VARF1" disabled>VARF1</button>
+                    <button class="voice-btn" data-voice="VARF2" disabled>VARF2</button>
+                    <button class="voice-btn" data-voice="VARF3" disabled>VARF3</button>
+                    <button class="voice-btn" data-voice="VARF4" disabled>VARF4</button>
+                </div>
+            </div>
+        </div>
         <div class="actions">
             <button id="myTurnBtn" class="primary" disabled>My Turn</button>
             <button id="yourTurnBtn" class="danger" disabled style="display:none">Your Turn</button>
@@ -294,6 +406,11 @@
         <h2>output <span class="sub">· audio</span></h2>
         <audio id="audioPlayer" controls style="display:none; width:100%; margin-top:12px"></audio>
         <p id="audioStatus" class="info"></p>
+    </section>
+
+    <section id="turnHistorySection" style="display:none">
+        <h2>turns</h2>
+        <div id="turnHistory"></div>
     </section>
 
     <section>
@@ -356,6 +473,10 @@
         const exampleBtn = document.getElementById('exampleBtn');
         const audioPlayer = document.getElementById('audioPlayer');
         const audioStatus = document.getElementById('audioStatus');
+        const voiceGrid = document.getElementById('voiceGrid');
+        const voiceNoneBtn = document.getElementById('voiceNoneBtn');
+        const voiceBtns = [voiceNoneBtn, ...Array.from(voiceGrid.querySelectorAll('.voice-btn'))];
+        let activeVoiceBtn = voiceNoneBtn;
         const metricsCard = document.getElementById('metricsCard');
         const metricFrameMs = document.getElementById('metricFrameMs');
         const metricFps = document.getElementById('metricFps');
@@ -363,6 +484,8 @@
         const metricTemporalMs = document.getElementById('metricTemporalMs');
         const metricDepthMs = document.getElementById('metricDepthMs');
         const metricMimiMs = document.getElementById('metricMimiMs');
+
+        const isBenchmark = new URLSearchParams(location.search).has('benchmark');
 
         let worker = null;
         let mimiWorker = null;
@@ -378,9 +501,12 @@
         const allDecodedChunks = []; // Collect decoded audio from Mimi worker for WAV export
         let mimiTotalMs = 0;       // Accumulated Mimi decode time from Mimi worker
         let mimiFrameCount = 0;    // Number of Mimi decode frames
+        let lastTurnBlobUrl = null; // WAV blob URL for the completed turn (attached to history entry)
 
         // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
         let uiState = 'idle';
+        let turnCount = 0;
+        let generationStartTime = 0;
 
         function setUIState(state) {
             uiState = state;
@@ -394,6 +520,7 @@
                     yourTurnBtn.disabled = true;
                     fileBtn.disabled = false;
                     exampleBtn.disabled = false;
+                    voiceBtns.forEach(b => b.disabled = false);
                     break;
                 case 'listening':
                     myTurnBtn.style.display = 'none';
@@ -402,13 +529,17 @@
                     newConvoBtn.style.display = '';
                     fileBtn.disabled = true;
                     exampleBtn.disabled = true;
+                    voiceBtns.forEach(b => b.disabled = true);
                     break;
                 case 'generating':
+                    generationStartTime = performance.now();
+                    /* falls through */
                 case 'speaking':
                     myTurnBtn.style.display = 'none';
                     yourTurnBtn.style.display = 'none';
                     fileBtn.disabled = true;
                     exampleBtn.disabled = true;
+                    voiceBtns.forEach(b => b.disabled = true);
                     break;
             }
         }
@@ -542,6 +673,7 @@
                             audioPlayer.src = audioPlayer._blobUrl;
                             audioPlayer.style.display = 'block';
                             audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
+                            lastTurnBlobUrl = audioPlayer._blobUrl;
                         }
                         break;
                     }
@@ -566,7 +698,7 @@
         function initWorker() {
             worker = new Worker('./worker.js', { type: 'module' });
 
-            worker.onmessage = (e) => {
+            worker.onmessage = async (e) => {
                 const msg = e.data;
                 switch (msg.type) {
                     case 'status':
@@ -576,6 +708,7 @@
                                 myTurnBtn.disabled = false;
                                 fileBtn.disabled = false;
                                 exampleBtn.disabled = false;
+                                voiceBtns.forEach(b => b.disabled = false);
                             }
                             progressBar.classList.remove('visible');
                             progressInfo.textContent = '';
@@ -606,9 +739,16 @@
                         break;
 
                     case 'audio-chunk':
-                        audioStatus.textContent = msg.done
-                            ? 'Generation complete'
-                            : `Generating... frame ${msg.step + 1}`;
+                        if (!isBenchmark) {
+                            if (msg.done) {
+                                audioStatus.textContent = 'Generation complete';
+                            } else {
+                                const playing = msg.step >= 24;
+                                audioStatus.textContent = playing
+                                    ? `Playing (frame ${msg.step + 1})`
+                                    : `Buffering audio... (frame ${msg.step + 1}/25)`;
+                            }
+                        }
                         if (msg.done && playbackNode) {
                             playbackNode.port.postMessage({ type: 'flush' });
                         }
@@ -623,6 +763,7 @@
                         audioPlayer.src = audioPlayer._blobUrl;
                         audioPlayer.style.display = 'block';
                         audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
+                        lastTurnBlobUrl = audioPlayer._blobUrl;
                         break;
                     }
 
@@ -642,10 +783,34 @@
                         break;
                     }
 
-                    case 'turn-complete':
+                    case 'turn-complete': {
                         updateStatus('ready', 'Ready');
                         setUIState('idle');
+                        // Record turn history entry
+                        turnCount++;
+                        const audioDurationSec = mimiFrameCount > 0
+                            ? (mimiFrameCount * 0.08).toFixed(1)
+                            : '?';
+                        const genSec = generationStartTime > 0
+                            ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
+                            : '?';
+                        const turnHistoryEl = document.getElementById('turnHistory');
+                        const turnHistorySectionEl = document.getElementById('turnHistorySection');
+                        const entry = document.createElement('div');
+                        entry.className = 'turn-entry';
+                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${genSec}s gen · ${audioDurationSec}s audio</span>`;
+                        const blobUrl = lastTurnBlobUrl || audioPlayer._blobUrl;
+                        if (blobUrl) {
+                            const player = document.createElement('audio');
+                            player.controls = true;
+                            player.src = blobUrl;
+                            entry.appendChild(player);
+                            lastTurnBlobUrl = null;
+                        }
+                        turnHistoryEl.appendChild(entry);
+                        turnHistorySectionEl.style.display = '';
                         break;
+                    }
 
                     case 'metrics':
                         // Override Mimi timing with data from the Mimi worker
@@ -653,6 +818,23 @@
                             msg.mimiMs = mimiTotalMs / mimiFrameCount;
                         }
                         updateMetrics(msg);
+                        break;
+
+                    case 'voice-loaded':
+                        voiceBtns.forEach(b => {
+                            b.disabled = false;
+                            b.classList.remove('loading');
+                        });
+                        updateStatus('ready', 'Ready');
+                        break;
+
+                    case 'voice-error':
+                        console.error('[voice]', msg.error);
+                        voiceBtns.forEach(b => {
+                            b.disabled = false;
+                            b.classList.remove('loading');
+                        });
+                        updateStatus('ready', 'Ready');
                         break;
 
                     case 'error':
@@ -721,16 +903,16 @@
             initMimiWorker();
 
             const cached = await isModelCached();
-            if (cached) {
+            if (cached || isBenchmark) {
                 updateStatus('loading', 'Loading model from cache (~5 GB)...');
-                worker.postMessage({ type: 'load' });
+                worker.postMessage({ type: 'load', benchmark: isBenchmark });
             } else {
                 updateStatus('', 'Model not loaded (~5.1 GB download)');
                 downloadBtn.textContent = 'Download Model';
                 downloadBtn.style.display = '';
                 downloadBtn.addEventListener('click', () => {
                     downloadBtn.disabled = true;
-                    worker.postMessage({ type: 'load' });
+                    worker.postMessage({ type: 'load', benchmark: isBenchmark });
                 });
             }
         }
@@ -769,6 +951,7 @@
             worker.postMessage({ type: 'stop' });
             setUIState('generating');
             updateStatus('active', 'Generating response...');
+            audioStatus.textContent = 'Buffering audio...';
 
             // Clear decoded audio chunks and Mimi timing for new generation
             allDecodedChunks.length = 0;
@@ -808,6 +991,23 @@
             updateStatus('ready', 'Ready');
         });
 
+        // --- Voice preset ---
+
+        function handleVoiceClick(e) {
+            const btn = e.target.closest('.voice-btn');
+            if (!btn || btn.disabled) return;
+
+            activeVoiceBtn.classList.remove('active');
+            btn.classList.add('active', 'loading');
+            activeVoiceBtn = btn;
+
+            const name = btn.dataset.voice || null;
+            voiceBtns.forEach(b => b.disabled = true);
+            worker.postMessage({ type: 'load-voice-preset', name });
+        }
+        voiceGrid.addEventListener('click', handleVoiceClick);
+        voiceNoneBtn.addEventListener('click', handleVoiceClick);
+
         // --- File handlers (test mode) ---
 
         fileBtn.addEventListener('click', () => fileInput.click());
@@ -822,11 +1022,15 @@
             updateStatus('loading', `Decoding ${label}...`);
             setUIState('generating');
             try {
-                if (!playbackNode) await initAudioPlayback();
-                if (audioCtx.state === 'suspended') await audioCtx.resume();
+                // In benchmark mode, skip AudioContext entirely (not needed, and
+                // Chrome blocks it without a user gesture).
+                if (!isBenchmark) {
+                    if (!playbackNode) await initAudioPlayback();
+                    if (audioCtx.state === 'suspended') await audioCtx.resume();
+                    playbackNode.port.postMessage({ type: 'reset' });
+                }
 
-                // Reset playback buffer and decoded chunks
-                playbackNode.port.postMessage({ type: 'reset' });
+                // Reset decoded chunks and Mimi timing
                 allDecodedChunks.length = 0;
                 mimiTotalMs = 0;
                 mimiFrameCount = 0;
@@ -870,6 +1074,48 @@
             if (!resp.ok) { updateStatus('error', 'Failed to fetch example WAV'); return; }
             await feedAudioFile(await resp.arrayBuffer(), 'joke.wav');
         });
+
+        // --- Benchmark mode ---
+        // When ?benchmark is in the URL, auto-drive the full pipeline
+        // and expose results on window.__benchmarkResults for Playwright.
+
+        if (isBenchmark) {
+            // Listen for benchmark-complete from worker
+            const origOnMessage = worker.onmessage;
+            worker.onmessage = (e) => {
+                origOnMessage(e);
+                const msg = e.data;
+                if (msg.type === 'benchmark-complete') {
+                    window.__benchmarkResults = msg.results;
+                    // Display results visually
+                    let pre = document.getElementById('benchmarkResults');
+                    if (!pre) {
+                        pre = document.createElement('pre');
+                        pre.id = 'benchmarkResults';
+                        pre.style.cssText = 'padding:16px;border:1px solid #ddd;font-size:12px;overflow:auto;max-height:400px;margin-top:12px;';
+                        document.querySelector('footer').before(pre);
+                    }
+                    pre.textContent = JSON.stringify(msg.results, null, 2);
+                }
+                if (msg.type === 'status' && msg.ready) {
+                    // Model loaded — feed test audio and generate
+                    benchmarkAutoRun();
+                }
+            };
+        }
+
+        async function benchmarkAutoRun() {
+            console.log('[benchmark] Model ready, feeding test audio...');
+            try {
+                const resp = await fetch('./joke.wav');
+                if (!resp.ok) throw new Error('Failed to fetch joke.wav: ' + resp.status);
+                const arrayBuf = await resp.arrayBuffer();
+                await feedAudioFile(arrayBuf, 'benchmark-joke.wav');
+            } catch (err) {
+                console.error('[benchmark] Auto-run failed:', err);
+                window.__benchmarkResults = { error: err.message };
+            }
+        }
 
         function buildWavBlob(samples) {
             const numSamples = samples.length;

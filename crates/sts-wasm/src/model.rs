@@ -13,21 +13,32 @@
 //!
 //! All linear projections use Q4Linear from the gguf module.
 
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
+use burn::backend::wgpu::{
+    into_contiguous, AutoCompiler, CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate,
+    Wgpu, WgpuDevice, WgpuRuntime,
+};
 use burn::tensor::activation::{silu, softmax};
-use burn::tensor::Tensor;
+use burn::tensor::{DType, Tensor, TensorPrimitive};
+use cubecl::prelude::KernelId;
+use cubecl::server::{Bindings, CubeCount, Handle};
+use cubecl::{CubeTask, Runtime};
+use std::cell::RefCell;
 
 use crate::gguf::{EmbeddingStore, Linear};
 use crate::StsConfig;
 
 // ---------------------------------------------------------------------------
-// RoPE -- Rotary Position Embeddings
+// RoPE -- Rotary Position Embeddings (Burn element-wise ops for fusion)
 // ---------------------------------------------------------------------------
 
-/// Rotary Position Embeddings with precomputed cos/sin tables.
+/// Rotary Position Embeddings with precomputed cos/sin tables as Burn tensors.
+///
+/// Uses Burn's element-wise ops (mul, sub, add, cat) so that Burn's fusion
+/// optimizer can chain these with surrounding operations.
 pub struct RoPE {
-    cos: Tensor<Wgpu, 2>,
-    sin: Tensor<Wgpu, 2>,
+    cos_table: Tensor<Wgpu, 2>, // [max_seq_len, half_dim]
+    sin_table: Tensor<Wgpu, 2>, // [max_seq_len, half_dim]
+    half_dim: usize,
 }
 
 impl RoPE {
@@ -51,66 +62,129 @@ impl RoPE {
         let freqs = Tensor::<Wgpu, 1>::from_floats(freqs.as_slice(), device)
             .reshape([max_seq_len, half_dim]);
 
-        let cos = freqs.clone().cos();
-        let sin = freqs.sin();
+        let cos_table = freqs.clone().cos();
+        let sin_table = freqs.sin();
 
-        RoPE { cos, sin }
+        RoPE {
+            cos_table,
+            sin_table,
+            half_dim,
+        }
     }
 
-    /// Apply rotary embeddings to Q and K tensors.
+    /// Apply RoPE rotation to a single [B, S, H, D] tensor using Burn ops.
+    ///
+    /// Uses interleaved convention: pairs at adjacent indices [r0, i0, r1, i1, ...]
+    /// as required by PersonaPlex/Moshi (not split-half).
+    fn apply_rope_to_tensor(&self, x: Tensor<Wgpu, 4>, offset: usize) -> Tensor<Wgpu, 4> {
+        let [batch, seq, heads, head_dim] = x.dims();
+        let half = self.half_dim; // head_dim / 2
+
+        // Reshape to separate real/imaginary pairs: [B, S, H, half_dim, 2]
+        let x = x.reshape([batch, seq, heads, half, 2]);
+
+        // Extract real (index 0) and imaginary (index 1) parts
+        // Both are [B, S, H, half, 1]
+        let x_real = x.clone().slice([0..batch, 0..seq, 0..heads, 0..half, 0..1]);
+        let x_imag = x.slice([0..batch, 0..seq, 0..heads, 0..half, 1..2]);
+
+        // Get cos/sin for positions [offset..offset+seq]
+        let cos = self.cos_table.clone().slice([offset..offset + seq, 0..half])
+            .reshape([1, seq, 1, half, 1]);
+        let sin = self.sin_table.clone().slice([offset..offset + seq, 0..half])
+            .reshape([1, seq, 1, half, 1]);
+
+        // Apply rotation: out_r = x_r * cos - x_i * sin
+        //                 out_i = x_r * sin + x_i * cos
+        let out_real = x_real.clone() * cos.clone() - x_imag.clone() * sin.clone();
+        let out_imag = x_real * sin + x_imag * cos;
+
+        // Stack back to interleaved [r0, i0, r1, i1, ...] and reshape
+        Tensor::cat(vec![out_real, out_imag], 4) // [B, S, H, half, 2]
+            .reshape([batch, seq, heads, head_dim])
+    }
+
+    /// Apply rotary embeddings to Q and K tensors using Burn element-wise ops.
     ///
     /// q, k shape: [batch, seq, heads, head_dim]
+    /// Burn's fusion optimizer can chain these ops with surrounding operations.
     pub fn apply(
         &self,
         q: Tensor<Wgpu, 4>,
         k: Tensor<Wgpu, 4>,
         offset: usize,
     ) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
-        let seq_len = q.dims()[1];
-        let [_max_len, half_dim] = self.cos.dims();
-        let cos = self
-            .cos
-            .clone()
-            .slice([offset..offset + seq_len, 0..half_dim]);
-        let sin = self
-            .sin
-            .clone()
-            .slice([offset..offset + seq_len, 0..half_dim]);
-
-        let q_rot = Self::apply_rotation(q, cos.clone(), sin.clone());
-        let k_rot = Self::apply_rotation(k, cos, sin);
+        let q_rot = self.apply_rope_to_tensor(q, offset);
+        let k_rot = self.apply_rope_to_tensor(k, offset);
         (q_rot, k_rot)
     }
 
-    fn apply_rotation(
-        x: Tensor<Wgpu, 4>,
-        cos: Tensor<Wgpu, 2>,
-        sin: Tensor<Wgpu, 2>,
-    ) -> Tensor<Wgpu, 4> {
-        let [batch, seq, heads, head_dim] = x.dims();
-        let half_dim = head_dim / 2;
+}
 
-        let x_pairs = x.reshape([batch, seq, heads, half_dim, 2]);
+// ---------------------------------------------------------------------------
+// V (and K) Cache Write kernel
+// ---------------------------------------------------------------------------
 
-        let x_r: Tensor<Wgpu, 4> = x_pairs
-            .clone()
-            .slice([0..batch, 0..seq, 0..heads, 0..half_dim, 0..1])
-            .reshape([batch, seq, heads, half_dim]);
-        let x_i: Tensor<Wgpu, 4> = x_pairs
-            .slice([0..batch, 0..seq, 0..heads, 0..half_dim, 1..2])
-            .reshape([batch, seq, heads, half_dim]);
+struct CacheWriteKernelSource;
 
-        let cos: Tensor<Wgpu, 4> = cos.unsqueeze_dim::<3>(0).unsqueeze_dim(2);
-        let sin: Tensor<Wgpu, 4> = sin.unsqueeze_dim::<3>(0).unsqueeze_dim(2);
-
-        let out_r = x_r.clone() * cos.clone() - x_i.clone() * sin.clone();
-        let out_i = x_r * sin + x_i * cos;
-
-        let out_r: Tensor<Wgpu, 5> = out_r.unsqueeze_dim(4);
-        let out_i: Tensor<Wgpu, 5> = out_i.unsqueeze_dim(4);
-        let out = Tensor::cat(vec![out_r, out_i], 4);
-        out.reshape([batch, seq, heads, head_dim])
+impl KernelSource for CacheWriteKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_cache_write.wgsl"))
     }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Direct cache write: copies tensor from [B, S, H, D] into cache [B, H, max_len, D].
+///
+/// Replaces: swap_dims + into_contiguous + slice_assign for V.
+pub fn gpu_cache_write_v(
+    v: &Tensor<Wgpu, 4>,
+    cache_handle: &Handle,
+    offset: usize,
+    max_len: usize,
+) {
+    let cube_v: CubeTensor<WgpuRuntime> = v.clone().into_primitive().tensor();
+    let cube_v = into_contiguous(cube_v);
+
+    let b = cube_v.shape.dims[0];
+    let s = cube_v.shape.dims[1];
+    let h = cube_v.shape.dims[2];
+    let d = cube_v.shape.dims[3];
+
+    let total_elements = b * s * h * d;
+
+    let client = cube_v.client.clone();
+
+    // Info buffer: [pos_offset, B, S, H, D, max_len]
+    let info: [u32; 6] = [
+        offset as u32,
+        b as u32,
+        s as u32,
+        h as u32,
+        d as u32,
+        max_len as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle_buf = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_v.handle.clone().binding())
+        .with_buffer(cache_handle.clone().binding())
+        .with_buffer(info_handle_buf.binding());
+
+    let kernel = SourceKernel::new(CacheWriteKernelSource, CubeDim::new_1d(256));
+
+    let num_workgroups = (total_elements as u32).div_ceil(256);
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_workgroups),
+            bindings,
+        )
+        .expect("V cache write kernel launch failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +261,57 @@ impl KVCache {
         self.v = Some(v_buf);
 
         result
+    }
+
+    /// Ensure cache buffers are allocated and return GPU handles + write position.
+    ///
+    /// Used by the fused RoPE+cache write path: the kernel writes directly
+    /// into the cache buffer, so we need the raw GPU handle.
+    pub fn ensure_allocated(&mut self, batch: usize) -> (Handle, Handle, usize) {
+        if self.k.is_none() {
+            self.k = Some(Tensor::zeros(
+                [batch, self.n_kv_heads, self.max_len, self.head_dim],
+                &self.device,
+            ));
+            self.v = Some(Tensor::zeros(
+                [batch, self.n_kv_heads, self.max_len, self.head_dim],
+                &self.device,
+            ));
+        }
+        let k_handle = self.k.as_ref().unwrap().clone().into_primitive().tensor().handle;
+        let v_handle = self.v.as_ref().unwrap().clone().into_primitive().tensor().handle;
+        (k_handle, v_handle, self.write_pos)
+    }
+
+    /// Advance bookkeeping after fused kernel has written K/V directly.
+    ///
+    /// Call this AFTER the fused RoPE+cache write and V cache write kernels
+    /// have written data into the cache buffers. This only updates the
+    /// position counters without doing any data copy.
+    ///
+    /// `num_steps`: number of sequence positions written (usually 1 for generation).
+    pub fn advance(&mut self, num_steps: usize) -> (Tensor<Wgpu, 4>, Tensor<Wgpu, 4>) {
+        for _ in 0..num_steps {
+            self.write_pos = (self.write_pos + 1) % self.max_len;
+            self.offset += 1;
+            self.len = (self.len + 1).min(self.max_len);
+        }
+
+        let k_buf = self.k.as_ref().unwrap();
+        let v_buf = self.v.as_ref().unwrap();
+        let [b, h, _, hd] = k_buf.dims();
+
+        if self.len < self.max_len {
+            let k_view = k_buf.clone().slice([0..b, 0..h, 0..self.len, 0..hd]);
+            let v_view = v_buf.clone().slice([0..b, 0..h, 0..self.len, 0..hd]);
+            (k_view, v_view)
+        } else {
+            (k_buf.clone(), v_buf.clone())
+        }
+    }
+
+    pub fn max_len(&self) -> usize {
+        self.max_len
     }
 
     pub fn offset(&self) -> usize {
@@ -286,31 +411,124 @@ impl LayerCaches {
 }
 
 // ---------------------------------------------------------------------------
-// RmsNorm
+// Fused RMSNorm kernel — 1 dispatch instead of 6-8
 // ---------------------------------------------------------------------------
 
-/// RMSNorm with learnable scale weights.
+struct RmsNormKernelSource;
+
+impl KernelSource for RmsNormKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_rmsnorm.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused RMSNorm on GPU: output = (x / rms(x)) * alpha, single dispatch.
 ///
-/// The Moshi GGUF stores norm weights as `norm.alpha` with shape [1, 1, dim],
-/// which we squeeze to [dim].
+/// `x`: [B, S, D], `alpha_handle`: GPU buffer of [D] f32 weights.
+/// Returns [B, S, D] normalized tensor.
+fn fused_rms_norm(
+    x: Tensor<Wgpu, 3>,
+    alpha_handle: &Handle,
+    _eps: f32,
+    info_handle: &Handle,
+) -> Tensor<Wgpu, 3> {
+    let cube_input: CubeTensor<WgpuRuntime> = x.into_primitive().tensor();
+    let cube_input = into_contiguous(cube_input);
+
+    let b = cube_input.shape.dims[0];
+    let s = cube_input.shape.dims[1];
+    let d = cube_input.shape.dims[2];
+    let total_rows = b * s;
+
+    let client = cube_input.client.clone();
+    let device = cube_input.device.clone();
+
+    let output_handle = client.empty(total_rows * d * 4);
+
+    let bindings = Bindings::new()
+        .with_buffer(cube_input.handle.clone().binding())
+        .with_buffer(alpha_handle.clone().binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.clone().binding());
+
+    let kernel = SourceKernel::new(RmsNormKernelSource, CubeDim::new_1d(256));
+
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(total_rows as u32),
+            bindings,
+        )
+        .expect("RMSNorm kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![b, s, d]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
+}
+
 pub struct RmsNormLayer {
-    alpha: Tensor<Wgpu, 1>,
-    eps: f64,
+    pub(crate) alpha_handle: Handle,
+    eps: f32,
+    dim: usize,
+    /// Cached info buffer (D, eps_bits, total_rows). Keyed by total_rows.
+    info_cache: RefCell<Option<(usize, Handle)>>,
+    device: WgpuDevice,
 }
 
 impl RmsNormLayer {
     pub fn new(alpha: Tensor<Wgpu, 1>, eps: f64) -> Self {
-        Self { alpha, eps }
+        let dim = alpha.dims()[0];
+        let device = alpha.device();
+        // Extract the GPU handle from the alpha tensor
+        let alpha_handle = alpha.into_primitive().tensor().handle;
+        Self {
+            alpha_handle,
+            eps: eps as f32,
+            dim,
+            info_cache: RefCell::new(None),
+            device,
+        }
+    }
+
+    /// Get or create a cached info buffer for the given total_rows.
+    fn get_or_create_info(&self, total_rows: usize) -> Handle {
+        let mut cache = self.info_cache.borrow_mut();
+        if let Some((cached_rows, ref handle)) = *cache {
+            if cached_rows == total_rows {
+                return handle.clone();
+            }
+        }
+        let client = WgpuRuntime::client(&self.device);
+        let info: [u32; 3] = [
+            self.dim as u32,
+            self.eps.to_bits(),
+            total_rows as u32,
+        ];
+        let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let handle = client.create_from_slice(&info_bytes);
+        *cache = Some((total_rows, handle.clone()));
+        handle
     }
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
-        let [_b, _s, d] = x.dims();
-        // RMS norm: x * rsqrt(mean(x^2) + eps) * alpha
-        let x_sq = x.clone().powf_scalar(2.0);
-        let mean_sq = x_sq.sum_dim(2) / (d as f64);
-        let rms = (mean_sq + self.eps).sqrt();
-        let x_norm = x / rms;
-        x_norm * self.alpha.clone().unsqueeze::<2>().unsqueeze_dim::<3>(0)
+        let [b, s, _d] = x.dims();
+        let total_rows = b * s;
+        let info_handle = self.get_or_create_info(total_rows);
+        fused_rms_norm(x, &self.alpha_handle, self.eps, &info_handle)
+    }
+
+    /// Get a reference to the underlying CubeCL handle for raw GPU access.
+    pub fn raw_alpha_handle(&self) -> &Handle {
+        &self.alpha_handle
     }
 }
 
@@ -342,6 +560,111 @@ fn apply_causal_mask(
     let mask: Tensor<Wgpu, 2> = mask.reshape([q_len, kv_len]);
     let mask: Tensor<Wgpu, 4> = mask.unsqueeze_dim::<3>(0).unsqueeze_dim(0);
     scores + mask
+}
+
+// ---------------------------------------------------------------------------
+// Fused Attention -- single-token decode (Flash-decoding style)
+// ---------------------------------------------------------------------------
+
+struct FusedAttentionKernelSource;
+
+impl KernelSource for FusedAttentionKernelSource {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("wgsl/shader_attention.wgsl"))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>()
+    }
+}
+
+/// Fused single-token attention: QK^T + softmax + V in one GPU dispatch.
+///
+/// Only valid for single-token decode (q_seq_len == 1, batch == 1).
+///
+/// Accepts tensors in their natural layouts to avoid unnecessary copies:
+/// - q: `[1, 1, num_heads, head_dim]` (BEFORE swap_dims — saves 1 copy dispatch)
+/// - k: `[1, num_heads, S, head_dim]` (from KV cache — may be non-contiguous slice)
+/// - v: `[1, num_heads, S, head_dim]` (from KV cache — may be non-contiguous slice)
+///
+/// The kernel uses stride-aware addressing for K/V to handle cache slices
+/// without requiring `into_contiguous()` copies. Q is always contiguous after
+/// slice+reshape (B=S=1, so leading dims don't matter).
+///
+/// Returns: `[1, num_heads, 1, head_dim]`
+///
+/// Replaces: matmul(Q, K^T), scale, softmax, matmul(attn, V) — ~6 dispatches -> 1.
+/// Also eliminates 3 `into_contiguous` copy dispatches per call (Q swap_dims + K/V cache slice).
+pub fn fused_attention(
+    q: Tensor<Wgpu, 4>,
+    k: Tensor<Wgpu, 4>,
+    v: Tensor<Wgpu, 4>,
+    scale: f32,
+) -> Tensor<Wgpu, 4> {
+    let [_b, _one, num_heads, head_dim] = q.dims();
+    let [_b2, _h2, seq_len, _hd2] = k.dims();
+
+    // Q: [1, 1, H, D] — contiguous after slice+reshape (B=S=1).
+    // Just reinterpret as [H, D] without copying.
+    let cube_q: CubeTensor<WgpuRuntime> = q.into_primitive().tensor();
+    // Q is contiguous: shape [1,1,H,D] with strides [H*D, H*D, D, 1].
+    // The leading dims are size 1 so the "wrong" strides don't matter —
+    // the H*D elements are packed. Skip into_contiguous.
+    let q_handle = cube_q.handle.clone();
+
+    // K, V: [1, H, S, D] from KV cache. May be non-contiguous (cache slice
+    // has head_stride = max_len * D instead of S * D). Extract the actual
+    // head stride so the kernel can address correctly.
+    let cube_k: CubeTensor<WgpuRuntime> = k.into_primitive().tensor();
+    let cube_v: CubeTensor<WgpuRuntime> = v.into_primitive().tensor();
+    // strides[1] = head stride in elements (stride for the H dimension)
+    let kv_head_stride = cube_k.strides[1];
+    let k_handle = cube_k.handle.clone();
+    let v_handle = cube_v.handle.clone();
+
+    let client = cube_q.client.clone();
+    let device = cube_q.device.clone();
+
+    let output_size = num_heads * head_dim;
+    let output_handle = client.empty(output_size * 4);
+
+    // Info buffer: [num_heads, head_dim, seq_len, scale_bits, kv_head_stride]
+    let info: [u32; 5] = [
+        num_heads as u32,
+        head_dim as u32,
+        seq_len as u32,
+        scale.to_bits(),
+        kv_head_stride as u32,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let info_handle = client.create_from_slice(&info_bytes);
+
+    let bindings = Bindings::new()
+        .with_buffer(q_handle.binding())
+        .with_buffer(k_handle.binding())
+        .with_buffer(v_handle.binding())
+        .with_buffer(output_handle.clone().binding())
+        .with_buffer(info_handle.binding());
+
+    let kernel = SourceKernel::new(FusedAttentionKernelSource, CubeDim::new_1d(256));
+
+    // One workgroup per head
+    client
+        .launch(
+            Box::new(kernel) as Box<dyn CubeTask<AutoCompiler>>,
+            CubeCount::new_1d(num_heads as u32),
+            bindings,
+        )
+        .expect("Fused attention kernel launch failed");
+
+    let output_tensor = CubeTensor::new_contiguous(
+        client,
+        device,
+        burn::prelude::Shape::from(vec![1, num_heads, 1, head_dim]),
+        output_handle,
+        DType::F32,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(output_tensor))
 }
 
 // ---------------------------------------------------------------------------
@@ -387,19 +710,11 @@ impl Q4Attention {
         &self,
         qkv: Tensor<Wgpu, 3>,
     ) -> (Tensor<Wgpu, 3>, Tensor<Wgpu, 3>, Tensor<Wgpu, 3>) {
-        let [batch, seq, _] = qkv.dims();
+        let [b, s, _] = qkv.dims();
         let kv_dim = self.n_kv_heads * self.head_dim;
-        let q = qkv
-            .clone()
-            .slice([0..batch, 0..seq, 0..self.dim]);
-        let k = qkv
-            .clone()
-            .slice([0..batch, 0..seq, self.dim..self.dim + kv_dim]);
-        let v = qkv.slice([
-            0..batch,
-            0..seq,
-            self.dim + kv_dim..self.dim + 2 * kv_dim,
-        ]);
+        let q = qkv.clone().slice([0..b, 0..s, 0..self.dim]);
+        let k = qkv.clone().slice([0..b, 0..s, self.dim..self.dim + kv_dim]);
+        let v = qkv.slice([0..b, 0..s, self.dim + kv_dim..self.dim + 2 * kv_dim]);
         (q, k, v)
     }
 
@@ -419,10 +734,32 @@ impl Q4Attention {
         let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
 
+        // Generation mode (S=1, no GQA): use RoPE + direct cache write path.
+        // Saves dispatches per layer (swap_dims+contiguous+slice_assign for K and V).
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            // Apply RoPE to Q and K using Burn ops (fusable)
+            let (q, k_rot) = rope.apply(q, k, offset);
+            // Write rotated K directly to K cache
+            gpu_cache_write_v(&k_rot, &k_cache_handle, offset, max_len);
+            // Write V directly to V cache (no RoPE needed)
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            // Advance cache bookkeeping (no data copy)
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_proj.forward(out);
+        }
+
+        // Prefill path: use RoPE + cache.update
         let (q, k) = rope.apply(q, k, offset);
 
-        // [batch, heads, seq, head_dim]
-        let q = q.swap_dims(1, 2);
         let k = k.swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
 
@@ -446,6 +783,8 @@ impl Q4Attention {
             (k, v)
         };
 
+        // Prefill path: need Q in [B, H, S, D] for standard matmul attention
+        let q = q.swap_dims(1, 2);
         let k_t = k.swap_dims(2, 3);
         let scores = q.matmul(k_t) * self.scale;
         let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
@@ -455,6 +794,82 @@ impl Q4Attention {
         let out = out.swap_dims(1, 2);
         let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
         self.out_proj.forward(out)
+    }
+
+    /// Forward with fused residual addition in the out_proj matmul.
+    pub fn forward_with_cache_fused_residual(
+        &self,
+        x: Tensor<Wgpu, 3>,
+        residual: Tensor<Wgpu, 3>,
+        rope: &RoPE,
+        cache: &mut KVCache,
+    ) -> Tensor<Wgpu, 3> {
+        let [batch, seq_len, _] = x.dims();
+        let offset = cache.offset();
+
+        let qkv = self.in_proj.forward(x);
+        let (q, k, v) = self.split_qkv(qkv);
+
+        let q = q.reshape([batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape([batch, seq_len, self.n_kv_heads, self.head_dim]);
+
+        // Generation mode (S=1, no GQA): use RoPE + direct cache write path.
+        if seq_len == 1 && self.n_heads == self.n_kv_heads {
+            let (k_cache_handle, v_cache_handle, _write_pos) =
+                cache.ensure_allocated(batch);
+            let max_len = cache.max_len();
+
+            // Apply RoPE to Q and K using Burn ops (fusable)
+            let (q, k_rot) = rope.apply(q, k, offset);
+            // Write rotated K directly to K cache
+            gpu_cache_write_v(&k_rot, &k_cache_handle, offset, max_len);
+            gpu_cache_write_v(&v, &v_cache_handle, offset, max_len);
+
+            let (k_all, v_all) = cache.advance(1);
+
+            let out = fused_attention(q, k_all, v_all, self.scale);
+            let out = out.swap_dims(1, 2);
+            let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+            return self.out_proj.forward_with_residual(out, residual);
+        }
+
+        // Prefill path
+        let (q, k) = rope.apply(q, k, offset);
+
+        let k = k.swap_dims(1, 2);
+        let v = v.swap_dims(1, 2);
+
+        let (k, v) = cache.update(k, v);
+        let total_seq_len = cache.seq_len();
+
+        let (k, v) = if self.n_heads != self.n_kv_heads {
+            let repeat_factor = self.n_heads / self.n_kv_heads;
+            let [b, nkv, s, hd] = k.dims();
+            let k = k
+                .unsqueeze_dim::<5>(2)
+                .repeat_dim(2, repeat_factor)
+                .reshape([b, nkv * repeat_factor, s, hd]);
+            let v = v
+                .unsqueeze_dim::<5>(2)
+                .repeat_dim(2, repeat_factor)
+                .reshape([b, nkv * repeat_factor, s, hd]);
+            (k, v)
+        } else {
+            (k, v)
+        };
+
+        // Prefill path: need Q in [B, H, S, D]
+        let q = q.swap_dims(1, 2);
+        let k_t = k.swap_dims(2, 3);
+        let scores = q.matmul(k_t) * self.scale;
+        let scores = apply_causal_mask(scores, seq_len, total_seq_len, offset);
+        let attn = softmax(scores, 3);
+        let out = attn.matmul(v);
+
+        let out = out.swap_dims(1, 2);
+        let out = out.reshape([batch, seq_len, self.n_heads * self.head_dim]);
+        self.out_proj.forward_with_residual(out, residual)
     }
 }
 
@@ -484,13 +899,23 @@ impl Q4FeedForward {
 
     pub fn forward(&self, x: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
         let combined = self.linear_in.forward(x);
-        let [batch, seq, total_dim] = combined.dims();
+        let [b, s, total_dim] = combined.dims();
         let half = total_dim / 2;
-        let gate = combined
-            .clone()
-            .slice([0..batch, 0..seq, 0..half]);
-        let value = combined.slice([0..batch, 0..seq, half..total_dim]);
-        self.linear_out.forward(silu(gate) * value)
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
+        self.linear_out.forward(activated)
+    }
+
+    /// Forward with fused residual addition in the linear_out matmul.
+    pub fn forward_with_residual(&self, x: Tensor<Wgpu, 3>, residual: Tensor<Wgpu, 3>) -> Tensor<Wgpu, 3> {
+        let combined = self.linear_in.forward(x);
+        let [b, s, total_dim] = combined.dims();
+        let half = total_dim / 2;
+        let gate = combined.clone().slice([0..b, 0..s, 0..half]);
+        let value = combined.slice([0..b, 0..s, half..total_dim]);
+        let activated = silu(gate) * value;
+        self.linear_out.forward_with_residual(activated, residual)
     }
 }
 
@@ -529,15 +954,15 @@ impl Q4TransformerBlock {
         rope: &RoPE,
         cache: &mut KVCache,
     ) -> Tensor<Wgpu, 3> {
+        // Fuse residual addition into out_proj matmul (saves 1 dispatch)
         let residual = x.clone();
         let x = self.norm1.forward(x);
-        let x = self.attention.forward_with_cache(x, rope, cache);
-        let x = x + residual;
+        let x = self.attention.forward_with_cache_fused_residual(x, residual, rope, cache);
 
+        // Fuse residual addition into linear_out matmul (saves 1 dispatch)
         let residual = x.clone();
         let x = self.norm2.forward(x);
-        let x = self.ffn.forward(x);
-        x + residual
+        self.ffn.forward_with_residual(x, residual)
     }
 
     pub fn norm1(&self) -> &RmsNormLayer { &self.norm1 }
@@ -914,10 +1339,15 @@ pub async fn sample_top_k_with_penalty(
         }
     }
 
-    // Find top-k indices
+    // Find top-k indices using partial sort (O(n) partition + O(k log k) sort)
     let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+    if indexed.len() > top_k {
+        indexed.select_nth_unstable_by(top_k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        indexed.truncate(top_k);
+    }
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.truncate(top_k);
 
     // Softmax over top-k
     let max_val = indexed[0].1;
@@ -957,7 +1387,7 @@ pub async fn sample_greedy(logits: Tensor<Wgpu, 3>) -> u32 {
 ///
 /// Uses a basic LCG seeded from a global counter. Not cryptographic,
 /// but sufficient for top-k sampling diversity.
-fn pseudo_random() -> f32 {
+pub(crate) fn pseudo_random() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEED: AtomicU64 = AtomicU64::new(0);
 

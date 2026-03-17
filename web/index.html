@@ -500,7 +500,10 @@
         const allDecodedChunks = []; // Collect decoded audio from Mimi worker for WAV export
         let mimiTotalMs = 0;       // Accumulated Mimi decode time from Mimi worker
         let mimiFrameCount = 0;    // Number of Mimi decode frames
-        let lastTurnBlobUrl = null; // WAV blob URL for the completed turn (attached to history entry)
+        // Pending turn metadata: set by turn-complete, consumed when decoded done arrives
+        let pendingTurnGenSec = null;
+        let pendingTurnNumber = null;
+        let pendingTurnBlobUrl = null; // set if decoded done arrives before turn-complete
 
         // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
         let uiState = 'idle';
@@ -672,7 +675,16 @@
                             audioPlayer.src = audioPlayer._blobUrl;
                             audioPlayer.style.display = 'block';
                             audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
-                            lastTurnBlobUrl = audioPlayer._blobUrl;
+                            const blobUrl = audioPlayer._blobUrl;
+                            if (pendingTurnGenSec !== null) {
+                                // turn-complete already arrived — create the entry now
+                                addTurnHistoryEntry(pendingTurnNumber, pendingTurnGenSec, blobUrl);
+                                pendingTurnGenSec = null;
+                                pendingTurnNumber = null;
+                            } else {
+                                // turn-complete hasn't arrived yet — buffer for it
+                                pendingTurnBlobUrl = blobUrl;
+                            }
                         }
                         break;
                     }
@@ -692,6 +704,25 @@
             mimiWorker.postMessage({ type: 'set-mimi-port', port: channel.port2 }, [channel.port2]);
 
             return mimiWorker;
+        }
+
+        function addTurnHistoryEntry(turnNum, genSec, blobUrl) {
+            const audioDurationSec = mimiFrameCount > 0
+                ? (mimiFrameCount * 0.08).toFixed(1)
+                : '?';
+            const turnHistoryEl = document.getElementById('turnHistory');
+            const turnHistorySectionEl = document.getElementById('turnHistorySection');
+            const entry = document.createElement('div');
+            entry.className = 'turn-entry';
+            entry.innerHTML = `<span class="turn-label">Turn ${turnNum}</span><span class="turn-duration">${genSec}s gen · ${audioDurationSec}s audio</span>`;
+            if (blobUrl) {
+                const player = document.createElement('audio');
+                player.controls = true;
+                player.src = blobUrl;
+                entry.appendChild(player);
+            }
+            turnHistoryEl.appendChild(entry);
+            turnHistorySectionEl.style.display = '';
         }
 
         function initWorker() {
@@ -762,7 +793,14 @@
                         audioPlayer.src = audioPlayer._blobUrl;
                         audioPlayer.style.display = 'block';
                         audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
-                        lastTurnBlobUrl = audioPlayer._blobUrl;
+                        const acBlobUrl = audioPlayer._blobUrl;
+                        if (pendingTurnGenSec !== null) {
+                            addTurnHistoryEntry(pendingTurnNumber, pendingTurnGenSec, acBlobUrl);
+                            pendingTurnGenSec = null;
+                            pendingTurnNumber = null;
+                        } else {
+                            pendingTurnBlobUrl = acBlobUrl;
+                        }
                         break;
                     }
 
@@ -785,29 +823,19 @@
                     case 'turn-complete': {
                         updateStatus('ready', 'Ready');
                         setUIState('idle');
-                        // Record turn history entry
                         turnCount++;
-                        const audioDurationSec = mimiFrameCount > 0
-                            ? (mimiFrameCount * 0.08).toFixed(1)
-                            : '?';
                         const genSec = generationStartTime > 0
                             ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
                             : '?';
-                        const turnHistoryEl = document.getElementById('turnHistory');
-                        const turnHistorySectionEl = document.getElementById('turnHistorySection');
-                        const entry = document.createElement('div');
-                        entry.className = 'turn-entry';
-                        entry.innerHTML = `<span class="turn-label">Turn ${turnCount}</span><span class="turn-duration">${genSec}s gen · ${audioDurationSec}s audio</span>`;
-                        const blobUrl = lastTurnBlobUrl || audioPlayer._blobUrl;
-                        if (blobUrl) {
-                            const player = document.createElement('audio');
-                            player.controls = true;
-                            player.src = blobUrl;
-                            entry.appendChild(player);
-                            lastTurnBlobUrl = null;
+                        if (pendingTurnBlobUrl !== null) {
+                            // decoded done already arrived — create the entry now
+                            addTurnHistoryEntry(turnCount, genSec, pendingTurnBlobUrl);
+                            pendingTurnBlobUrl = null;
+                        } else {
+                            // wait for decoded done to arrive with the blob
+                            pendingTurnGenSec = genSec;
+                            pendingTurnNumber = turnCount;
                         }
-                        turnHistoryEl.appendChild(entry);
-                        turnHistorySectionEl.style.display = '';
                         break;
                     }
 
@@ -956,6 +984,9 @@
             allDecodedChunks.length = 0;
             mimiTotalMs = 0;
             mimiFrameCount = 0;
+            pendingTurnGenSec = null;
+            pendingTurnNumber = null;
+            pendingTurnBlobUrl = null;
 
             // Reset playback buffer for fresh output
             if (playbackNode) {
@@ -986,6 +1017,9 @@
             allDecodedChunks.length = 0;
             mimiTotalMs = 0;
             mimiFrameCount = 0;
+            pendingTurnGenSec = null;
+            pendingTurnNumber = null;
+            pendingTurnBlobUrl = null;
             setUIState('idle');
             updateStatus('ready', 'Ready');
         });
@@ -1033,6 +1067,9 @@
                 allDecodedChunks.length = 0;
                 mimiTotalMs = 0;
                 mimiFrameCount = 0;
+                pendingTurnGenSec = null;
+                pendingTurnNumber = null;
+                pendingTurnBlobUrl = null;
 
                 const offlineCtx = new OfflineAudioContext(1, 1, 24000);
                 const audioBuf = await offlineCtx.decodeAudioData(arrayBuf);

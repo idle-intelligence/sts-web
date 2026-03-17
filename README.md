@@ -38,7 +38,7 @@ node web/serve.mjs
 
 ## Architecture
 
-- `crates/sts-wasm/` — Temporal transformer (24L) + depth transformer (6L × 8 steps) in Burn + wgpu, Q4_K GGUF quantization
+- `crates/sts-wasm/` — Temporal transformer (32L) + depth transformer (6L × 8 steps) in Burn + wgpu, Q4_K GGUF quantization
 - **Mimi codec** (`mimi-rs`) — Audio tokenizer/detokenizer, 8 codebooks at 12.5Hz
 - `web/` — Standalone demo, Web Workers for inference + Mimi decode, AudioWorklet for playback
 - Model weights fetched from HuggingFace at runtime, cached via Cache API

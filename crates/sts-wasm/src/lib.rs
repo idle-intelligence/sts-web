@@ -121,7 +121,7 @@ impl Default for StsConfig {
         // Values from actual PersonaPlex-7B / Moshi architecture tensor inspection.
         Self {
             // Temporal transformer (Helium backbone)
-            num_layers: 24,
+            num_layers: 32,
             hidden_size: 4096,
             num_heads: 32,
             num_kv_heads: 32, // MHA, not GQA

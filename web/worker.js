@@ -46,7 +46,7 @@
  *   mimiWorkerPort -- MessagePort to Mimi worker for offloaded decode
  */
 
-const HF_BASE = '/hf/personaplex-24L-q4_k-webgpu';
+const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
 
 let engine = null;
 let stsWasm = null;
@@ -254,8 +254,8 @@ async function handleLoad(config) {
     // 4. Download and process model shards.
     const shardUrls = config.shardList && config.shardList.length > 0
         ? config.shardList
-        : Array.from({ length: 8 }, (_, i) =>
-            `${HF_BASE}/shards/personaplex-24L-q4_k.gguf.shard-0${i}`
+        : Array.from({ length: 9 }, (_, i) =>
+            `${HF_BASE}/shards/personaplex-7b-v1-q4_k.gguf.shard-0${i}`
         );
 
     const allCached = await isCached(shardUrls[0]);

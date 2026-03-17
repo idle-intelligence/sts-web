@@ -873,13 +873,13 @@
         async function isModelCached() {
             try {
                 const cache = await caches.open('sts-model-v1');
-                return !!(await cache.match('/hf/personaplex-24L-q4_k-webgpu/personaplex-24L-q4_k.gguf.shard-00'));
+                return !!(await cache.match('/hf/personaplex-7b-v1-q4_k-webgpu/shards/personaplex-7b-v1-q4_k.gguf.shard-00'));
             } catch { return false; }
         }
 
         // --- Init ---
 
-        const HF_BASE = '/hf/personaplex-24L-q4_k-webgpu';
+        const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
         const MIMI_URL = `${HF_BASE}/tokenizer-e351c8d8-checkpoint125.safetensors`;
         const CACHE_NAME = 'sts-model-v1';
 

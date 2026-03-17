@@ -330,10 +330,9 @@
         <p class="org">idle intelligence</p>
         <h1>sts-web</h1>
         <p class="tagline">
-            Quantized to Q4.
             <a href="https://huggingface.co/nvidia/personaplex-7b-v1">NVIDIA PersonaPlex-7B</a>
-            running client-side via WebGPU using
-            <a href="https://burn.dev">Burn</a>
+            — pruned to 24 layers, recovered with QLoRA, quantized to Q4_K.
+            Client-side inference: WebGPU via <a href="https://burn.dev">Burn</a> + Rust/WASM.
         </p>
         <p class="repo">
             <a href="https://github.com/idle-intelligence/sts-web">github.com/idle-intelligence/sts-web</a>

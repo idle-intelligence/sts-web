@@ -10,3 +10,5 @@ CLAUDE.md
 docs/
 web/mimi-pkg/
 node_modules/
+pkg/
+mimi-pkg/

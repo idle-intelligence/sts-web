@@ -558,7 +558,7 @@ impl StsStream {
                 Some(&provided),
                 None, // No penalty during prefill
                 1.0,
-                None, // Full 16 steps during prefill
+                Some(self.config.depth_gen_steps), // Only agent steps; user predictions discarded
             )
             .await;
             self.prefill_depth_ms += now_ms() - t_depth;

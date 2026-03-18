@@ -316,7 +316,6 @@ impl StsEngine {
         let depth_cache = depth.create_cache();
         let mut stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
 
-        // Initialize custom DepthEngine (bypasses Burn/CubeCL for depth inference)
         {
             use crate::depth_engine::DepthEngine;
             let depth_engine = DepthEngine::new(&depth, &self.device, &self.config);
@@ -426,12 +425,11 @@ impl StsEngine {
         let depth_cache = depth.create_cache();
         let mut stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
 
-        // Initialize custom DepthEngine (bypasses Burn/CubeCL for depth inference)
         {
             use crate::depth_engine::DepthEngine;
             let depth_engine = DepthEngine::new(&depth, &self.device, &self.config);
             stream.depth_engine = Some(depth_engine);
-            wasm_log("[sts] Custom DepthEngine initialized (incremental)");
+            wasm_log("[sts] Custom DepthEngine initialized");
         }
 
         self.temporal = Some(temporal);

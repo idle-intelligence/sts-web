@@ -39,6 +39,7 @@ const SHADER_ARGMAX: &str = include_str!("wgsl/shader_argmax.wgsl");
 const SHADER_SWIGLU: &str = include_str!("wgsl/shader_swiglu.wgsl");
 const SHADER_VEC_ADD: &str = include_str!("wgsl/shader_vec_add.wgsl");
 const SHADER_CACHE_WRITE: &str = include_str!("wgsl/shader_cache_write.wgsl");
+const SHADER_SAMPLE_TOPK: &str = include_str!("wgsl/shader_sample_topk.wgsl");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -186,6 +187,7 @@ pub struct DepthEngine {
     swiglu_pipeline: wgpu::ComputePipeline,
     vec_add_pipeline: wgpu::ComputePipeline,
     cache_write_pipeline: wgpu::ComputePipeline,
+    sample_topk_pipeline: wgpu::ComputePipeline,
 
     // ---- Weight buffers (persistent, extracted from Burn) ----
 
@@ -298,6 +300,14 @@ pub struct DepthEngine {
 
     /// Per-step argmax info: [vocab_size].
     info_argmax: Vec<wgpu::Buffer>,
+
+    /// Combined penalty token buffer: 8 steps × 256 bytes (256-byte aligned slots).
+    /// Step `s` occupies bytes `[s*256 .. s*256+120]` (max 30 tokens × 4 bytes).
+    all_penalty_buf: wgpu::Buffer,
+
+    /// Combined sampling info buffer: 8 steps × 256 bytes (256-byte aligned slots).
+    /// Step `s` occupies bytes `[s*256 .. s*256+24]` (6 × u32).
+    all_info_sample_buf: wgpu::Buffer,
 
     /// Per-step, per-layer cache write info: [pos_offset, B=1, S=1, H=num_heads, D=head_dim, max_len].
     /// pos_offset varies by step. Stored as [step][layer] but layer dimension is constant
@@ -437,6 +447,7 @@ impl DepthEngine {
         let swiglu_pipeline = create_pipeline(&device, SHADER_SWIGLU, "depth_swiglu");
         let vec_add_pipeline = create_pipeline(&device, SHADER_VEC_ADD, "depth_vec_add");
         let cache_write_pipeline = create_pipeline(&device, SHADER_CACHE_WRITE, "depth_cache_write");
+        let sample_topk_pipeline = create_pipeline(&device, SHADER_SAMPLE_TOPK, "depth_sample_topk");
 
         // ---- Extract weight buffers ----
         let num_steps = config.num_steps;
@@ -695,6 +706,22 @@ impl DepthEngine {
             })
             .collect();
 
+        // Single combined penalty buffer: 8 steps × 256-byte aligned slots.
+        let all_penalty_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("depth_all_penalty"),
+            size: (num_steps * 256) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Single combined info_sample buffer: 8 steps × 256-byte aligned slots.
+        let all_info_sample_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("depth_all_info_sample"),
+            size: (num_steps * 256) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Per-step cache write info: [pos_offset, B=1, S=1, H=num_heads, D=head_dim, max_len]
         let info_cache_write: Vec<wgpu::Buffer> = (0..num_steps)
             .map(|step| {
@@ -724,6 +751,7 @@ impl DepthEngine {
             swiglu_pipeline,
             vec_add_pipeline,
             cache_write_pipeline,
+            sample_topk_pipeline,
             step_weights,
             layer_step_weights,
             text_emb,
@@ -756,6 +784,8 @@ impl DepthEngine {
             info_vec_add_dim,
             info_embed,
             info_argmax,
+            all_penalty_buf,
+            all_info_sample_buf,
             info_cache_write,
             config,
         }
@@ -855,12 +885,63 @@ impl DepthEngine {
         &self,
         temporal_hidden: &WgpuResource,
         text_token: &WgpuResource,
+        audio_temp: f32,
+        audio_top_k: usize,
+        audio_penalty: f32,
+        penalty_history: Option<&[Vec<u32>]>,
     ) -> Vec<u32> {
         let config = &self.config;
         let num_steps = config.num_steps;
         let dim = config.dim;
         let num_heads = config.num_heads;
         let head_dim = config.head_dim;
+
+        // Build combined CPU payloads for penalty tokens and sampling info, then do
+        // two write_buffer calls instead of 16 (reduces WASM→JS boundary crossings).
+        let mut penalty_payload = vec![0u8; num_steps * 256];
+        let mut info_payload = vec![0u8; num_steps * 256];
+
+        for step in 0..num_steps {
+            let history = penalty_history
+                .and_then(|h| h.get(step))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let num_penalty = history.len().min(30);
+
+            let slot = step * 256;
+            for (i, &tok) in history[..num_penalty].iter().enumerate() {
+                let off = slot + i * 4;
+                penalty_payload[off..off + 4].copy_from_slice(&tok.to_le_bytes());
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            let rand_val: f32 = js_sys::Math::random() as f32;
+            #[cfg(not(target_arch = "wasm32"))]
+            let rand_val: f32 = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                step.hash(&mut h);
+                (h.finish() as f32) / (u64::MAX as f32)
+            };
+
+            let sw = &self.step_weights[step];
+            let info_data: [u32; 6] = [
+                sw.output_vocab as u32,
+                audio_top_k as u32,
+                audio_temp.to_bits(),
+                audio_penalty.to_bits(),
+                rand_val.to_bits(),
+                num_penalty as u32,
+            ];
+            for (i, &v) in info_data.iter().enumerate() {
+                let off = slot + i * 4;
+                info_payload[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        self.queue.write_buffer(&self.all_penalty_buf, 0, &penalty_payload);
+        self.queue.write_buffer(&self.all_info_sample_buf, 0, &info_payload);
 
         let mut encoder = self
             .device
@@ -1327,31 +1408,33 @@ impl DepthEngine {
                 pass.dispatch_workgroups(wg_x, 1, 1);
             }
 
-            // ---- Argmax ----
-            // argmax bindings:
-            //   @binding(0) logits: f32 [V]
-            //   @binding(1) result: u32 [1]
-            //   @binding(2) info: [V]
+            // ---- Sample top-k (replaces argmax) ----
+            // sample_topk bindings:
+            //   @binding(0) logits: f32 [V] (read_write — modified in-place for penalty/temp)
+            //   @binding(1) penalty_tokens: u32 [30]
+            //   @binding(2) result: u32 [1]
+            //   @binding(3) info: [vocab_size, K, temp_bits, penalty_bits, rand_bits, num_penalty]
             {
                 let sw = &self.step_weights[step];
                 let vocab_bytes = (sw.output_vocab * 4) as u64;
+                let step_offset = (step * 256) as u64;
 
                 let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &self.argmax_pipeline.get_bind_group_layout(0),
+                    layout: &self.sample_topk_pipeline.get_bind_group_layout(0),
                     entries: &[
                         buf_entry(0, &self.logits_buf, 0, vocab_bytes),
-                        buf_entry_whole(1, &self.token_result_bufs[step]),
-                        buf_entry_whole(2, &self.info_argmax[step]),
+                        buf_entry(1, &self.all_penalty_buf, step_offset, 256),
+                        buf_entry(2, &self.token_result_bufs[step], 0, 4),
+                        buf_entry(3, &self.all_info_sample_buf, step_offset, 256),
                     ],
                 });
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("argmax"),
+                    label: Some("sample_topk"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.argmax_pipeline);
+                pass.set_pipeline(&self.sample_topk_pipeline);
                 pass.set_bind_group(0, Some(&bg), &[]);
-                // Single workgroup (256 threads do the reduction)
                 pass.dispatch_workgroups(1, 1, 1);
             }
         }

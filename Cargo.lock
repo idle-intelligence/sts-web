@@ -4042,6 +4042,7 @@ dependencies = [
  "console_error_panic_hook",
  "criterion",
  "cubecl",
+ "futures-lite",
  "getrandom 0.3.4",
  "hf-hub",
  "hound",

@@ -62,7 +62,8 @@ use cubecl::Runtime;
 use crate::depth::DepthTransformer;
 use crate::gguf::{gpu_argmax_buffer, gpu_sample_top_k_with_penalty};
 #[cfg(feature = "wasm")]
-use crate::gguf::gpu_read_token_tensor;
+#[cfg(feature = "wasm")]
+use futures_lite::future::zip;
 use crate::model::{LayerCaches, TemporalTransformer};
 use crate::StsConfig;
 
@@ -240,7 +241,7 @@ impl StsStream {
             text_temperature: 0.7,
             text_top_k: 25,
             audio_temperature: 0.8,
-            audio_top_k: 250,
+            audio_top_k: 25,
             text_token_history: Vec::new(),
             audio_token_history: vec![Vec::new(); config.depth_num_steps],
             repetition_penalty: 1.2,
@@ -558,7 +559,7 @@ impl StsStream {
                 Some(&provided),
                 None, // No penalty during prefill
                 1.0,
-                None, // Full 16 steps during prefill
+                Some(self.config.depth_gen_steps), // Only agent steps; user predictions discarded
             )
             .await;
             self.prefill_depth_ms += now_ms() - t_depth;
@@ -658,11 +659,28 @@ impl StsStream {
             // Reset the custom engine's KV caches for this frame.
             engine.reset_caches();
 
-            // Run all 8 depth steps in a single command buffer.
-            let audio_tokens = engine.generate(&hidden_resource, &text_resource).await;
-
-            // Read back text token separately (the custom engine only returns audio).
-            let text_token_val = gpu_read_token_tensor(text_token_tensor).await;
+            // Run depth + text readback CONCURRENTLY: zip polls both futures,
+            // so the JS event loop resolves whichever mapAsync finishes first.
+            // Text readback (small 1-element tensor) completes well before depth,
+            // so it should already be done by the time generate() resolves.
+            let penalty_hist = &self.audio_token_history;
+            let generate_fut = engine.generate(
+                &hidden_resource,
+                &text_resource,
+                self.audio_temperature,
+                self.audio_top_k,
+                self.repetition_penalty,
+                Some(penalty_hist),
+            );
+            let text_fut = async {
+                let data = text_token_tensor
+                    .into_data_async()
+                    .await
+                    .expect("GPU readback failed");
+                let raw: Vec<f32> = data.to_vec().expect("token readback to_vec failed");
+                raw[0].to_bits()
+            };
+            let (text_token_val, audio_tokens) = zip(text_fut, generate_fut).await;
 
             (audio_tokens, text_token_val)
         } else {
@@ -1200,7 +1218,7 @@ mod tests {
         assert!((stream.text_temperature - 0.7).abs() < 1e-6);
         assert_eq!(stream.text_top_k, 25);
         assert!((stream.audio_temperature - 0.8).abs() < 1e-6);
-        assert_eq!(stream.audio_top_k, 250);
+        assert_eq!(stream.audio_top_k, 25);
 
         stream.set_sampling_params(0.5, 10, 0.9, 100);
         assert!((stream.text_temperature - 0.5).abs() < 1e-6);

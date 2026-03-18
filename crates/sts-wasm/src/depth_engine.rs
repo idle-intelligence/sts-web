@@ -301,11 +301,13 @@ pub struct DepthEngine {
     /// Per-step argmax info: [vocab_size].
     info_argmax: Vec<wgpu::Buffer>,
 
-    /// Per-step penalty token buffers (STORAGE | COPY_DST, max 30 tokens × 4 bytes each).
-    penalty_token_bufs: Vec<wgpu::Buffer>,
+    /// Combined penalty token buffer: 8 steps × 256 bytes (256-byte aligned slots).
+    /// Step `s` occupies bytes `[s*256 .. s*256+120]` (max 30 tokens × 4 bytes).
+    all_penalty_buf: wgpu::Buffer,
 
-    /// Per-step sampling info buffers: [vocab_size, K, temp_bits, penalty_bits, rand_bits, num_penalty].
-    info_sample: Vec<wgpu::Buffer>,
+    /// Combined sampling info buffer: 8 steps × 256 bytes (256-byte aligned slots).
+    /// Step `s` occupies bytes `[s*256 .. s*256+24]` (6 × u32).
+    all_info_sample_buf: wgpu::Buffer,
 
     /// Per-step, per-layer cache write info: [pos_offset, B=1, S=1, H=num_heads, D=head_dim, max_len].
     /// pos_offset varies by step. Stored as [step][layer] but layer dimension is constant
@@ -704,30 +706,21 @@ impl DepthEngine {
             })
             .collect();
 
-        // Per-step penalty token buffers: max 30 tokens × 4 bytes = 120 bytes each
-        let penalty_token_bufs: Vec<wgpu::Buffer> = (0..num_steps)
-            .map(|step| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("depth_penalty_tokens_{step}")),
-                    size: 30 * 4,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
+        // Single combined penalty buffer: 8 steps × 256-byte aligned slots.
+        let all_penalty_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("depth_all_penalty"),
+            size: (num_steps * 256) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        // Per-step sampling info buffers: 6 × u32 = 24 bytes each
-        // [vocab_size, K, temp_bits, penalty_bits, rand_bits, num_penalty]
-        let info_sample: Vec<wgpu::Buffer> = (0..num_steps)
-            .map(|step| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("depth_info_sample_{step}")),
-                    size: 6 * 4,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
+        // Single combined info_sample buffer: 8 steps × 256-byte aligned slots.
+        let all_info_sample_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("depth_all_info_sample"),
+            size: (num_steps * 256) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Per-step cache write info: [pos_offset, B=1, S=1, H=num_heads, D=head_dim, max_len]
         let info_cache_write: Vec<wgpu::Buffer> = (0..num_steps)
@@ -791,8 +784,8 @@ impl DepthEngine {
             info_vec_add_dim,
             info_embed,
             info_argmax,
-            penalty_token_bufs,
-            info_sample,
+            all_penalty_buf,
+            all_info_sample_buf,
             info_cache_write,
             config,
         }
@@ -903,7 +896,11 @@ impl DepthEngine {
         let num_heads = config.num_heads;
         let head_dim = config.head_dim;
 
-        // Write per-step sampling info and penalty tokens before encoding GPU commands.
+        // Build combined CPU payloads for penalty tokens and sampling info, then do
+        // two write_buffer calls instead of 16 (reduces WASM→JS boundary crossings).
+        let mut penalty_payload = vec![0u8; num_steps * 256];
+        let mut info_payload = vec![0u8; num_steps * 256];
+
         for step in 0..num_steps {
             let history = penalty_history
                 .and_then(|h| h.get(step))
@@ -911,13 +908,10 @@ impl DepthEngine {
                 .unwrap_or(&[]);
             let num_penalty = history.len().min(30);
 
-            if num_penalty > 0 {
-                let penalty_bytes: Vec<u8> = history[..num_penalty]
-                    .iter()
-                    .flat_map(|t| t.to_le_bytes())
-                    .collect();
-                self.queue
-                    .write_buffer(&self.penalty_token_bufs[step], 0, &penalty_bytes);
+            let slot = step * 256;
+            for (i, &tok) in history[..num_penalty].iter().enumerate() {
+                let off = slot + i * 4;
+                penalty_payload[off..off + 4].copy_from_slice(&tok.to_le_bytes());
             }
 
             #[cfg(target_arch = "wasm32")]
@@ -940,9 +934,14 @@ impl DepthEngine {
                 rand_val.to_bits(),
                 num_penalty as u32,
             ];
-            let info_bytes: Vec<u8> = info_data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            self.queue.write_buffer(&self.info_sample[step], 0, &info_bytes);
+            for (i, &v) in info_data.iter().enumerate() {
+                let off = slot + i * 4;
+                info_payload[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
         }
+
+        self.queue.write_buffer(&self.all_penalty_buf, 0, &penalty_payload);
+        self.queue.write_buffer(&self.all_info_sample_buf, 0, &info_payload);
 
         let mut encoder = self
             .device
@@ -1418,16 +1417,16 @@ impl DepthEngine {
             {
                 let sw = &self.step_weights[step];
                 let vocab_bytes = (sw.output_vocab * 4) as u64;
-                let penalty_bytes = (30 * 4) as u64;
+                let step_offset = (step * 256) as u64;
 
                 let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &self.sample_topk_pipeline.get_bind_group_layout(0),
                     entries: &[
                         buf_entry(0, &self.logits_buf, 0, vocab_bytes),
-                        buf_entry(1, &self.penalty_token_bufs[step], 0, penalty_bytes),
-                        buf_entry_whole(2, &self.token_result_bufs[step]),
-                        buf_entry_whole(3, &self.info_sample[step]),
+                        buf_entry(1, &self.all_penalty_buf, step_offset, 256),
+                        buf_entry(2, &self.token_result_bufs[step], 0, 4),
+                        buf_entry(3, &self.all_info_sample_buf, step_offset, 256),
                     ],
                 });
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

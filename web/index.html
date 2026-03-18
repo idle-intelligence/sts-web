@@ -649,6 +649,13 @@
                         break;
 
                     case 'decoded': {
+                        // On step 0, clear any stale chunks/timing from a previous turn
+                        // that may have arrived after the pre-generation reset.
+                        if (msg.step === 0) {
+                            allDecodedChunks.length = 0;
+                            mimiTotalMs = 0;
+                            mimiFrameCount = 0;
+                        }
                         // Accumulate Mimi decode timing
                         if (msg.decodeMs != null) {
                             mimiTotalMs += msg.decodeMs;
@@ -668,6 +675,10 @@
                                 fullAudio.set(c, offset);
                                 offset += c.length;
                             }
+                            // Clear immediately after assembly so stale chunks can't
+                            // pollute a subsequent turn if a new generation starts before
+                            // the next step=0 resets the array.
+                            allDecodedChunks.length = 0;
                             lastCompleteAudio = fullAudio;
                             const wavBlob = buildWavBlob(fullAudio);
                             if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);

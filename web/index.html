@@ -636,6 +636,10 @@
 
         function initMimiWorker() {
             mimiWorker = new Worker('./mimi-worker.js', { type: 'module' });
+            mimiWorker.onerror = (e) => {
+                console.error('[mimi-worker error]', e);
+                updateStatus('error', `Mimi worker error: ${e.message}`);
+            };
 
             mimiWorker.onmessage = (e) => {
                 const msg = e.data;
@@ -736,6 +740,10 @@
 
         function initWorker() {
             worker = new Worker('./worker.js', { type: 'module' });
+            worker.onerror = (e) => {
+                console.error('[worker error]', e);
+                updateStatus('error', `Worker error: ${e.message}`);
+            };
 
             worker.onmessage = async (e) => {
                 const msg = e.data;

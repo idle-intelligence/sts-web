@@ -680,7 +680,7 @@ impl StsStream {
                 let raw: Vec<f32> = data.to_vec().expect("token readback to_vec failed");
                 raw[0].to_bits()
             };
-            let (audio_tokens, text_token_val) = zip(generate_fut, text_fut).await;
+            let (text_token_val, audio_tokens) = zip(text_fut, generate_fut).await;
 
             (audio_tokens, text_token_val)
         } else {

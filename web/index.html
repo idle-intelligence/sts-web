@@ -1,0 +1,1192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sts-web — idle intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #fdfdfd;
+            --text: #1a1a1a;
+            --muted: #555;
+            --faint: #999;
+            --border: #ddd;
+            --green: #2d7d46;
+            --yellow: #b58900;
+            --red: #c0392b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+            max-width: 640px;
+            margin: 0 auto;
+            padding: 48px 24px 96px;
+            color: var(--text);
+            background: var(--bg);
+            line-height: 1.5;
+            font-size: 15px;
+        }
+        a { color: var(--text); }
+        a:hover { color: var(--muted); }
+
+        header { margin-bottom: 48px; }
+        .org {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--muted);
+            letter-spacing: 0.02em;
+            margin-bottom: 2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        h1 {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .tagline {
+            color: var(--muted);
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .tagline a { text-decoration: underline; color: var(--muted); }
+        .tagline a:hover { color: var(--text); }
+        .repo {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        .repo a { color: var(--faint); text-decoration: none; }
+        .repo a:hover { color: var(--muted); }
+
+        section {
+            border-top: 1px solid var(--border);
+            padding: 24px 0;
+        }
+        section h2 {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            color: var(--faint);
+            margin-bottom: 12px;
+        }
+        section h2 .sub {
+            font-weight: 400;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--faint);
+            flex-shrink: 0;
+        }
+        .status-dot.loading { background: var(--yellow); }
+        .status-dot.ready { background: var(--green); }
+        .status-dot.error { background: var(--red); }
+        .status-dot.active {
+            background: var(--green);
+            animation: pulse 1.5s infinite;
+        }
+        .status-dot.recording {
+            background: var(--red);
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .progress {
+            height: 2px;
+            background: var(--border);
+            border-radius: 1px;
+            overflow: hidden;
+            margin-top: 12px;
+            display: none;
+        }
+        .progress.visible { display: block; }
+        .progress-bar {
+            height: 100%;
+            background: var(--text);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        #progressInfo {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            color: var(--faint);
+            margin-top: 4px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        button {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 16px;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--text);
+            border-radius: 0;
+            transition: border-color 0.15s;
+        }
+        button:hover:not(:disabled) {
+            border-color: var(--text);
+        }
+        button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        button.primary {
+            background: var(--text);
+            color: var(--bg);
+            border-color: var(--text);
+        }
+        button.primary:hover:not(:disabled) {
+            background: var(--muted);
+            border-color: var(--muted);
+        }
+        button.danger {
+            background: var(--red);
+            color: #fff;
+            border-color: var(--red);
+        }
+        button.danger:hover:not(:disabled) {
+            opacity: 0.85;
+        }
+        .info {
+            font-size: 13px;
+            color: var(--faint);
+            margin-top: 12px;
+        }
+
+        #transcript {
+            padding: 16px;
+            min-height: 120px;
+            border: 1px solid var(--border);
+            white-space: pre-wrap;
+            line-height: 1.6;
+            font-size: 15px;
+            color: var(--text);
+        }
+
+        #turnHistory { margin-top: 8px; }
+        .turn-entry {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 16px;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--muted);
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .turn-entry:last-child { border-bottom: none; }
+        .turn-label { color: var(--text); }
+        .turn-duration { color: var(--faint); }
+        .turn-entry audio {
+            height: 28px;
+            flex: 1 1 200px;
+            min-width: 0;
+        }
+
+        #metricsCard { display: none; }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+        .metric { text-align: center; }
+        .metric-value {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        .metric-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            color: var(--faint);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            margin-top: 2px;
+        }
+
+        .streaming-cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1em;
+            background: var(--text);
+            margin-left: 2px;
+            vertical-align: text-bottom;
+            animation: blink 0.7s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        .hw-note {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            color: var(--faint);
+            margin-top: 8px;
+        }
+
+        .voice-section {
+            margin-bottom: 16px;
+        }
+        .voice-section-label {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            color: var(--faint);
+            margin-bottom: 8px;
+        }
+        .voice-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .voice-row {
+            display: flex;
+            flex-wrap: nowrap;
+            align-items: center;
+            gap: 4px;
+        }
+        .voice-btn {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 4px 9px;
+            border: 1px solid var(--border);
+            background: transparent;
+            color: var(--muted);
+            border-radius: 999px;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s, color 0.15s;
+            letter-spacing: 0.02em;
+        }
+        .voice-btn:hover:not(:disabled) {
+            border-color: var(--text);
+            color: var(--text);
+        }
+        .voice-btn.active {
+            background: var(--text);
+            color: var(--bg);
+            border-color: var(--text);
+        }
+        .voice-btn.loading {
+            border-style: dashed;
+        }
+        .voice-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        .wip-note {
+            font-size: 13px;
+            color: var(--yellow);
+            border: 1px solid var(--yellow);
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 24px;
+        }
+
+        footer {
+            border-top: 1px solid var(--border);
+            padding-top: 24px;
+            margin-top: 24px;
+        }
+        footer a {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            color: var(--faint);
+            text-decoration: none;
+        }
+        footer a:hover { color: var(--muted); }
+    </style>
+</head>
+<body>
+    <header>
+        <p class="org">idle intelligence</p>
+        <h1>sts-web</h1>
+        <p class="tagline">
+            <a href="https://huggingface.co/nvidia/personaplex-7b-v1">NVIDIA PersonaPlex-7B</a>
+            — pruned to 24 layers, recovered with QLoRA, quantized to Q4_K.
+            Client-side inference: WebGPU via <a href="https://burn.dev">Burn</a> + Rust/WASM.
+        </p>
+        <p class="repo">
+            <a href="https://github.com/idle-intelligence/sts-web">github.com/idle-intelligence/sts-web</a>
+        </p>
+    </header>
+
+    <p class="wip-note">⚠ Work in progress — runs slower than realtime without a powerful GPU. Expect delays during audio generation.</p>
+
+    <section>
+        <h2>status</h2>
+        <div class="status">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">Checking browser support...</span>
+        </div>
+        <div class="progress" id="progressBar">
+            <div class="progress-bar" id="progressFill"></div>
+        </div>
+        <p id="progressInfo"></p>
+        <div style="margin-top:12px">
+            <button id="downloadBtn" class="primary" style="display:none">Load Model</button>
+        </div>
+        <p class="hw-note">Desktop only. Requires discrete GPU or Apple Silicon with 16GB+ RAM.</p>
+    </section>
+
+    <section>
+        <h2>conversation</h2>
+        <div class="voice-section">
+            <div class="voice-section-label">VOICE</div>
+            <button class="voice-btn active" data-voice="" disabled id="voiceNoneBtn">None</button>
+            <p class="hw-note" style="margin: 6px 0 10px;">No voice prompt — speaker identity sampled from prior distribution</p>
+            <div class="voice-grid" id="voiceGrid">
+                <div class="voice-row">
+                    <button class="voice-btn" data-voice="NATM0" disabled>NATM0</button>
+                    <button class="voice-btn" data-voice="NATM1" disabled>NATM1</button>
+                    <button class="voice-btn" data-voice="NATM2" disabled>NATM2</button>
+                    <button class="voice-btn" data-voice="NATM3" disabled>NATM3</button>
+                    <button class="voice-btn" data-voice="VARM0" disabled>VARM0</button>
+                    <button class="voice-btn" data-voice="VARM1" disabled>VARM1</button>
+                    <button class="voice-btn" data-voice="VARM2" disabled>VARM2</button>
+                    <button class="voice-btn" data-voice="VARM3" disabled>VARM3</button>
+                    <button class="voice-btn" data-voice="VARM4" disabled>VARM4</button>
+                </div>
+                <div class="voice-row">
+                    <button class="voice-btn" data-voice="NATF0" disabled>NATF0</button>
+                    <button class="voice-btn" data-voice="NATF1" disabled>NATF1</button>
+                    <button class="voice-btn" data-voice="NATF2" disabled>NATF2</button>
+                    <button class="voice-btn" data-voice="NATF3" disabled>NATF3</button>
+                    <button class="voice-btn" data-voice="VARF0" disabled>VARF0</button>
+                    <button class="voice-btn" data-voice="VARF1" disabled>VARF1</button>
+                    <button class="voice-btn" data-voice="VARF2" disabled>VARF2</button>
+                    <button class="voice-btn" data-voice="VARF3" disabled>VARF3</button>
+                    <button class="voice-btn" data-voice="VARF4" disabled>VARF4</button>
+                </div>
+            </div>
+        </div>
+        <div class="actions">
+            <button id="myTurnBtn" class="primary" disabled>My Turn</button>
+            <button id="yourTurnBtn" class="danger" disabled style="display:none">Your Turn</button>
+            <button id="newConvoBtn" style="display:none">New Conversation</button>
+        </div>
+        <p class="info">Audio stays on this device. All inference runs locally in your browser.</p>
+    </section>
+
+    <section>
+        <h2>output <span class="sub">· inner monologue</span></h2>
+        <div id="transcript"><span id="transcriptText"></span><span id="streamingCursor" class="streaming-cursor" style="display:none"></span></div>
+    </section>
+
+    <section>
+        <h2>output <span class="sub">· audio</span></h2>
+        <audio id="audioPlayer" controls style="display:none; width:100%; margin-top:12px"></audio>
+        <p id="audioStatus" class="info"></p>
+    </section>
+
+    <section id="turnHistorySection" style="display:none">
+        <h2>turns</h2>
+        <div id="turnHistory"></div>
+    </section>
+
+    <section>
+        <h2>files <span class="sub">· test mode</span></h2>
+        <div class="actions">
+            <button id="fileBtn" disabled>Load WAV File</button>
+            <button id="exampleBtn" disabled>Load Example WAV</button>
+            <input type="file" id="fileInput" accept=".wav,audio/wav" style="display:none">
+        </div>
+    </section>
+
+    <section id="metricsCard">
+        <h2>performance</h2>
+        <div class="metrics-grid">
+            <div class="metric">
+                <div class="metric-value" id="metricFrameMs">--</div>
+                <div class="metric-label">ms/frame</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricFps">--</div>
+                <div class="metric-label">Frames/sec</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricRtf">--</div>
+                <div class="metric-label">RTF</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricTemporalMs">--</div>
+                <div class="metric-label">Temporal (ms)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricDepthMs">--</div>
+                <div class="metric-label">Depth (ms)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="metricMimiMs">--</div>
+                <div class="metric-label">Mimi (ms)</div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <a href="https://idleintelligence.org">idleintelligence.org</a>
+    </footer>
+
+    <script type="module">
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const progressBar = document.getElementById('progressBar');
+        const progressFill = document.getElementById('progressFill');
+        const progressInfo = document.getElementById('progressInfo');
+        const transcriptEl = document.getElementById('transcript');
+        const transcriptTextEl = document.getElementById('transcriptText');
+        const myTurnBtn = document.getElementById('myTurnBtn');
+        const yourTurnBtn = document.getElementById('yourTurnBtn');
+        const newConvoBtn = document.getElementById('newConvoBtn');
+        const fileBtn = document.getElementById('fileBtn');
+        const fileInput = document.getElementById('fileInput');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const exampleBtn = document.getElementById('exampleBtn');
+        const audioPlayer = document.getElementById('audioPlayer');
+        const audioStatus = document.getElementById('audioStatus');
+        const voiceGrid = document.getElementById('voiceGrid');
+        const voiceNoneBtn = document.getElementById('voiceNoneBtn');
+        const voiceBtns = [voiceNoneBtn, ...Array.from(voiceGrid.querySelectorAll('.voice-btn'))];
+        let activeVoiceBtn = voiceNoneBtn;
+        const metricsCard = document.getElementById('metricsCard');
+        const metricFrameMs = document.getElementById('metricFrameMs');
+        const metricFps = document.getElementById('metricFps');
+        const metricRtf = document.getElementById('metricRtf');
+        const metricTemporalMs = document.getElementById('metricTemporalMs');
+        const metricDepthMs = document.getElementById('metricDepthMs');
+        const metricMimiMs = document.getElementById('metricMimiMs');
+
+        const isBenchmark = new URLSearchParams(location.search).has('benchmark');
+
+        let worker = null;
+        let mimiWorker = null;
+        let audioCtx = null;
+        let playbackNode = null;
+        let micStream = null;
+        let micWorkletNode = null;
+        let transcriptText = '';
+        let micModuleLoaded = false;
+        let lastCompleteAudio = null;
+        let listeningStartTime = 0;
+        let listeningTimer = null;
+        const allDecodedChunks = []; // Collect decoded audio from Mimi worker for WAV export
+        let mimiTotalMs = 0;       // Accumulated Mimi decode time from Mimi worker
+        let mimiFrameCount = 0;    // Number of Mimi decode frames
+        // Pending turn metadata: set by turn-complete, consumed when decoded done arrives
+        let pendingTurnGenSec = null;
+        let pendingTurnNumber = null;
+        let pendingTurnBlobUrl = null; // set if decoded done arrives before turn-complete
+
+        // UI state: 'idle' | 'listening' | 'generating' | 'speaking'
+        let uiState = 'idle';
+        let turnCount = 0;
+        let generationStartTime = 0;
+
+        function setUIState(state) {
+            uiState = state;
+            switch (state) {
+                case 'idle':
+                    myTurnBtn.textContent = 'My Turn';
+                    myTurnBtn.disabled = false;
+                    myTurnBtn.style.display = '';
+                    myTurnBtn.classList.add('primary');
+                    yourTurnBtn.style.display = 'none';
+                    yourTurnBtn.disabled = true;
+                    fileBtn.disabled = false;
+                    exampleBtn.disabled = false;
+                    voiceBtns.forEach(b => b.disabled = false);
+                    break;
+                case 'listening':
+                    myTurnBtn.style.display = 'none';
+                    yourTurnBtn.style.display = '';
+                    yourTurnBtn.disabled = false;
+                    newConvoBtn.style.display = '';
+                    fileBtn.disabled = true;
+                    exampleBtn.disabled = true;
+                    voiceBtns.forEach(b => b.disabled = true);
+                    break;
+                case 'generating':
+                    generationStartTime = performance.now();
+                    /* falls through */
+                case 'speaking':
+                    myTurnBtn.style.display = 'none';
+                    yourTurnBtn.style.display = 'none';
+                    fileBtn.disabled = true;
+                    exampleBtn.disabled = true;
+                    voiceBtns.forEach(b => b.disabled = true);
+                    break;
+            }
+        }
+
+        function updateStatus(state, text) {
+            statusDot.className = 'status-dot ' + state;
+            statusText.textContent = text;
+        }
+
+        function formatBytes(bytes) {
+            const mb = bytes / (1024 * 1024);
+            return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
+        }
+
+        function updateMetrics(data) {
+            metricsCard.style.display = 'block';
+            if (data.framesPerSec != null) metricFps.textContent = data.framesPerSec.toFixed(1);
+            if (data.avgFrameMs != null) metricFrameMs.textContent = data.avgFrameMs.toFixed(1);
+            if (data.temporalMs != null) metricTemporalMs.textContent = data.temporalMs.toFixed(1);
+            if (data.depthMs != null) metricDepthMs.textContent = data.depthMs.toFixed(1);
+            if (data.mimiMs != null) metricMimiMs.textContent = data.mimiMs.toFixed(1);
+            if (data.avgFrameMs != null) metricRtf.textContent = (data.avgFrameMs / 80).toFixed(2);
+        }
+
+        // --- Audio playback setup ---
+
+        async function initAudioPlayback() {
+            audioCtx = new AudioContext({ sampleRate: 24000 });
+            await audioCtx.audioWorklet.addModule('./audio-playback.js');
+            playbackNode = new AudioWorkletNode(audioCtx, 'audio-playback');
+            playbackNode.connect(audioCtx.destination);
+
+            if (mimiWorker) {
+                // Mimi worker path: decoded PCM flows Mimi Worker -> AudioWorklet
+                const channel = new MessageChannel();
+                playbackNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+                mimiWorker.postMessage({ type: 'set-playback-port', port: channel.port2 }, [channel.port2]);
+            } else {
+                // Fallback: inference worker sends PCM directly to AudioWorklet
+                const channel = new MessageChannel();
+                playbackNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+                worker.postMessage({ type: 'playback-port', port: channel.port2 }, [channel.port2]);
+            }
+
+            return playbackNode;
+        }
+
+        // --- Mic setup ---
+
+        async function startMic() {
+            if (!audioCtx) await initAudioPlayback();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            if (!micModuleLoaded) {
+                await audioCtx.audioWorklet.addModule('./audio-processor.js');
+                micModuleLoaded = true;
+            }
+
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                }
+            });
+            const source = audioCtx.createMediaStreamSource(micStream);
+            micWorkletNode = new AudioWorkletNode(audioCtx, 'audio-processor');
+
+            // Direct port from AudioWorklet -> Worker (bypasses main thread)
+            const channel = new MessageChannel();
+            micWorkletNode.port.postMessage({ type: 'port', port: channel.port1 }, [channel.port1]);
+            worker.postMessage({ type: 'audio-port', port: channel.port2 }, [channel.port2]);
+
+            source.connect(micWorkletNode);
+            // Don't connect to destination — mic input should not play back
+        }
+
+        function stopMic() {
+            if (micWorkletNode) {
+                micWorkletNode.port.postMessage({ type: 'stop' });
+                micWorkletNode.disconnect();
+                micWorkletNode = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+            }
+        }
+
+        // --- Worker setup ---
+
+        function initMimiWorker() {
+            mimiWorker = new Worker('./mimi-worker.js', { type: 'module' });
+            mimiWorker.onerror = (e) => {
+                console.error('[mimi-worker error]', e);
+                updateStatus('error', `Mimi worker error: ${e.message}`);
+            };
+
+            mimiWorker.onmessage = (e) => {
+                const msg = e.data;
+                switch (msg.type) {
+                    case 'status':
+                        console.log('[mimi-worker]', msg.text);
+                        break;
+
+                    case 'ready':
+                        console.log('[mimi-worker] Mimi codec ready');
+                        break;
+
+                    case 'decoded': {
+                        // On step 0, clear any stale chunks/timing from a previous turn
+                        // that may have arrived after the pre-generation reset.
+                        if (msg.step === 0) {
+                            allDecodedChunks.length = 0;
+                            mimiTotalMs = 0;
+                            mimiFrameCount = 0;
+                        }
+                        // Accumulate Mimi decode timing
+                        if (msg.decodeMs != null) {
+                            mimiTotalMs += msg.decodeMs;
+                            mimiFrameCount++;
+                        }
+                        // Collect decoded audio for WAV export
+                        if (msg.samples && msg.samples.length > 0) {
+                            allDecodedChunks.push(new Float32Array(msg.samples));
+                        }
+                        // On last frame, assemble full audio for WAV download
+                        if (msg.done && allDecodedChunks.length > 0) {
+                            let totalLen = 0;
+                            for (const c of allDecodedChunks) totalLen += c.length;
+                            const fullAudio = new Float32Array(totalLen);
+                            let offset = 0;
+                            for (const c of allDecodedChunks) {
+                                fullAudio.set(c, offset);
+                                offset += c.length;
+                            }
+                            // Clear immediately after assembly so stale chunks can't
+                            // pollute a subsequent turn if a new generation starts before
+                            // the next step=0 resets the array.
+                            allDecodedChunks.length = 0;
+                            lastCompleteAudio = fullAudio;
+                            const wavBlob = buildWavBlob(fullAudio);
+                            if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
+                            audioPlayer._blobUrl = URL.createObjectURL(wavBlob);
+                            audioPlayer.src = audioPlayer._blobUrl;
+                            audioPlayer.style.display = 'block';
+                            audioStatus.textContent = `Response: ${(fullAudio.length / 24000).toFixed(1)}s audio`;
+                            // Create a SEPARATE blob URL for the history (the main player's gets revoked next turn)
+                            const historyBlobUrl = URL.createObjectURL(wavBlob);
+                            const genSec = pendingTurnGenSec
+                                || (generationStartTime > 0 ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?');
+                            const turnNum = pendingTurnNumber || (turnCount + 1);
+                            addTurnHistoryEntry(turnNum, genSec, historyBlobUrl);
+                            pendingTurnGenSec = null;
+                            pendingTurnNumber = null;
+                        }
+                        break;
+                    }
+
+                    case 'error':
+                        console.error('[mimi-worker]', msg.message);
+                        updateStatus('error', 'Mimi error: ' + msg.message);
+                        break;
+                }
+            };
+
+            // Create a direct channel: inference worker -> Mimi worker
+            const channel = new MessageChannel();
+            worker.postMessage({ type: 'mimi-worker-port', port: channel.port1 }, [channel.port1]);
+
+            // The Mimi worker receives decode commands on this port
+            mimiWorker.postMessage({ type: 'set-mimi-port', port: channel.port2 }, [channel.port2]);
+
+            return mimiWorker;
+        }
+
+        function addTurnHistoryEntry(turnNum, genSec, blobUrl) {
+            const audioDurationSec = mimiFrameCount > 0
+                ? (mimiFrameCount * 0.08).toFixed(1)
+                : '?';
+            const turnHistoryEl = document.getElementById('turnHistory');
+            const turnHistorySectionEl = document.getElementById('turnHistorySection');
+            const entry = document.createElement('div');
+            entry.className = 'turn-entry';
+            entry.innerHTML = `<span class="turn-label">Turn ${turnNum}</span><span class="turn-duration">${genSec}s gen · ${audioDurationSec}s audio</span>`;
+            if (blobUrl) {
+                const player = document.createElement('audio');
+                player.controls = true;
+                player.src = blobUrl;
+                entry.appendChild(player);
+            }
+            turnHistoryEl.appendChild(entry);
+            turnHistorySectionEl.style.display = '';
+        }
+
+        function initWorker() {
+            worker = new Worker('./worker.js', { type: 'module' });
+            worker.onerror = (e) => {
+                console.error('[worker error]', e);
+                updateStatus('error', `Worker error: ${e.message}`);
+            };
+
+            worker.onmessage = async (e) => {
+                const msg = e.data;
+                switch (msg.type) {
+                    case 'status':
+                        if (msg.ready) {
+                            updateStatus('ready', msg.text);
+                            if (uiState === 'idle') {
+                                myTurnBtn.disabled = false;
+                                fileBtn.disabled = false;
+                                exampleBtn.disabled = false;
+                                voiceBtns.forEach(b => b.disabled = false);
+                            }
+                            progressBar.classList.remove('visible');
+                            progressInfo.textContent = '';
+                            downloadBtn.style.display = 'none';
+
+                            // Start loading Mimi worker now that inference worker is ready
+                            if (mimiWorker) loadMimiWorker();
+                        } else if (uiState === 'listening') {
+                            // Main thread timer handles the display; ignore worker status
+                            break;
+                        } else if (uiState === 'generating' || uiState === 'speaking') {
+                            // Filter out stale "Listening" messages that arrive after
+                            // the user clicked "Your Turn" (worker audio processing
+                            // is async and messages can arrive late).
+                            if (msg.text && msg.text.startsWith('Listening')) break;
+                            updateStatus('active', msg.text);
+                        } else {
+                            updateStatus('loading', msg.text);
+                            if (msg.progress) {
+                                progressBar.classList.add('visible');
+                                const pct = msg.progress.total > 0
+                                    ? (msg.progress.loaded / msg.progress.total) * 100 : 0;
+                                progressFill.style.width = pct + '%';
+                                progressInfo.textContent =
+                                    `${formatBytes(msg.progress.loaded)} / ${formatBytes(msg.progress.total)}`;
+                            }
+                        }
+                        break;
+
+                    case 'audio-chunk':
+                        if (!isBenchmark) {
+                            if (msg.done) {
+                                audioStatus.textContent = 'Generation complete';
+                            } else {
+                                const playing = msg.step >= 24;
+                                audioStatus.textContent = playing
+                                    ? `Playing (frame ${msg.step + 1})`
+                                    : `Buffering audio... (frame ${msg.step + 1}/25)`;
+                            }
+                        }
+                        if (msg.done && playbackNode) {
+                            playbackNode.port.postMessage({ type: 'flush' });
+                        }
+                        break;
+
+                    case 'audio-complete': {
+                        // Fallback path (no Mimi worker): inference worker sends decoded audio
+                        lastCompleteAudio = msg.samples;
+                        const wavBlob = buildWavBlob(msg.samples);
+                        if (audioPlayer._blobUrl) URL.revokeObjectURL(audioPlayer._blobUrl);
+                        audioPlayer._blobUrl = URL.createObjectURL(wavBlob);
+                        audioPlayer.src = audioPlayer._blobUrl;
+                        audioPlayer.style.display = 'block';
+                        audioStatus.textContent = `Response: ${(msg.samples.length / 24000).toFixed(1)}s audio`;
+                        const acHistoryBlobUrl = URL.createObjectURL(wavBlob);
+                        const acGenSec = pendingTurnGenSec
+                            || (generationStartTime > 0 ? ((performance.now() - generationStartTime) / 1000).toFixed(1) : '?');
+                        const acTurnNum = pendingTurnNumber || (turnCount + 1);
+                        addTurnHistoryEntry(acTurnNum, acGenSec, acHistoryBlobUrl);
+                        pendingTurnGenSec = null;
+                        pendingTurnNumber = null;
+                        break;
+                    }
+
+                    case 'transcript': {
+                        const cursor = document.getElementById('streamingCursor');
+                        if (msg.text) {
+                            transcriptText += msg.text;
+                            transcriptTextEl.textContent = transcriptText;
+                            transcriptEl.classList.remove('empty');
+                        }
+                        if (msg.final) {
+                            if (transcriptText) transcriptText += ' ';
+                            if (cursor) cursor.style.display = 'none';
+                        } else {
+                            if (cursor) cursor.style.display = 'inline-block';
+                        }
+                        break;
+                    }
+
+                    case 'turn-complete': {
+                        updateStatus('ready', 'Ready');
+                        setUIState('idle');
+                        turnCount++;
+                        // Gen time is captured now; the turn entry is created
+                        // from the decoded-done handler when the audio blob is ready.
+                        pendingTurnGenSec = generationStartTime > 0
+                            ? ((performance.now() - generationStartTime) / 1000).toFixed(1)
+                            : '?';
+                        pendingTurnNumber = turnCount;
+                        break;
+                    }
+
+                    case 'metrics':
+                        // Override Mimi timing with data from the Mimi worker
+                        if (mimiFrameCount > 0) {
+                            msg.mimiMs = mimiTotalMs / mimiFrameCount;
+                        }
+                        updateMetrics(msg);
+                        break;
+
+                    case 'voice-loaded':
+                        voiceBtns.forEach(b => {
+                            b.disabled = false;
+                            b.classList.remove('loading');
+                        });
+                        updateStatus('ready', 'Ready');
+                        break;
+
+                    case 'voice-error':
+                        console.error('[voice]', msg.error);
+                        voiceBtns.forEach(b => {
+                            b.disabled = false;
+                            b.classList.remove('loading');
+                        });
+                        updateStatus('ready', 'Ready');
+                        break;
+
+                    case 'error':
+                        if (listeningTimer) { clearInterval(listeningTimer); listeningTimer = null; }
+                        updateStatus('error', 'Error: ' + msg.message);
+                        console.error('[sts]', msg.message);
+                        stopMic();
+                        setUIState('idle');
+                        break;
+                }
+            };
+
+            return worker;
+        }
+
+        // --- Cache check ---
+
+        async function isModelCached() {
+            try {
+                const cache = await caches.open('sts-model-v1');
+                return !!(await cache.match('https://huggingface.co/idle-intelligence/personaplex-24L-q4_k-webgpu/resolve/main/shards/personaplex-7b-v1-q4_k.gguf.shard-00'));
+            } catch { return false; }
+        }
+
+        // --- Init ---
+
+        const HF_BASE = 'https://huggingface.co/idle-intelligence/personaplex-24L-q4_k-webgpu/resolve/main';
+        const MIMI_URL = `${HF_BASE}/tokenizer-e351c8d8-checkpoint125.safetensors`;
+        const CACHE_NAME = 'sts-model-v1';
+
+        /** Fetch with Cache API support (mirrors worker.js cachedFetch). */
+        async function cachedFetchMain(url, label) {
+            const cache = await caches.open(CACHE_NAME);
+            const cached = await cache.match(url);
+            if (cached) return await cached.arrayBuffer();
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+            const buf = await resp.arrayBuffer();
+            try {
+                await cache.put(url, new Response(buf.slice(0), {
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                }));
+            } catch (e) { console.warn('Cache put failed:', e); }
+            return buf;
+        }
+
+        /**
+         * Load the Mimi worker: WASM module + model weights.
+         * Called after the inference worker signals ready (model loaded).
+         */
+        async function loadMimiWorker() {
+            try {
+                mimiWorker.postMessage({ type: 'load' });
+                const mimiBuf = await cachedFetchMain(MIMI_URL, 'Mimi codec');
+                mimiWorker.postMessage({ type: 'load-model', data: mimiBuf }, [mimiBuf]);
+            } catch (err) {
+                console.error('[main] Failed to load Mimi worker:', err);
+                // Mimi worker failed — inference worker fallback still works
+            }
+        }
+
+        if (!navigator.gpu) {
+            updateStatus('error', 'WebGPU not supported. Use Chrome or Edge 113+.');
+        } else {
+            initWorker();
+            initMimiWorker();
+
+            const cached = await isModelCached();
+            if (cached || isBenchmark) {
+                updateStatus('loading', 'Loading model from cache (~5 GB)...');
+                worker.postMessage({ type: 'load', benchmark: isBenchmark });
+            } else {
+                updateStatus('', 'Model not loaded (~5.1 GB download)');
+                downloadBtn.textContent = 'Download Model';
+                downloadBtn.style.display = '';
+                downloadBtn.addEventListener('click', () => {
+                    downloadBtn.disabled = true;
+                    worker.postMessage({ type: 'load', benchmark: isBenchmark });
+                });
+            }
+        }
+
+        // --- Event handlers ---
+
+        // "My Turn" — start recording
+        myTurnBtn.addEventListener('click', async () => {
+            myTurnBtn.disabled = true;
+            try {
+                transcriptText = '';
+                transcriptTextEl.textContent = 'Transcript will appear here...';
+                transcriptEl.classList.add('empty');
+                audioStatus.textContent = 'Audio output will play here...';
+
+                await startMic();
+                worker.postMessage({ type: 'start-listening' });
+                setUIState('listening');
+                listeningStartTime = performance.now();
+                updateStatus('recording', 'Listening... 0s');
+                listeningTimer = setInterval(() => {
+                    const elapsed = ((performance.now() - listeningStartTime) / 1000).toFixed(1);
+                    updateStatus('recording', `Listening... ${elapsed}s`);
+                }, 200);
+            } catch (err) {
+                myTurnBtn.disabled = false;
+                updateStatus('error', 'Microphone error: ' + err.message);
+                console.error(err);
+            }
+        });
+
+        // "Your Turn" — stop recording, trigger generation
+        yourTurnBtn.addEventListener('click', () => {
+            if (listeningTimer) { clearInterval(listeningTimer); listeningTimer = null; }
+            stopMic();
+            worker.postMessage({ type: 'stop' });
+            setUIState('generating');
+            updateStatus('active', 'Generating response...');
+            audioStatus.textContent = 'Buffering audio...';
+
+            // Clear decoded audio chunks and Mimi timing for new generation
+            allDecodedChunks.length = 0;
+            mimiTotalMs = 0;
+            mimiFrameCount = 0;
+            pendingTurnGenSec = null;
+            pendingTurnNumber = null;
+            pendingTurnBlobUrl = null;
+
+            // Reset playback buffer for fresh output
+            if (playbackNode) {
+                playbackNode.port.postMessage({ type: 'reset' });
+            }
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        });
+
+        // "New Conversation" — reset everything
+        newConvoBtn.addEventListener('click', () => {
+            if (listeningTimer) { clearInterval(listeningTimer); listeningTimer = null; }
+            stopMic();
+
+            // Reset playback buffer
+            if (playbackNode) {
+                playbackNode.port.postMessage({ type: 'reset' });
+            }
+
+            // Clear transcript
+            transcriptText = '';
+            transcriptTextEl.textContent = 'Transcript will appear here...';
+            transcriptEl.classList.add('empty');
+            audioStatus.textContent = 'Audio output will play here...';
+
+            // Tell workers to reset
+            worker.postMessage({ type: 'new-conversation' });
+            if (mimiWorker) mimiWorker.postMessage({ type: 'reset' });
+            allDecodedChunks.length = 0;
+            mimiTotalMs = 0;
+            mimiFrameCount = 0;
+            pendingTurnGenSec = null;
+            pendingTurnNumber = null;
+            pendingTurnBlobUrl = null;
+            setUIState('idle');
+            updateStatus('ready', 'Ready');
+        });
+
+        // --- Voice preset ---
+
+        function handleVoiceClick(e) {
+            const btn = e.target.closest('.voice-btn');
+            if (!btn || btn.disabled) return;
+
+            activeVoiceBtn.classList.remove('active');
+            btn.classList.add('active', 'loading');
+            activeVoiceBtn = btn;
+
+            const name = btn.dataset.voice || null;
+            voiceBtns.forEach(b => b.disabled = true);
+            worker.postMessage({ type: 'load-voice-preset', name });
+        }
+        voiceGrid.addEventListener('click', handleVoiceClick);
+        voiceNoneBtn.addEventListener('click', handleVoiceClick);
+
+        // --- File handlers (test mode) ---
+
+        fileBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            fileInput.value = '';
+            await feedAudioFile(await file.arrayBuffer(), file.name);
+        });
+
+        async function feedAudioFile(arrayBuf, label) {
+            updateStatus('loading', `Decoding ${label}...`);
+            setUIState('generating');
+            try {
+                // In benchmark mode, skip AudioContext entirely (not needed, and
+                // Chrome blocks it without a user gesture).
+                if (!isBenchmark) {
+                    if (!playbackNode) await initAudioPlayback();
+                    if (audioCtx.state === 'suspended') await audioCtx.resume();
+                    playbackNode.port.postMessage({ type: 'reset' });
+                }
+
+                // Reset decoded chunks and Mimi timing
+                allDecodedChunks.length = 0;
+                mimiTotalMs = 0;
+                mimiFrameCount = 0;
+                pendingTurnGenSec = null;
+                pendingTurnNumber = null;
+                pendingTurnBlobUrl = null;
+
+                const offlineCtx = new OfflineAudioContext(1, 1, 24000);
+                const audioBuf = await offlineCtx.decodeAudioData(arrayBuf);
+                const outLen = Math.ceil(audioBuf.duration * 24000);
+                const resampleCtx = new OfflineAudioContext(1, outLen, 24000);
+                const source = resampleCtx.createBufferSource();
+                source.buffer = audioBuf;
+                source.connect(resampleCtx.destination);
+                source.start(0);
+                const rendered = await resampleCtx.startRendering();
+                const pcm = rendered.getChannelData(0);
+
+                worker.postMessage({ type: 'new-conversation' });
+                transcriptText = '';
+                transcriptTextEl.textContent = '';
+                transcriptEl.classList.remove('empty');
+
+                // Use walkie-talkie path: start-listening, feed audio, stop
+                worker.postMessage({ type: 'start-listening' });
+
+                const CHUNK = 1920; // Match Mimi frame size
+                updateStatus('loading', `Processing ${(pcm.length / 24000).toFixed(1)}s of audio...`);
+                for (let i = 0; i < pcm.length; i += CHUNK) {
+                    const chunk = pcm.slice(i, Math.min(i + CHUNK, pcm.length));
+                    worker.postMessage({ type: 'audio', samples: chunk }, [chunk.buffer]);
+                    if ((i / CHUNK) % 10 === 0) await new Promise(r => setTimeout(r, 0));
+                }
+                worker.postMessage({ type: 'stop' });
+            } catch (err) {
+                updateStatus('error', 'File error: ' + err.message);
+                console.error(err);
+                setUIState('idle');
+            }
+        }
+
+        exampleBtn.addEventListener('click', async () => {
+            const resp = await fetch('./joke.wav');
+            if (!resp.ok) { updateStatus('error', 'Failed to fetch example WAV'); return; }
+            await feedAudioFile(await resp.arrayBuffer(), 'joke.wav');
+        });
+
+        // --- Benchmark mode ---
+        // When ?benchmark is in the URL, auto-drive the full pipeline
+        // and expose results on window.__benchmarkResults for Playwright.
+
+        if (isBenchmark) {
+            // Listen for benchmark-complete from worker
+            const origOnMessage = worker.onmessage;
+            worker.onmessage = (e) => {
+                origOnMessage(e);
+                const msg = e.data;
+                if (msg.type === 'benchmark-complete') {
+                    window.__benchmarkResults = msg.results;
+                    // Display results visually
+                    let pre = document.getElementById('benchmarkResults');
+                    if (!pre) {
+                        pre = document.createElement('pre');
+                        pre.id = 'benchmarkResults';
+                        pre.style.cssText = 'padding:16px;border:1px solid #ddd;font-size:12px;overflow:auto;max-height:400px;margin-top:12px;';
+                        document.querySelector('footer').before(pre);
+                    }
+                    pre.textContent = JSON.stringify(msg.results, null, 2);
+                }
+                if (msg.type === 'status' && msg.ready) {
+                    // Model loaded — feed test audio and generate
+                    benchmarkAutoRun();
+                }
+            };
+        }
+
+        async function benchmarkAutoRun() {
+            console.log('[benchmark] Model ready, feeding test audio...');
+            try {
+                const resp = await fetch('./joke.wav');
+                if (!resp.ok) throw new Error('Failed to fetch joke.wav: ' + resp.status);
+                const arrayBuf = await resp.arrayBuffer();
+                await feedAudioFile(arrayBuf, 'benchmark-joke.wav');
+            } catch (err) {
+                console.error('[benchmark] Auto-run failed:', err);
+                window.__benchmarkResults = { error: err.message };
+            }
+        }
+
+        function buildWavBlob(samples) {
+            const numSamples = samples.length;
+            const buffer = new ArrayBuffer(44 + numSamples * 2);
+            const view = new DataView(buffer);
+            const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+            writeStr(0, 'RIFF');
+            view.setUint32(4, 36 + numSamples * 2, true);
+            writeStr(8, 'WAVE');
+            writeStr(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM
+            view.setUint16(22, 1, true); // mono
+            view.setUint32(24, 24000, true);
+            view.setUint32(28, 48000, true); // byte rate
+            view.setUint16(32, 2, true); // block align
+            view.setUint16(34, 16, true); // bits per sample
+            writeStr(36, 'data');
+            view.setUint32(40, numSamples * 2, true);
+            for (let i = 0; i < numSamples; i++) {
+                const s = Math.max(-1, Math.min(1, samples[i]));
+                view.setInt16(44 + i * 2, s * 32767, true);
+            }
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
+    </script>
+</body>
+</html>

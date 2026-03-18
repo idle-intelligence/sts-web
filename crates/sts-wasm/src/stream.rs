@@ -659,7 +659,15 @@ impl StsStream {
             engine.reset_caches();
 
             // Run all 8 depth steps in a single command buffer.
-            let audio_tokens = engine.generate(&hidden_resource, &text_resource).await;
+            let penalty_hist = &self.audio_token_history;
+            let audio_tokens = engine.generate(
+                &hidden_resource,
+                &text_resource,
+                self.audio_temperature,
+                self.audio_top_k,
+                self.repetition_penalty,
+                Some(penalty_hist),
+            ).await;
 
             // Read back text token separately (the custom engine only returns audio).
             let text_token_val = gpu_read_token_tensor(text_token_tensor).await;

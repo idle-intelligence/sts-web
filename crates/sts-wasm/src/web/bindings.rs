@@ -316,10 +316,12 @@ impl StsEngine {
         let depth_cache = depth.create_cache();
         let mut stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
 
-        // Custom depth engine disabled: uses argmax only (no temperature/top-k/penalty),
-        // causing audio repetition. Burn path has correct sampling. Re-enable when
-        // sampling is added to the custom engine.
-        stream.depth_engine = None;
+        {
+            use crate::depth_engine::DepthEngine;
+            let depth_engine = DepthEngine::new(&depth, &self.device, &self.config);
+            stream.depth_engine = Some(depth_engine);
+            wasm_log("[sts] Custom DepthEngine initialized");
+        }
 
         self.temporal = Some(temporal);
         self.depth = Some(depth);
@@ -423,10 +425,12 @@ impl StsEngine {
         let depth_cache = depth.create_cache();
         let mut stream = StsStream::new(self.config.clone(), temporal_cache, depth_cache);
 
-        // Custom depth engine disabled: uses argmax only (no temperature/top-k/penalty),
-        // causing audio repetition. Burn path has correct sampling. Re-enable when
-        // sampling is added to the custom engine.
-        stream.depth_engine = None;
+        {
+            use crate::depth_engine::DepthEngine;
+            let depth_engine = DepthEngine::new(&depth, &self.device, &self.config);
+            stream.depth_engine = Some(depth_engine);
+            wasm_log("[sts] Custom DepthEngine initialized");
+        }
 
         self.temporal = Some(temporal);
         self.depth = Some(depth);

@@ -62,7 +62,8 @@ use cubecl::Runtime;
 use crate::depth::DepthTransformer;
 use crate::gguf::{gpu_argmax_buffer, gpu_sample_top_k_with_penalty};
 #[cfg(feature = "wasm")]
-use crate::gguf::gpu_read_token_tensor;
+#[cfg(feature = "wasm")]
+use futures_lite::future::zip;
 use crate::model::{LayerCaches, TemporalTransformer};
 use crate::StsConfig;
 
@@ -658,19 +659,28 @@ impl StsStream {
             // Reset the custom engine's KV caches for this frame.
             engine.reset_caches();
 
-            // Run all 8 depth steps in a single command buffer.
+            // Run depth + text readback CONCURRENTLY: zip polls both futures,
+            // so the JS event loop resolves whichever mapAsync finishes first.
+            // Text readback (small 1-element tensor) completes well before depth,
+            // so it should already be done by the time generate() resolves.
             let penalty_hist = &self.audio_token_history;
-            let audio_tokens = engine.generate(
+            let generate_fut = engine.generate(
                 &hidden_resource,
                 &text_resource,
                 self.audio_temperature,
                 self.audio_top_k,
                 self.repetition_penalty,
                 Some(penalty_hist),
-            ).await;
-
-            // Read back text token separately (the custom engine only returns audio).
-            let text_token_val = gpu_read_token_tensor(text_token_tensor).await;
+            );
+            let text_fut = async {
+                let data = text_token_tensor
+                    .into_data_async()
+                    .await
+                    .expect("GPU readback failed");
+                let raw: Vec<f32> = data.to_vec().expect("token readback to_vec failed");
+                raw[0].to_bits()
+            };
+            let (audio_tokens, text_token_val) = zip(generate_fut, text_fut).await;
 
             (audio_tokens, text_token_val)
         } else {

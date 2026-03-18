@@ -118,7 +118,7 @@ self.onmessage = async (e) => {
     try {
         switch (type) {
             case 'load': {
-                const wasmJsUrl = data.url || new URL('/mimi-pkg/mimi_wasm.js', import.meta.url).href;
+                const wasmJsUrl = data.url || new URL('../mimi-pkg/mimi_wasm.js', import.meta.url).href;
                 const wasmBgUrl = wasmJsUrl.replace(/\.js$/, '_bg.wasm');
                 logState(`Loading Mimi WASM from ${wasmJsUrl}`);
                 self.postMessage({ type: 'status', text: 'Loading Mimi WASM module...' });

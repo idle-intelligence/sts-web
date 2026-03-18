@@ -240,7 +240,7 @@ impl StsStream {
             text_temperature: 0.7,
             text_top_k: 25,
             audio_temperature: 0.8,
-            audio_top_k: 250,
+            audio_top_k: 25,
             text_token_history: Vec::new(),
             audio_token_history: vec![Vec::new(); config.depth_num_steps],
             repetition_penalty: 1.2,
@@ -1208,7 +1208,7 @@ mod tests {
         assert!((stream.text_temperature - 0.7).abs() < 1e-6);
         assert_eq!(stream.text_top_k, 25);
         assert!((stream.audio_temperature - 0.8).abs() < 1e-6);
-        assert_eq!(stream.audio_top_k, 250);
+        assert_eq!(stream.audio_top_k, 25);
 
         stream.set_sampling_params(0.5, 10, 0.9, 100);
         assert!((stream.text_temperature - 0.5).abs() < 1e-6);

@@ -941,10 +941,10 @@
 
             const cached = await isModelCached();
             if (cached || isBenchmark) {
-                updateStatus('loading', 'Loading model from cache (~5 GB)...');
+                updateStatus('loading', 'Loading model from cache (~3.5 GB)...');
                 worker.postMessage({ type: 'load', benchmark: isBenchmark });
             } else {
-                updateStatus('', 'Model not loaded (~5.1 GB download)');
+                updateStatus('', 'Model not loaded (~3.9 GB download)');
                 downloadBtn.textContent = 'Download Model';
                 downloadBtn.style.display = '';
                 downloadBtn.addEventListener('click', () => {

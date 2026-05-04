@@ -27,6 +27,9 @@ pub mod tokenizer;
 #[cfg(feature = "wgpu")]
 pub mod loader;
 
+#[cfg(all(feature = "wgpu", not(target_family = "wasm")))]
+pub mod voice;
+
 #[cfg(feature = "wasm")]
 pub mod depth_engine;
 

@@ -2882,6 +2882,7 @@ dependencies = [
 [[package]]
 name = "mimi-rs"
 version = "0.1.0"
+source = "git+https://github.com/idle-intelligence/mimi-rs?branch=main#519ba1dfb7e908253f87716812cdb852db3e013b"
 dependencies = [
  "candle-core",
  "candle-nn",

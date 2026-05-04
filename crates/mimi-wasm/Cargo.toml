@@ -13,7 +13,7 @@ wasm-opt = false
 
 [dependencies]
 # Mimi audio codec (Candle-based, runs on CPU)
-mimi-rs = { path = "../../../mimi-rs" }
+mimi-rs = { git = "https://github.com/idle-intelligence/mimi-rs", branch = "main" }
 candle-core = "0.9"
 candle-nn = "0.9"
 safetensors = "0.4"

@@ -4,7 +4,7 @@ Browser-native speech-to-speech running 100% client-side via Rust/WASM + WebGPU.
 
 [**Try the demo →**](https://idle-intelligence.github.io/sts-web/web/)
 
-> **Disclaimer:** This is an experimental port. The model weights are Q4_K-quantized from [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1), a 24-layer pruned + QLoRA recovery variant of PersonaPlex-7B-v1. Inference quality may differ from the original implementation. This project is not affiliated with or endorsed by NVIDIA.
+> **Model:** [`idle-intelligence/personaplex-24L-q4_k-webgpu`](https://huggingface.co/idle-intelligence/personaplex-24L-q4_k-webgpu) — a layer-pruned (32L → 24L), LoRA-recovered, Q4_K-quantized derivative of [`nvidia/personaplex-7b-v1`](https://huggingface.co/nvidia/personaplex-7b-v1), built specifically to run in this WebGPU/native runtime. Pruning + recovery + quantization are by [@idle-intelligence](https://huggingface.co/idle-intelligence); the base PersonaPlex weights are NVIDIA's. See the [HF discussion](https://huggingface.co/idle-intelligence/personaplex-24L-q4_k-webgpu/discussions/1) for usage Q&A.
 
 ## Status
 
@@ -59,7 +59,7 @@ Requirements: Vulkan (Linux/Windows) or Metal (macOS) — wgpu auto-selects. ~4 
 
 ## Architecture
 
-- `crates/sts-wasm/` — Temporal transformer (32L) + depth transformer (6L × 8 steps) in Burn + wgpu, Q4_K GGUF quantization
+- `crates/sts-wasm/` — Temporal transformer (24L pruned, 32L upstream) + depth transformer (6L × 16 steps, 8 generated) in Burn + wgpu, Q4_K GGUF quantization
 - **Mimi codec** (`mimi-rs`) — Audio tokenizer/detokenizer, 8 codebooks at 12.5Hz
 - `web/` — Standalone demo, Web Workers for inference + Mimi decode, AudioWorklet for playback
 - Model weights fetched from HuggingFace at runtime, cached via Cache API

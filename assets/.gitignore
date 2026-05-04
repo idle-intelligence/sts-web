@@ -1,0 +1,4 @@
+# Test resources resolved by tests/common/mod.rs.
+# Symlink local data into here; nothing inside this dir is tracked.
+*
+!.gitignore

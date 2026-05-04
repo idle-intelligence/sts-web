@@ -4,31 +4,38 @@
 //! the garbled-audio bug is in the model (or the token plumbing around it).
 //! If the roundtrip audio is also garbled, the codec or weight remapping is
 //! the problem.
+//!
+//! Set `STS_TEST_MODEL_DIR` (model dir holding the Mimi safetensors) and
+//! `STS_TEST_AUDIO_WAV` (mono test WAV) to enable.
+
+mod common;
 
 use std::fs;
-use std::path::Path;
 
 use sts_wasm::mimi::MimiCodec;
 
-const MIMI_WEIGHTS: &str = "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_0-webgpu/tokenizer-e351c8d8-checkpoint125.safetensors";
-const INPUT_WAV: &str = "/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke.wav";
-const OUTPUT_WAV: &str = "/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke_roundtrip.wav";
-
 #[test]
 fn mimi_roundtrip() {
-    // ── Guard: skip if files are missing ──────────────────────────────
-    if !Path::new(MIMI_WEIGHTS).exists() {
-        eprintln!("Skipping: Mimi weights not found at {MIMI_WEIGHTS}");
+    let Some(model_dir) = common::model_dir() else {
         return;
-    }
-    if !Path::new(INPUT_WAV).exists() {
-        eprintln!("Skipping: test WAV not found at {INPUT_WAV}");
+    };
+    let Some(input_wav) = common::audio_wav() else {
         return;
-    }
+    };
+    let Some(mimi_weights) = common::find_mimi_weights(&model_dir) else {
+        eprintln!(
+            "Skipping: no `tokenizer-*.safetensors` in {}",
+            model_dir.display()
+        );
+        return;
+    };
+
+    let output_dir = common::test_output_dir();
+    let output_wav = output_dir.join("joke_roundtrip.wav");
 
     // ── 1. Load Mimi codec ───────────────────────────────────────────
-    println!("Loading Mimi codec from {MIMI_WEIGHTS} ...");
-    let mimi_data = fs::read(MIMI_WEIGHTS).expect("failed to read Mimi weights");
+    println!("Loading Mimi codec from {} ...", mimi_weights.display());
+    let mimi_data = fs::read(&mimi_weights).expect("failed to read Mimi weights");
     let mut mimi = MimiCodec::from_bytes(&mimi_data).expect("failed to load Mimi codec");
     println!(
         "  Codec ready: {} codebooks, {} Hz sample rate",
@@ -37,24 +44,12 @@ fn mimi_roundtrip() {
     );
 
     // ── 2. Load test WAV ─────────────────────────────────────────────
-    println!("Loading test WAV from {INPUT_WAV} ...");
-    let reader = hound::WavReader::open(INPUT_WAV).expect("failed to open WAV");
-    let spec = reader.spec();
+    println!("Loading test WAV from {} ...", input_wav.display());
+    let (samples, spec) = common::read_wav_mono_f32(&input_wav);
     println!(
         "  WAV spec: {} Hz, {} ch, {} bits, {:?}",
         spec.sample_rate, spec.channels, spec.bits_per_sample, spec.sample_format
     );
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .map(|s| s.unwrap() as f32 / max_val)
-                .collect()
-        }
-        hound::SampleFormat::Float => reader.into_samples::<f32>().map(|s| s.unwrap()).collect(),
-    };
     let duration_s = samples.len() as f64 / spec.sample_rate as f64;
     println!("  Loaded {} samples ({:.3}s)", samples.len(), duration_s);
 
@@ -173,13 +168,13 @@ fn mimi_roundtrip() {
             sample_format: hound::SampleFormat::Int,
         };
         let mut writer =
-            hound::WavWriter::create(OUTPUT_WAV, out_spec).expect("failed to create output WAV");
+            hound::WavWriter::create(&output_wav, out_spec).expect("failed to create output WAV");
         for &s in &all_output {
             let val = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
             writer.write_sample(val).unwrap();
         }
         writer.finalize().unwrap();
-        println!("Roundtrip WAV written to: {OUTPUT_WAV}");
+        println!("Roundtrip WAV written to: {}", output_wav.display());
     } else {
         println!("WARNING: No output audio produced — nothing written.");
     }
@@ -200,28 +195,31 @@ fn mimi_roundtrip() {
     );
 }
 
-const OUTPUT_WAV_8CB: &str =
-    "/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke_roundtrip_8cb.wav";
-const OUTPUT_WAV_32CB: &str =
-    "/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke_roundtrip_32cb.wav";
-
 /// Test that decoding with only 8 out of 32 codebooks produces recognisable
 /// (lower-quality but not garbled) audio, compared to a full 32-codebook decode.
 #[test]
 fn test_mimi_8codebook_roundtrip() {
-    // ── Guard: skip if files are missing ──────────────────────────────
-    if !Path::new(MIMI_WEIGHTS).exists() {
-        eprintln!("Skipping: Mimi weights not found at {MIMI_WEIGHTS}");
+    let Some(model_dir) = common::model_dir() else {
         return;
-    }
-    if !Path::new(INPUT_WAV).exists() {
-        eprintln!("Skipping: test WAV not found at {INPUT_WAV}");
+    };
+    let Some(input_wav) = common::audio_wav() else {
         return;
-    }
+    };
+    let Some(mimi_weights) = common::find_mimi_weights(&model_dir) else {
+        eprintln!(
+            "Skipping: no `tokenizer-*.safetensors` in {}",
+            model_dir.display()
+        );
+        return;
+    };
+
+    let output_dir = common::test_output_dir();
+    let output_wav_8cb = output_dir.join("joke_roundtrip_8cb.wav");
+    let output_wav_32cb = output_dir.join("joke_roundtrip_32cb.wav");
 
     // ── 1. Load Mimi codec ───────────────────────────────────────────
-    println!("Loading Mimi codec from {MIMI_WEIGHTS} ...");
-    let mimi_data = fs::read(MIMI_WEIGHTS).expect("failed to read Mimi weights");
+    println!("Loading Mimi codec from {} ...", mimi_weights.display());
+    let mimi_data = fs::read(&mimi_weights).expect("failed to read Mimi weights");
     let mut mimi = MimiCodec::from_bytes(&mimi_data).expect("failed to load Mimi codec");
     let num_codebooks = mimi.num_codebooks();
     println!(
@@ -232,24 +230,12 @@ fn test_mimi_8codebook_roundtrip() {
     assert_eq!(num_codebooks, 32, "Expected 32 codebooks from Mimi");
 
     // ── 2. Load test WAV ─────────────────────────────────────────────
-    println!("Loading test WAV from {INPUT_WAV} ...");
-    let reader = hound::WavReader::open(INPUT_WAV).expect("failed to open WAV");
-    let spec = reader.spec();
+    println!("Loading test WAV from {} ...", input_wav.display());
+    let (samples, spec) = common::read_wav_mono_f32(&input_wav);
     println!(
         "  WAV spec: {} Hz, {} ch, {} bits, {:?}",
         spec.sample_rate, spec.channels, spec.bits_per_sample, spec.sample_format
     );
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .map(|s| s.unwrap() as f32 / max_val)
-                .collect()
-        }
-        hound::SampleFormat::Float => reader.into_samples::<f32>().map(|s| s.unwrap()).collect(),
-    };
     let duration_s = samples.len() as f64 / spec.sample_rate as f64;
     println!("  Loaded {} samples ({:.3}s)", samples.len(), duration_s);
 
@@ -299,7 +285,11 @@ fn test_mimi_8codebook_roundtrip() {
         let pcm = mimi.decode(frame_tokens);
         output_32cb.extend_from_slice(&pcm);
     }
-    println!("  32cb output: {} samples ({:.3}s)", output_32cb.len(), output_32cb.len() as f64 / 24000.0);
+    println!(
+        "  32cb output: {} samples ({:.3}s)",
+        output_32cb.len(),
+        output_32cb.len() as f64 / 24000.0
+    );
 
     // ── 4b. Decode with ONLY first 8 codebooks ──────────────────────
     println!("Decoding with only first 8 codebooks ...");
@@ -311,7 +301,11 @@ fn test_mimi_8codebook_roundtrip() {
         let pcm = mimi.decode_n(partial_tokens, n_active);
         output_8cb.extend_from_slice(&pcm);
     }
-    println!("  8cb output: {} samples ({:.3}s)", output_8cb.len(), output_8cb.len() as f64 / 24000.0);
+    println!(
+        "  8cb output: {} samples ({:.3}s)",
+        output_8cb.len(),
+        output_8cb.len() as f64 / 24000.0
+    );
 
     // ── 5. Compute signal quality stats ──────────────────────────────
     fn compute_rms(samples: &[f32]) -> f32 {
@@ -322,10 +316,7 @@ fn test_mimi_8codebook_roundtrip() {
     }
 
     fn compute_peak(samples: &[f32]) -> f32 {
-        samples
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0_f32, f32::max)
+        samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max)
     }
 
     let rms_32 = compute_rms(&output_32cb);
@@ -371,36 +362,30 @@ fn test_mimi_8codebook_roundtrip() {
     };
 
     if !output_32cb.is_empty() {
-        let mut writer =
-            hound::WavWriter::create(OUTPUT_WAV_32CB, out_spec).expect("failed to create 32cb WAV");
+        let mut writer = hound::WavWriter::create(&output_wav_32cb, out_spec)
+            .expect("failed to create 32cb WAV");
         for &s in &output_32cb {
             let val = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
             writer.write_sample(val).unwrap();
         }
         writer.finalize().unwrap();
-        println!("32cb roundtrip WAV written to: {OUTPUT_WAV_32CB}");
+        println!("32cb roundtrip WAV written to: {}", output_wav_32cb.display());
     }
 
     if !output_8cb.is_empty() {
-        let mut writer =
-            hound::WavWriter::create(OUTPUT_WAV_8CB, out_spec).expect("failed to create 8cb WAV");
+        let mut writer = hound::WavWriter::create(&output_wav_8cb, out_spec)
+            .expect("failed to create 8cb WAV");
         for &s in &output_8cb {
             let val = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
             writer.write_sample(val).unwrap();
         }
         writer.finalize().unwrap();
-        println!("8cb roundtrip WAV written to: {OUTPUT_WAV_8CB}");
+        println!("8cb roundtrip WAV written to: {}", output_wav_8cb.display());
     }
 
     // ── 7. Assertions ───────────────────────────────────────────────
-    assert!(
-        !output_32cb.is_empty(),
-        "32cb decode produced no audio"
-    );
-    assert!(
-        !output_8cb.is_empty(),
-        "8cb decode produced no audio"
-    );
+    assert!(!output_32cb.is_empty(), "32cb decode produced no audio");
+    assert!(!output_8cb.is_empty(), "8cb decode produced no audio");
 
     // The 8cb output should have non-trivial energy (not silence)
     assert!(

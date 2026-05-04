@@ -36,6 +36,27 @@ node web/serve.mjs
 # 4. Open https://localhost:8443
 ```
 
+## Native CLI (`sts`)
+
+Run the model from a terminal — useful for trying `personaplex-24L-q4_k-webgpu` without a browser, scripting batch inference, or smoke-testing changes against `joke.wav`.
+
+```bash
+# 1. Download the model (~3.8 GB)
+huggingface-cli download idle-intelligence/personaplex-24L-q4_k-webgpu \
+    --local-dir personaplex-24L-q4_k-webgpu
+
+# 2. Build and run (release; first build pulls Burn + cubecl, ~5 min)
+cargo run --release --features "wgpu,cli" --bin sts -- \
+    --model-dir ./personaplex-24L-q4_k-webgpu \
+    --input  my_question.wav \
+    --output response.wav \
+    --voice  NATF2
+```
+
+The CLI loads the sharded GGUF, the Mimi codec safetensors, the SentencePiece tokenizer, and a `.pt` voice preset directly — no Python preprocessing. It runs an end-to-end speech-to-speech turn (voice prefill → system prompt → user audio prefill → response generation → Mimi decode) and writes a 24 kHz mono WAV. The model's inner-monologue text is also printed to stdout.
+
+Requirements: Vulkan (Linux/Windows) or Metal (macOS) — wgpu auto-selects. ~4 GB VRAM. Input WAV must be mono; any sample rate is accepted (resampled to 24 kHz). Other voices: `NATF0..3`, `NATM0..3`, `VARF0..4`, `VARM0..4`. Run `sts --help` for all options (sampling temperatures, max frame count, layer count for non-default checkpoints).
+
 ## Architecture
 
 - `crates/sts-wasm/` — Temporal transformer (32L) + depth transformer (6L × 8 steps) in Burn + wgpu, Q4_K GGUF quantization

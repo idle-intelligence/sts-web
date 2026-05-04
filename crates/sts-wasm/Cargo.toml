@@ -24,7 +24,7 @@ wasm = [
     "console_error_panic_hook",
     "getrandom/wasm_js",
 ]
-cli = ["clap", "indicatif"]
+cli = ["clap", "indicatif", "dep:pollster"]
 hub = ["hf-hub"]
 
 [dependencies]
@@ -50,7 +50,7 @@ async-channel = "2"
 futures-lite = "2"
 
 # Mimi audio codec (Candle-based, runs on CPU)
-mimi-rs = { path = "../../../mimi-rs" }
+mimi-rs = { git = "https://github.com/idle-intelligence/mimi-rs", branch = "main" }
 candle-core = "0.9"
 candle-nn = "0.9"
 safetensors = "0.4"
@@ -58,6 +58,7 @@ safetensors = "0.4"
 # CLI (optional)
 clap = { workspace = true, optional = true }
 indicatif = { workspace = true, optional = true }
+pollster = { version = "0.4", optional = true }
 
 # HuggingFace Hub (optional)
 hf-hub = { workspace = true, optional = true }
@@ -79,3 +80,8 @@ pollster = "0.4"
 [[bench]]
 name = "inference"
 harness = false
+
+[[bin]]
+name = "sts"
+path = "src/bin/sts.rs"
+required-features = ["cli"]

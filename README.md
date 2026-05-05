@@ -8,7 +8,7 @@ Browser-native speech-to-speech running 100% client-side via Rust/WASM + WebGPU.
 
 ## Status
 
-Work in progress. The pipeline runs end-to-end in Chrome/Edge with WebGPU — walkie-talkie mode functional, voice presets available. Audio quality is poor. Generation runs ~3x slower than realtime on consumer GPUs.
+Work in progress. The pipeline runs end-to-end in Chrome/Edge with WebGPU — walkie-talkie mode functional, voice presets available. Audio quality is poor. Native generation runs near realtime on an RTX 3080 (~63 ms/frame, 0.8× realtime); prefill (~3.4 s for the system prompt + a few seconds of user audio) currently dominates time-to-first-frame.
 
 ```
 Microphone → AudioWorklet (24kHz mono) → Mimi encoder (WASM) → Temporal transformer (WASM/WebGPU) → Depth transformer (WASM/WebGPU) → Mimi decoder (WASM) → AudioWorklet playback

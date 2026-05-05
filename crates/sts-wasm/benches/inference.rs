@@ -4,8 +4,7 @@
 //! Requires model weights on disk — skips gracefully if not found.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -19,42 +18,97 @@ use sts_wasm::model::TemporalTransformer;
 use sts_wasm::stream::StsStream;
 use sts_wasm::StsConfig;
 
-fn model_dir() -> PathBuf {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        PathBuf::from(
-            std::env::var("STS_MODEL_PATH").unwrap_or_else(|_| {
-                "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_k-webgpu".to_string()
-            }),
-        )
+fn workspace_root() -> PathBuf {
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.pop(); // out of crates/sts-wasm
+    d.pop(); // out of crates
+    d
+}
+
+fn model_dir() -> Option<PathBuf> {
+    let p = workspace_root().join("assets/model");
+    if p.is_dir() {
+        Some(p)
+    } else {
+        eprintln!(
+            "Benchmark skipped: {} is not a directory (symlink it to a personaplex model checkout)",
+            p.display()
+        );
+        None
+    }
+}
+
+fn num_layers() -> usize {
+    let cfg_path = workspace_root().join("assets/model/config.json");
+    if let Ok(s) = fs::read_to_string(&cfg_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            if let Some(n) = v
+                .get("architecture")
+                .and_then(|a| a.get("temporal_transformer"))
+                .and_then(|t| t.get("layers"))
+                .and_then(|l| l.as_u64())
+            {
+                return n as usize;
+            }
+        }
+    }
+    32
+}
+
+fn audio_wav() -> Option<PathBuf> {
+    let p = workspace_root().join("assets/audio/joke.wav");
+    if p.is_file() {
+        Some(p)
+    } else {
+        eprintln!(
+            "Benchmark skipped: {} is not a file (symlink it to a mono test WAV)",
+            p.display()
+        );
+        None
+    }
+}
+
+fn find_mimi_weights(model_dir: &std::path::Path) -> Option<PathBuf> {
+    fs::read_dir(model_dir).ok()?.flatten().find_map(|e| {
+        let n = e.file_name().to_string_lossy().to_string();
+        (n.starts_with("tokenizer-") && n.ends_with(".safetensors")).then(|| e.path())
     })
-    .clone()
+}
+
+fn load_shards(model_dir: &std::path::Path) -> Vec<Vec<u8>> {
+    for dir in [model_dir.join("shards"), model_dir.to_path_buf()] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains("shard-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !paths.is_empty() {
+            paths.sort();
+            return paths.iter().map(|p| fs::read(p).unwrap()).collect();
+        }
+    }
+    panic!("no GGUF shards found in {}", model_dir.display())
 }
 
 fn load_model() -> Option<(TemporalTransformer, DepthTransformer, StsConfig)> {
-    let dir = model_dir();
-    if !dir.exists() {
-        eprintln!(
-            "Benchmark skipped: model weights not found at {}",
-            dir.display()
-        );
-        return None;
-    }
+    let dir = model_dir()?;
 
     let device = WgpuDevice::default();
-    let config = StsConfig::default();
+    let config = StsConfig {
+        num_layers: num_layers(),
+        ..StsConfig::default()
+    };
 
-    let mut shard_files: Vec<_> = fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_str().unwrap_or("").contains("shard-"))
-        .collect();
-    shard_files.sort_by_key(|e| e.file_name());
-    let shards: Vec<Vec<u8>> = shard_files
-        .iter()
-        .map(|sf| fs::read(sf.path()).unwrap())
-        .collect();
-
+    let shards = load_shards(&dir);
     let mut loader = Q4ModelLoader::from_shards(shards).unwrap();
     let parts = load_sts_model_deferred(&mut loader, &config, &device).unwrap();
     drop(loader);
@@ -64,20 +118,15 @@ fn load_model() -> Option<(TemporalTransformer, DepthTransformer, StsConfig)> {
 }
 
 fn encode_user_audio(config: &StsConfig) -> Option<Vec<Vec<u32>>> {
-    let wav_path = Path::new("/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke.wav");
-    if !wav_path.exists() {
-        return None;
-    }
-    let mimi_path = model_dir().join("tokenizer-e351c8d8-checkpoint125.safetensors");
-    if !mimi_path.exists() {
-        return None;
-    }
+    let wav_path = audio_wav()?;
+    let dir = model_dir()?;
+    let mimi_path = find_mimi_weights(&dir)?;
 
     let mimi_data = fs::read(&mimi_path).unwrap();
     let mut mimi = MimiCodec::from_bytes(&mimi_data).unwrap();
     mimi.reset();
 
-    let reader = hound::WavReader::open(wav_path).unwrap();
+    let reader = hound::WavReader::open(&wav_path).unwrap();
     let spec = reader.spec();
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {

@@ -2891,17 +2891,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimi-rs"
-version = "0.1.0"
-source = "git+https://github.com/idle-intelligence/mimi-rs?branch=main#519ba1dfb7e908253f87716812cdb852db3e013b"
-dependencies = [
- "candle-core",
- "candle-nn",
- "half",
- "safetensors 0.4.5",
-]
-
-[[package]]
 name = "mimi-wasm"
 version = "0.1.0"
 dependencies = [
@@ -2910,7 +2899,7 @@ dependencies = [
  "console_error_panic_hook",
  "getrandom 0.3.4",
  "js-sys",
- "mimi-rs 0.1.0",
+ "mimi-rs",
  "safetensors 0.4.5",
  "wasm-bindgen",
  "web-sys",
@@ -4060,7 +4049,7 @@ dependencies = [
  "hound",
  "indicatif 0.18.4",
  "js-sys",
- "mimi-rs 0.1.0 (git+https://github.com/idle-intelligence/mimi-rs?branch=main)",
+ "mimi-rs",
  "pollster",
  "safetensors 0.4.5",
  "serde",

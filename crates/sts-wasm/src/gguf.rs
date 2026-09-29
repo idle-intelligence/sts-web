@@ -97,6 +97,23 @@ pub fn reverse_gguf_dims(gguf_dims: &[u64]) -> Vec<usize> {
     gguf_dims.iter().rev().map(|&d| d as usize).collect()
 }
 
+/// Detect how many `{prefix}{N}.` layers are actually present among a set of
+/// tensor names, by scanning for the largest `N` and returning `N + 1`.
+///
+/// Used instead of a hardcoded layer count so pruned models (e.g. a 24-layer
+/// GGUF cut down from an unpruned 32-layer checkpoint) load correctly: the
+/// layer count comes from the tensors that were actually shipped, not from
+/// the config default of the original unpruned model.
+pub fn detect_layer_count(tensors: &HashMap<String, GgufTensorInfo>, prefix: &str) -> Option<usize> {
+    tensors
+        .keys()
+        .filter_map(|name| name.strip_prefix(prefix))
+        .filter_map(|rest| rest.split('.').next())
+        .filter_map(|idx_str| idx_str.parse::<usize>().ok())
+        .max()
+        .map(|max_idx| max_idx + 1)
+}
+
 // ---------------------------------------------------------------------------
 // GGUF String / Value helpers
 // ---------------------------------------------------------------------------
@@ -310,6 +327,10 @@ impl<R: Read + Seek> GgufReader<R> {
 
     pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.tensors.get(name)
+    }
+
+    pub fn tensors(&self) -> &HashMap<String, GgufTensorInfo> {
+        &self.tensors
     }
 
     pub fn tensor_data(&mut self, name: &str) -> Result<Vec<u8>> {
@@ -1783,6 +1804,10 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 
     pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.reader.tensor_info(name)
+    }
+
+    pub fn tensors(&self) -> &HashMap<String, GgufTensorInfo> {
+        self.reader.tensors()
     }
 
     pub fn tensor_data(&mut self, name: &str) -> Result<Vec<u8>> {

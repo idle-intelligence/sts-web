@@ -45,8 +45,8 @@ use crate::depth::{
     DepthTransformer, DepthTransformerBlock, MultiLinearAttention, MultiLinearFeedForward,
 };
 use crate::gguf::{
-    f16_to_f32, reverse_gguf_dims, EmbeddingStore, GgmlDtype, GgufTensorIndex, GgufTensorInfo,
-    Linear, Q4KLinear, Q4KTensor, Q4Linear, Q4ModelLoader, Q4Tensor, DenseLinear,
+    detect_layer_count, f16_to_f32, reverse_gguf_dims, EmbeddingStore, GgmlDtype, GgufTensorIndex,
+    GgufTensorInfo, Linear, Q4KLinear, Q4KTensor, Q4Linear, Q4ModelLoader, Q4Tensor, DenseLinear,
 };
 use crate::model::{
     Q4Attention, Q4FeedForward, Q4TransformerBlock, RoPE, RmsNormLayer, TemporalTransformer,
@@ -175,6 +175,17 @@ pub fn load_sts_model_deferred<R: Read + Seek>(
         tensors = loader.tensor_count(),
         "Loading Q4 STS model from GGUF (deferred)"
     );
+
+    // Layer counts come from the tensors actually present in this GGUF, not
+    // from the config default (which reflects the original unpruned model).
+    let mut config = config.clone();
+    if let Some(n) = detect_layer_count(loader.tensors(), "transformer.layers.") {
+        config.num_layers = n;
+    }
+    if let Some(n) = detect_layer_count(loader.tensors(), "depformer.layers.") {
+        config.depth_num_layers = n;
+    }
+    let config = &config;
 
     // -----------------------------------------------------------------------
     // Temporal transformer layers
@@ -479,7 +490,16 @@ pub struct IncrementalModelLoader {
 }
 
 impl IncrementalModelLoader {
-    pub fn new(index: GgufTensorIndex, config: StsConfig, device: WgpuDevice) -> Self {
+    pub fn new(index: GgufTensorIndex, mut config: StsConfig, device: WgpuDevice) -> Self {
+        // Layer counts come from the tensors actually present in this GGUF,
+        // not from the config default (which reflects the original unpruned
+        // model) — a pruned checkpoint has fewer layers than the default.
+        if let Some(n) = detect_layer_count(&index.tensors, "transformer.layers.") {
+            config.num_layers = n;
+        }
+        if let Some(n) = detect_layer_count(&index.tensors, "depformer.layers.") {
+            config.depth_num_layers = n;
+        }
         Self {
             index,
             config,

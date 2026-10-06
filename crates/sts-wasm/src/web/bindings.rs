@@ -501,8 +501,8 @@ impl StsEngine {
             return Err(JsError::new("Embeddings size must be multiple of 4"));
         }
         let embeddings: Vec<f32> = embeddings_bin
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
 
         let expected = num_frames * self.config.hidden_size;

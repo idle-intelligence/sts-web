@@ -197,6 +197,7 @@ pub struct StsStream {
 
     // Text-based stopping: stop if text has been padding for N frames after real text
     consecutive_text_pad_frames: usize,
+    #[allow(dead_code)] // threshold is compared by the caller against consecutive_text_pad_frames()
     text_pad_stop_frames: usize,
     has_generated_text: bool,
 
@@ -1169,10 +1170,10 @@ mod tests {
         let mut cache_snapshot: Vec<Vec<i32>> = Vec::new();
         for s in 0..17 {
             cache_snapshot.push(vec![
-                (s * 100) as i32,       // pos 0
-                (s * 100 + 1) as i32,   // pos 1
-                (s * 100 + 2) as i32,   // pos 2
-                (s * 100 + 3) as i32,   // pos 3
+                s * 100,       // pos 0
+                s * 100 + 1,   // pos 1
+                s * 100 + 2,   // pos 2
+                s * 100 + 3,   // pos 3
             ]);
         }
 

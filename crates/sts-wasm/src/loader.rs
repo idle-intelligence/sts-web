@@ -694,11 +694,11 @@ impl IncrementalModelLoader {
         let num_elements = info.num_elements();
         let data: Vec<f32> = match info.dtype() {
             GgmlDtype::F32 => bytes
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),
             GgmlDtype::F16 => bytes
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
                 .collect(),
             other => bail!("Unsupported dtype {:?} for norm tensor '{}'", other, info.name),
@@ -731,11 +731,11 @@ impl IncrementalModelLoader {
                 let cols = shape[1];
                 let data: Vec<f32> = match info.dtype() {
                     GgmlDtype::F32 => bytes
-                        .chunks_exact(4)
+                        .as_chunks::<4>().0.iter()
                         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                         .collect(),
                     GgmlDtype::F16 => bytes
-                        .chunks_exact(2)
+                        .as_chunks::<2>().0.iter()
                         .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
                         .collect(),
                     _ => unreachable!(),

@@ -457,8 +457,8 @@ fn test_end_to_end_audio() {
         let emb_bytes = fs::read(&voice_preset_path).unwrap();
         assert_eq!(emb_bytes.len() % 4, 0, "Embeddings file size must be multiple of 4");
         let embeddings: Vec<f32> = emb_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>().0.iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
 
         let cache_json: serde_json::Value =
@@ -638,13 +638,14 @@ fn test_end_to_end_audio() {
     // Print first/last few response audio token frames
     if response_frame_count > 0 {
         println!("  First 5 response audio frames:");
-        for i in 0..5.min(response_frame_count) {
-            println!("    frame {i}: {:?}", all_model_audio_tokens[i]);
+        for (i, frame) in all_model_audio_tokens.iter().enumerate().take(5.min(response_frame_count)) {
+            println!("    frame {i}: {frame:?}");
         }
         if response_frame_count > 5 {
             println!("  Last 5 response audio frames:");
-            for i in (response_frame_count.saturating_sub(5))..response_frame_count {
-                println!("    frame {i}: {:?}", all_model_audio_tokens[i]);
+            let start = response_frame_count.saturating_sub(5);
+            for (i, frame) in all_model_audio_tokens.iter().enumerate().skip(start).take(response_frame_count - start) {
+                println!("    frame {i}: {frame:?}");
             }
         }
     }

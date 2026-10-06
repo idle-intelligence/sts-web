@@ -183,6 +183,7 @@ pub struct DepthEngine {
     rmsnorm_pipeline: wgpu::ComputePipeline,
     attention_pipeline: wgpu::ComputePipeline,
     embed_q4_pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)] // built but not read on every target/feature combo
     argmax_pipeline: wgpu::ComputePipeline,
     swiglu_pipeline: wgpu::ComputePipeline,
     vec_add_pipeline: wgpu::ComputePipeline,
@@ -299,6 +300,7 @@ pub struct DepthEngine {
     info_embed: Vec<wgpu::Buffer>,
 
     /// Per-step argmax info: [vocab_size].
+    #[allow(dead_code)] // built but not read on every target/feature combo
     info_argmax: Vec<wgpu::Buffer>,
 
     /// Combined penalty token buffer: 8 steps × 256 bytes (256-byte aligned slots).
@@ -1481,8 +1483,8 @@ impl DepthEngine {
 
         let data = slice.get_mapped_range();
         let tokens: Vec<u32> = data
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>().0.iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         drop(data);
         self.staging_buf.unmap();

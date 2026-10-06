@@ -1679,7 +1679,7 @@ mod tests {
     fn test_pseudo_random_range() {
         for _ in 0..100 {
             let r = pseudo_random();
-            assert!(r >= 0.0 && r < 1.0, "out of range: {r}");
+            assert!((0.0..1.0).contains(&r), "out of range: {r}");
         }
     }
 }

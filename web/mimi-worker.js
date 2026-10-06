@@ -39,6 +39,10 @@
  *   inferencePort  -- MessagePort from inference worker (decode commands)
  */
 
+// Bumped by scripts/build.sh on every deploy so browsers don't keep running a
+// cached pkg/worker from an older build.
+const ENGINE_BUILD = "dev";
+
 let mimiWasm = null;
 let mimiEngine = null;
 let playbackPort = null;
@@ -118,8 +122,8 @@ self.onmessage = async (e) => {
     try {
         switch (type) {
             case 'load': {
-                const wasmJsUrl = data.url || new URL('../mimi-pkg/mimi_wasm.js', import.meta.url).href;
-                const wasmBgUrl = wasmJsUrl.replace(/\.js$/, '_bg.wasm');
+                const wasmJsUrl = (data.url || new URL('../mimi-pkg/mimi_wasm.js', import.meta.url).href) + `?v=${ENGINE_BUILD}`;
+                const wasmBgUrl = wasmJsUrl.replace(/\.js\?/, '_bg.wasm?');
                 logState(`Loading Mimi WASM from ${wasmJsUrl}`);
                 self.postMessage({ type: 'status', text: 'Loading Mimi WASM module...' });
                 wasmInitPromise = (async () => {

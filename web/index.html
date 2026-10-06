@@ -635,7 +635,7 @@
         // --- Worker setup ---
 
         function initMimiWorker() {
-            mimiWorker = new Worker('./mimi-worker.js', { type: 'module' });
+            mimiWorker = new Worker(`./mimi-worker.js?v=${ENGINE_BUILD}`, { type: 'module' });
             mimiWorker.onerror = (e) => {
                 console.error('[mimi-worker error]', e);
                 updateStatus('error', `Mimi worker error: ${e.message}`);
@@ -739,7 +739,7 @@
         }
 
         function initWorker() {
-            worker = new Worker('./worker.js', { type: 'module' });
+            worker = new Worker(`./worker.js?v=${ENGINE_BUILD}`, { type: 'module' });
             worker.onerror = (e) => {
                 console.error('[worker error]', e);
                 updateStatus('error', `Worker error: ${e.message}`);
@@ -897,6 +897,10 @@
         }
 
         // --- Init ---
+
+        // Bumped by scripts/build.sh on every deploy so browsers don't keep
+        // running a cached worker/pkg from an older build.
+        const ENGINE_BUILD = "dev";
 
         const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
         const MIMI_URL = `${HF_BASE}/tokenizer-e351c8d8-checkpoint125.safetensors`;

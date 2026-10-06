@@ -1,0 +1,61 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Test (native; GPU-backed tests need Metal/Vulkan, run on the box instead)
+        run: cargo test --workspace --no-default-features --features wgpu,cli
+
+      - name: Clippy (native, wgpu + cli)
+        run: cargo clippy --workspace --all-targets --no-default-features --features wgpu,cli -- -D warnings
+
+      - name: Clippy (wasm32, browser feature set)
+        run: cargo clippy -p sts-wasm --lib --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
+
+      - name: Build sts-wasm + mimi-wasm and assemble the site
+        run: ENGINE_BUILD="${{ github.sha }}" scripts/build.sh
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

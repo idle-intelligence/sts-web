@@ -46,6 +46,10 @@
  *   mimiWorkerPort -- MessagePort to Mimi worker for offloaded decode
  */
 
+// Bumped by scripts/build.sh on every deploy so browsers don't keep running a
+// cached pkg/worker from an older build.
+const ENGINE_BUILD = "dev";
+
 const HF_BASE = '/hf/personaplex-7b-v1-q4_k-webgpu';
 
 let engine = null;
@@ -239,8 +243,8 @@ async function handleLoad(config) {
 
     // 1. Import WASM module.
     self.postMessage({ type: 'status', text: 'Loading WASM module...' });
-    const wasmJsUrl = base ? (base + '/pkg/sts_wasm.js') : new URL('../pkg/sts_wasm.js', import.meta.url).href;
-    const wasmBgUrl = base ? (base + '/pkg/sts_wasm_bg.wasm') : new URL('../pkg/sts_wasm_bg.wasm', import.meta.url).href;
+    const wasmJsUrl = (base ? (base + '/pkg/sts_wasm.js') : new URL('../pkg/sts_wasm.js', import.meta.url).href) + `?v=${ENGINE_BUILD}`;
+    const wasmBgUrl = (base ? (base + '/pkg/sts_wasm_bg.wasm') : new URL('../pkg/sts_wasm_bg.wasm', import.meta.url).href) + `?v=${ENGINE_BUILD}`;
     stsWasm = await import(wasmJsUrl);
     await stsWasm.default(wasmBgUrl);
 

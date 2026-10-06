@@ -49,6 +49,7 @@ Quantization strategy:
 
 import argparse
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -638,13 +639,13 @@ def main():
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1"),
+        default=Path(os.environ.get("MODELS_DIR", "../hf")) / "personaplex-7b-v1",
         help="Directory containing model.safetensors",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_k-webgpu"),
+        default=Path(os.environ.get("MODELS_DIR", "../hf")) / "personaplex-7b-v1-q4_k-webgpu",
         help="Output directory for quantized GGUF files",
     )
     parser.add_argument(

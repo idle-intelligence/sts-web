@@ -19,7 +19,7 @@ sys.path.insert(0, "refs/moshi/moshi")
 import torch
 from moshi.models import loaders
 
-MODEL_PATH = "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1/model.safetensors"
+MODEL_PATH = os.path.join(os.environ.get("MODELS_DIR", "../hf"), "personaplex-7b-v1/model.safetensors")
 RUST_LOG_PATH = "tests/reference/q4_layer_log.json"
 
 PERSONAPLEX_LM_KWARGS = dict(loaders._lm_kwargs)

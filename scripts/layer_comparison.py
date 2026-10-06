@@ -8,10 +8,11 @@ with the Q4 quantized Rust implementation.
 Output: tests/reference/bf16_layer_log.json
 
 Usage:
-    cd /Users/tc/Code/idle-intelligence/sts-web
+    cd sts-web
     .venv/bin/python scripts/layer_comparison.py
 """
 
+import os
 import sys
 import json
 
@@ -22,8 +23,8 @@ if sys.version_info >= (3, 14):
 
 from pathlib import Path
 
-MODEL_PATH = Path("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1/model.safetensors")
-OUTPUT_PATH = Path("/Users/tc/Code/idle-intelligence/sts-web/tests/reference/bf16_layer_log.json")
+MODEL_PATH = Path(os.environ.get("MODELS_DIR", "../hf")) / "personaplex-7b-v1/model.safetensors"
+OUTPUT_PATH = Path(__file__).resolve().parent.parent / "tests/reference/bf16_layer_log.json"
 
 
 def tensor_stats(t: torch.Tensor) -> dict:

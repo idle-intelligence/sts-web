@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inspect a GGUF file: list all tensors with their types and sizes."""
 
+import os
 import struct
 import sys
 from pathlib import Path
@@ -105,5 +106,5 @@ def inspect_gguf(path):
             print(f"  {type_name:6s} [{dims_str:>20s}] {size_mb:8.2f} MB  {name}")
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_k/model-q4_k.gguf"
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("MODELS_DIR", "../hf"), "personaplex-7b-v1-q4_k/model-q4_k.gguf")
     inspect_gguf(path)

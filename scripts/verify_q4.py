@@ -5,6 +5,7 @@ Dequantizes Q4_0 blocks and computes error metrics vs the BF16 originals.
 No PyTorch needed — uses numpy + safetensors only.
 """
 
+import os
 import struct
 import numpy as np
 from safetensors import safe_open
@@ -102,8 +103,8 @@ def bf16_to_f32(bf16_bytes):
 
 
 def main():
-    orig_path = "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1/model.safetensors"
-    gguf_dir = Path("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_0-webgpu")
+    orig_path = os.path.join(os.environ.get("MODELS_DIR", "../hf"), "personaplex-7b-v1/model.safetensors")
+    gguf_dir = Path(os.environ.get("MODELS_DIR", "../hf")) / "personaplex-7b-v1-q4_0-webgpu"
 
     # Find GGUF shards
     shard_paths = sorted(gguf_dir.glob("*.shard-*"))

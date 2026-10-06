@@ -17,10 +17,10 @@ if sys.version_info >= (3, 14):
 
 from pathlib import Path
 
-MODEL_PATH = Path("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1/model.safetensors")
-MIMI_PATH = Path("/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_0-webgpu/tokenizer-e351c8d8-checkpoint125.safetensors")
-WAV_PATH = Path("/Users/tc/Code/idle-intelligence/sts-web/tests/reference/joke.wav")
-OUTPUT_DIR = Path("/Users/tc/Code/idle-intelligence/sts-web/tests/reference")
+MODEL_PATH = Path(os.environ.get("MODELS_DIR", "../hf")) / "personaplex-7b-v1/model.safetensors"
+MIMI_PATH = Path(os.environ.get("MODELS_DIR", "../hf")) / "personaplex-7b-v1-q4_0-webgpu/tokenizer-e351c8d8-checkpoint125.safetensors"
+WAV_PATH = Path(__file__).resolve().parent.parent / "tests/reference/joke.wav"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "tests/reference"
 
 def load_wav(path):
     """Load WAV file as float32 numpy array."""

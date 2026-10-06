@@ -20,7 +20,7 @@ sys.path.insert(0, "refs/moshi/moshi")
 import torch
 from moshi.models import loaders
 
-MODEL_DIR = "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1"
+MODEL_DIR = os.path.join(os.environ.get("MODELS_DIR", "../hf"), "personaplex-7b-v1")
 MODEL_PATH = os.path.join(MODEL_DIR, "model.safetensors")
 MIMI_PATH = os.path.join(MODEL_DIR, "tokenizer-e351c8d8-checkpoint125.safetensors")
 OUTPUT_PATH = "tests/reference/python_forward_log.json"

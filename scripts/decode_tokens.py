@@ -44,7 +44,7 @@ def main():
     print(f"Codes tensor shape: {codes.shape}")
 
     # Load Mimi model
-    mimi_path = "/Users/tc/Code/idle-intelligence/hf/personaplex-7b-v1-q4_k-webgpu/tokenizer-e351c8d8-checkpoint125.safetensors"
+    mimi_path = os.path.join(os.environ.get("MODELS_DIR", "../hf"), "personaplex-7b-v1-q4_k-webgpu/tokenizer-e351c8d8-checkpoint125.safetensors")
     print(f"Loading Mimi from {mimi_path}...")
 
     from moshi.models import loaders

@@ -118,9 +118,10 @@ mod tests {
     }
 
     fn voice_pt_path() -> Option<PathBuf> {
-        // The .pt fixtures ship with the model (not the repo). Try the well-known
-        // local mirror; skip the test if unavailable.
-        let p = PathBuf::from("/data/Code/claude/hf/personaplex-24L-q4_k-webgpu/voices/NATF2.pt");
+        // The .pt fixtures ship with the model (not the repo): look under
+        // $MODELS_DIR (default "models"); skip the test if unavailable.
+        let models = std::env::var("MODELS_DIR").unwrap_or_else(|_| "models".into());
+        let p = PathBuf::from(models).join("hf/personaplex-24L-q4_k-webgpu/voices/NATF2.pt");
         if p.exists() {
             Some(p)
         } else {

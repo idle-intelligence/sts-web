@@ -20,10 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
 
       - uses: Swatinem/rust-cache@v2
 

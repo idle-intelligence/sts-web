@@ -75,7 +75,11 @@ wgpu = { workspace = true, optional = true }
 [dev-dependencies]
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
-pollster = "0.4"
+# Pinned to the exact versions already in Cargo.lock: probes for a wgpu
+# adapter in model.rs/depth.rs tests so the GPU tests skip where there is
+# none (CI runners), without pulling in any new versions.
+pollster = "=0.4.0"
+wgpu = "=26.0.1"
 
 [[bench]]
 name = "inference"

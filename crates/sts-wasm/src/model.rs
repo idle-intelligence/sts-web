@@ -1419,14 +1419,36 @@ pub(crate) fn pseudo_random() -> f32 {
 mod tests {
     use super::*;
 
-    fn test_device() -> WgpuDevice {
-        WgpuDevice::default()
+    // Burn/cubecl panics inside the wgpu runtime when there is no adapter
+    // (CI runners have no GPU), so probe for one with wgpu directly before
+    // touching anything Burn-related. cubecl's AutoGraphicsApi only ever
+    // tries the platform's primary backend (Vulkan/Metal/Dx12/WebGPU, never
+    // the GL software fallback), so the probe is restricted to PRIMARY too —
+    // otherwise a GL-only software adapter would make this probe see a GPU
+    // that cubecl itself cannot reach, and the panic below would still fire.
+    fn has_wgpu_adapter() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        pollster::block_on(instance.request_adapter(&Default::default())).is_ok()
+    }
+
+    fn test_device() -> Option<WgpuDevice> {
+        if has_wgpu_adapter() {
+            Some(WgpuDevice::default())
+        } else {
+            None
+        }
     }
 
     #[test]
     fn test_rope_shape() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let rope = RoPE::new(128, 100, 10000.0, &device);
 
             // Create dummy Q, K: [1, 5, 4, 128]
@@ -1442,8 +1464,11 @@ mod tests {
 
     #[test]
     fn test_rope_offset() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let rope = RoPE::new(128, 100, 10000.0, &device);
 
             let q = Tensor::<Wgpu, 4>::zeros([1, 1, 4, 128], &device);
@@ -1458,8 +1483,11 @@ mod tests {
 
     #[test]
     fn test_kv_cache_ring_buffer() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let mut cache = KVCache::new(4, 2, 8, &device);
 
             assert_eq!(cache.seq_len(), 0);
@@ -1496,8 +1524,11 @@ mod tests {
 
     #[test]
     fn test_kv_cache_reset() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let mut cache = KVCache::new(4, 2, 8, &device);
 
             let k = Tensor::<Wgpu, 4>::ones([1, 2, 1, 8], &device);
@@ -1512,8 +1543,11 @@ mod tests {
 
     #[test]
     fn test_kv_cache_reset_keep_buffers() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let mut cache = KVCache::new(4, 2, 8, &device);
 
             let k = Tensor::<Wgpu, 4>::ones([1, 2, 1, 8], &device);
@@ -1531,8 +1565,11 @@ mod tests {
 
     #[test]
     fn test_layer_caches() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let mut caches = LayerCaches::new(3, 10, 2, 8, &device);
 
             assert_eq!(caches.seq_len(), 0);
@@ -1553,8 +1590,11 @@ mod tests {
 
     #[test]
     fn test_rms_norm_shape() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let alpha = Tensor::<Wgpu, 1>::ones([64], &device);
             let norm = RmsNormLayer::new(alpha, 1e-5);
 
@@ -1567,8 +1607,11 @@ mod tests {
 
     #[test]
     fn test_rms_norm_unit() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let alpha = Tensor::<Wgpu, 1>::ones([4], &device);
             let norm = RmsNormLayer::new(alpha, 1e-8);
 
@@ -1591,8 +1634,11 @@ mod tests {
 
     #[test]
     fn test_sample_greedy() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             // Logits where idx 3 is highest
             let mut data = vec![-10.0f32; 10];
             data[3] = 100.0;
@@ -1607,8 +1653,11 @@ mod tests {
 
     #[test]
     fn test_sample_top_k_returns_valid_token() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             let mut data = vec![0.0f32; 100];
             data[42] = 50.0;
             let logits = Tensor::<Wgpu, 3>::from_data(
@@ -1623,8 +1672,11 @@ mod tests {
 
     #[test]
     fn test_sample_top_k_with_penalty_suppresses_repeated() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             // Token 42 has the highest logit, but if it's in the penalty history
             // its logit should be divided by the penalty factor, potentially
             // allowing token 10 (second-highest) to win.
@@ -1651,8 +1703,11 @@ mod tests {
 
     #[test]
     fn test_sample_top_k_with_penalty_negative_logits() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
             // For negative logits, penalty multiplies (makes more negative)
             let mut data = vec![-10.0f32; 50];
             data[5] = -1.0; // least negative = highest

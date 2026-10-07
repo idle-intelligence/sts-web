@@ -1066,15 +1066,37 @@ pub struct TokenLogit {
 mod tests {
     use super::*;
 
-    fn test_device() -> WgpuDevice {
-        WgpuDevice::default()
+    // Burn/cubecl panics inside the wgpu runtime when there is no adapter
+    // (CI runners have no GPU), so probe for one with wgpu directly before
+    // touching anything Burn-related. cubecl's AutoGraphicsApi only ever
+    // tries the platform's primary backend (Vulkan/Metal/Dx12/WebGPU, never
+    // the GL software fallback), so the probe is restricted to PRIMARY too —
+    // otherwise a GL-only software adapter would make this probe see a GPU
+    // that cubecl itself cannot reach, and the panic below would still fire.
+    fn has_wgpu_adapter() -> bool {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        pollster::block_on(instance.request_adapter(&Default::default())).is_ok()
+    }
+
+    fn test_device() -> Option<WgpuDevice> {
+        if has_wgpu_adapter() {
+            Some(WgpuDevice::default())
+        } else {
+            None
+        }
     }
 
     #[test]
     fn test_depth_cache_creation() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
             let config = StsConfig::default();
-            let device = test_device();
             let head_dim = config.depth_hidden_size / config.depth_num_heads;
             let caches = LayerCaches::new(
                 config.depth_num_layers,
@@ -1090,9 +1112,11 @@ mod tests {
 
     #[test]
     fn test_multi_linear_ffn_step_selection() {
+        let Some(device) = test_device() else {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        };
         pollster::block_on(async {
-            let device = test_device();
-
             // We can't easily create Q4Linear without GGUF data, but we can
             // verify the structure compiles and the per-step logic is sound.
             // This test verifies cache isolation between depth steps.

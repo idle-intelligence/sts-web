@@ -47,7 +47,7 @@ rm -rf _site
 mkdir -p _site/pkg _site/mimi-pkg _site/web
 cp crates/sts-wasm/pkg/sts_wasm.js crates/sts-wasm/pkg/sts_wasm_bg.wasm _site/pkg/
 cp crates/mimi-wasm/pkg/mimi_wasm.js crates/mimi-wasm/pkg/mimi_wasm_bg.wasm _site/mimi-pkg/
-cp web/index.html web/worker.js web/mimi-worker.js web/audio-playback.js web/audio-processor.js _site/web/
+cp web/index.html web/worker.js web/mimi-worker.js web/audio-playback.js web/audio-processor.js web/joke.wav _site/web/
 
 # --- Rewrite the ENGINE_BUILD tag on every loading URL ---
 echo "==> Rewriting ENGINE_BUILD tag to $ENGINE_BUILD"

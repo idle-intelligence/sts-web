@@ -21,13 +21,24 @@ HF_PROD_BASE="https://huggingface.co/idle-intelligence/personaplex-24L-q4_k-webg
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# RUSTFLAGS as an env var REPLACES .cargo/config.toml's target rustflags
+# instead of adding to it, silently dropping +simd128. --config merges with
+# the config file's rustflags array, so the remap flag goes in through that
+# instead.
+REMAP_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
+
 echo "==> Building sts-wasm (wasm feature) for ENGINE_BUILD=$ENGINE_BUILD"
-RUSTFLAGS="--remap-path-prefix=$HOME=/home" \
-  wasm-pack build crates/sts-wasm --target web --release --no-default-features --features wasm
+# No "--" before --config: wasm-pack 0.14's extra-args parser mishandles the
+# "--features <name> -- <extra>" combination (the "--" and everything after
+# it get swallowed into --features's value list), so --config never reaches
+# cargo. Passing --config straight after --features works and still reaches
+# cargo build as an extra option.
+wasm-pack build crates/sts-wasm --target web --release --no-default-features --features wasm \
+  --config "$REMAP_CONFIG"
 
 echo "==> Building mimi-wasm"
-RUSTFLAGS="--remap-path-prefix=$HOME=/home" \
-  wasm-pack build crates/mimi-wasm --target web --release
+wasm-pack build crates/mimi-wasm --target web --release \
+  --config "$REMAP_CONFIG"
 
 # --- Local-path / user-name leak check on built wasm outputs ---
 for WASM in crates/sts-wasm/pkg/sts_wasm_bg.wasm crates/mimi-wasm/pkg/mimi_wasm_bg.wasm; do

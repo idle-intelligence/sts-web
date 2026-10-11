@@ -90,4 +90,8 @@ if grep -q '/hf/personaplex-7b-v1-q4_k-webgpu' _site/web/index.html _site/web/wo
     exit 1
 fi
 
+# --- Target features: every wasm keeps SIMD ---
+echo "==> Checking wasm target features"
+python3 scripts/check_wasm_features.py crates/sts-wasm/pkg/sts_wasm_bg.wasm +simd128 -- crates/mimi-wasm/pkg/mimi_wasm_bg.wasm +simd128
+
 echo "==> Wrote _site"

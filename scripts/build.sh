@@ -21,11 +21,18 @@ HF_PROD_BASE="https://huggingface.co/idle-intelligence/personaplex-24L-q4_k-webg
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# RUSTFLAGS as an env var REPLACES .cargo/config.toml's target rustflags
-# instead of adding to it, silently dropping +simd128. --config merges with
-# the config file's rustflags array, so the remap flag goes in through that
-# instead.
-REMAP_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
+# Per-target flags (+simd128) live in .cargo/config.toml. Only the
+# machine-dependent --remap-path-prefix flags are passed inline, so
+# compiled-in source paths carry no home directory. They go in with
+# --config, which merges with the config file (RUSTFLAGS would replace it
+# and drop +simd128). The cfg(all()) key puts them after any user-level
+# cfg(all()) remap, so they win (rustc applies the last matching remap);
+# with --target they still apply only to the wasm, not to host build
+# scripts.
+# This moves to `trim-paths = "all"` in the release profile once cargo
+# stabilizes it.
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+REMAP="target.'cfg(all())'.rustflags=[\"--remap-path-prefix=$HOME=/home\", \"--remap-path-prefix=$CARGO_HOME_DIR=/cargo\"]"
 
 echo "==> Building sts-wasm (wasm feature) for ENGINE_BUILD=$ENGINE_BUILD"
 # No "--" before --config: wasm-pack 0.14's extra-args parser mishandles the
@@ -34,11 +41,11 @@ echo "==> Building sts-wasm (wasm feature) for ENGINE_BUILD=$ENGINE_BUILD"
 # cargo. Passing --config straight after --features works and still reaches
 # cargo build as an extra option.
 wasm-pack build crates/sts-wasm --target web --release --no-default-features --features wasm \
-  --config "$REMAP_CONFIG"
+  --config "$REMAP"
 
 echo "==> Building mimi-wasm"
 wasm-pack build crates/mimi-wasm --target web --release \
-  --config "$REMAP_CONFIG"
+  --config "$REMAP"
 
 # --- Local-path / user-name leak check on built wasm outputs ---
 for WASM in crates/sts-wasm/pkg/sts_wasm_bg.wasm crates/mimi-wasm/pkg/mimi_wasm_bg.wasm; do
